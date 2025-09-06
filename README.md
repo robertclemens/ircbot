@@ -19,4 +19,4 @@ How to use:
     * /msg botnick <hash_output> help
 * IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/. 
     * /set bot_auth_password <DEFAULT_BOT_PASS>
-    * /botcmd <botnick> help
+    * /botcmd botnick help
