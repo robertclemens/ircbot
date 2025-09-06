@@ -15,7 +15,8 @@ How to use:
 3) Start ircbot. At this time I recommend using "screen" to house the process in the background. Once a screen is started, run the bot with "./ircbot <config_password>". The config password must be remembered! This is used to encrypt any config changes. You must use the same password each time you start the bot.
 
 4) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
-- Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: /msg <botnick> <hash_output> help
-- IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/. 
-* /set bot_auth_password <DEFAULT_BOT_PASS>
-* /botcmd <botnick> help
+* Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
+    * /msg <botnick> <hash_output> help
+* IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/. 
+    * /set bot_auth_password <DEFAULT_BOT_PASS>
+    * /botcmd <botnick> help
