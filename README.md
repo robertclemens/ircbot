@@ -16,7 +16,7 @@ How to use:
 
 4) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
 * Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
-    * /msg <botnick> <hash_output> help
+    * /msg botnick <hash_output> help
 * IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/. 
     * /set bot_auth_password <DEFAULT_BOT_PASS>
     * /botcmd <botnick> help
