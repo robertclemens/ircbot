@@ -21,8 +21,6 @@
 #define DEFAULT_CHANNEL "#ircbot"       // Default channel to join
 #define DEFAULT_USERMASK "*!*@yourhostmask.com"  // Your hostmask (admin)
 
-
-// #define OS "Linux"
 #define GECOS "ircbot"         // Gecos field storage
 #define FAKE_PS "ircbot"       // Renames the process name in "ps" output.
 #define CONFIG_FILE ".ircbot"  // Do not change this
@@ -73,7 +71,6 @@ typedef enum { LS_NONE = 0, LS_LISTEN = 1, LS_CONNECTED = 2 } listen_status_t;
 // Struct Forward Declarations
 typedef struct bot_state bot_state_t;
 typedef struct chan_t chan_t;
-// typedef struct dcc_state_t dcc_state_t;
 typedef struct {
   char mask[MAX_MASK_LEN];
   char password[MAX_PASS];
@@ -89,15 +86,6 @@ struct chan_t {
   chan_t *next;
 };
 
-// struct dcc_state_t {
-//   int listen_fd;
-//   int client_fd;
-//   struct sockaddr_in addr;
-//   listen_status_t status;
-//   char *recv_buffer;
-//   time_t last_activity;
-// };
-
 struct bot_state {
   int server_fd;
   bot_status_t status;
@@ -106,7 +94,6 @@ struct bot_state {
   char bot_pass[MAX_PASS];
   op_mask_t op_masks[MAX_OP_MASKS];
   int op_mask_count;
-  //    char snoopy_pass[MAX_PASS];
   char *server_list[MAX_SERVERS + 1];
   char actual_server_name[256];
   int server_count;
@@ -131,7 +118,6 @@ struct bot_state {
   char ignored_default_mask[MAX_MASK_LEN];
   int ignored_chan_count;
   int chan_count;
-  // dcc_state_t dcc;
   char startup_password[MAX_PASS];
 };
 
@@ -150,8 +136,6 @@ void daemonize(void);
 void change_proc_name(int argc, char *argv[]);
 void handle_signal(int signum);
 // config.c
-// non-encrypted: void config_read(bot_state_t *state, const char *filename);
-// non-encrypted: void config_write(const bot_state_t *state);
 void config_read(bot_state_t *state, const char *filename);
 void config_load(bot_state_t *state, const char *password,
                  const char *filename);
@@ -163,13 +147,6 @@ chan_t *channel_find(const bot_state_t *state, const char *name);
 void channel_list_destroy(bot_state_t *state);
 void channel_list_reset_status(bot_state_t *state);
 void channel_manager_check_joins(bot_state_t *state);
-// dcc.c
-// void dcc_init(bot_state_t *state);
-// void dcc_kill(bot_state_t *state);
-// void dcc_check(bot_state_t *state);
-// void dcc_handle_input(bot_state_t *state);
-// int dcc_start_listen(bot_state_t *state);
-// int dcc_printf(bot_state_t *state, const char *format, ...);
 // irc_client.c
 void irc_connect(bot_state_t *state);
 void irc_disconnect(bot_state_t *state);
@@ -188,8 +165,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 void handle_fatal_error(const char *message);
 void get_local_ip(bot_state_t *state);
 // logging.c
-// void log_message(log_type_t log_type_flag, bot_state_t *state, const char
-// *format, ...);
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
                  const char *format, ...);
 #endif  // BOT_H
