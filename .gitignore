@@ -1,0 +1,10 @@
+# Compiled files
+*.o
+ircbot
+config_tool
+decrypt_tool
+hash-password
+
+# Logs and configs
+*.log
+.ircbot
