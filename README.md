@@ -13,6 +13,7 @@ How to use:
 2) Run "make"
 
 3) Start ircbot. At this time I recommend using "screen" to house the process in the background. Once a screen is started, run the bot with "./ircbot <config_password>". The config password must be remembered! This is used to encrypt any config changes. You must use the same password each time you start the bot.
+* Don't have "screen" or want to execute the bot without?: "./ircbot <config_password> &"
 
 4) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
 * Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
