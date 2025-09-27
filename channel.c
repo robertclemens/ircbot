@@ -28,7 +28,7 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
     }
     current->next = new_chan;
   }
-
+  state->chan_count++;
   return new_chan;
 }
 
@@ -75,18 +75,36 @@ void channel_list_reset_status(bot_state_t *state) {
 
 void channel_manager_check_joins(bot_state_t *state) {
   if (!(state->status & S_AUTHED)) return;
+
   time_t now = time(NULL);
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     if (c->status != C_IN && (now - c->last_join_attempt > JOIN_RETRY_TIME)) {
       if (c->key[0] != '\0') {
-        log_message(L_INFO, state, "[INFO] JOIN with key %s\n", c->name);
         irc_printf(state, "JOIN %s %s\r\n", c->name, c->key);
       } else {
-        log_message(L_INFO, state, "[INFO] JOIN without key %s\n", c->name);
         irc_printf(state, "JOIN %s\r\n", c->name);
       }
       c->last_join_attempt = now;
+    }
+
+    bool am_i_opped = false;
+    for (int i = 0; i < c->roster_count; i++) {
+      if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
+          c->roster[i].is_op) {
+        am_i_opped = true;
+        break;
+      }
+    }
+
+    if (c->status == C_IN && !am_i_opped &&
+        (now - c->last_who_request > ROSTER_REFRESH_INTERVAL)) {
+      log_message(L_DEBUG, state,
+                  "[DEBUG] Refreshing roster for %s because I am not an op.\n",
+                  c->name);
+      c->roster_count = 0;
+      irc_printf(state, "WHO %s\r\n", c->name);
+      c->last_who_request = now;
     }
   }
 }
