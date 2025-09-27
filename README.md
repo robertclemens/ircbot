@@ -12,12 +12,26 @@ How to use:
 
 2) Run "make"
 
-3) Start ircbot. At this time I recommend using "screen" to house the process in the background. Once a screen is started, run the bot with "./ircbot <config_password>". The config password must be remembered! This is used to encrypt any config changes. You must use the same password each time you start the bot.
-* Don't have "screen" or want to execute the bot without?: "./ircbot <config_password> &"
+3) Start ircbot. Choose config password and use run_bot.sh in utils/ to start the bot. 
+    * ./run_bot.sh
+    * Example crontab line:  */5 * * * * /home/user/ircbot/run_bot.sh 1>/dev/null 2>/dev/null
 
 4) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
 * Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
     * /msg botnick <hash_output> help
-* IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/. 
+* IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/ or place in ~/.irssi/scripts/autorun/ for automatic loading upon starting irssi. 
     * /set bot_auth_password <DEFAULT_BOT_PASS>
     * /botcmd botnick help
+
+h2 Changelog
+
+* v1.1.0 - 20250927
+    * Added secure bot communication for granting ops status in channels
+    * Changed startup mechanism to use environment variable to store and load configuration password
+    * Added syntax help to admin commands sent to bot. Also added help <command> functionality
+    * Added PID file logic to ircbot to keep multiple instances from running
+    * Included run_bot.sh in utils/ to allow easy ircbot startup and crontab processing (edit config password in this file before running)
+    * Added additional functionality for admin commands sent to ircbot
+
+* v1.0.0 - 20250906
+    * Initial commit of ircbot
