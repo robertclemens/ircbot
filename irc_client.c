@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <netdb.h>
 #include <stdarg.h>
@@ -90,6 +91,20 @@ void irc_connect(bot_state_t *state) {
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
       if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
         continue;
+      if (VHOST != NULL) {
+        struct sockaddr_in local_addr;
+        local_addr.sin_family = AF_INET;
+        local_addr.sin_port = 0;
+        local_addr.sin_addr.s_addr = inet_addr(VHOST);
+
+        if (bind(sockfd, (struct sockaddr *)&local_addr, sizeof(local_addr)) <
+            0) {
+          perror("bind failed");
+          close(sockfd);
+          sockfd = -1;
+          continue;
+        }
+      }
       if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) {
         if (i == 0) {
           state->ssl_ctx = SSL_CTX_new(TLS_client_method());
