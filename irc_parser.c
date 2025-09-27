@@ -64,6 +64,113 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
       }
     }
+  } else if (strcmp(command, "MODE") == 0 && params) {
+    char params_copy[MAX_BUFFER];
+    strncpy(params_copy, params, sizeof(params_copy) - 1);
+    params_copy[sizeof(params_copy) - 1] = '\0';
+
+    char *target = strtok(params_copy, " ");
+    char *modes = strtok(NULL, " ");
+    char *nick = strtok(NULL, " ");
+
+    if (target && modes && nick && strcasecmp(nick, state->current_nick) == 0) {
+      chan_t *c = channel_find(state, target);
+      if (!c) return;
+
+      if (strstr(modes, "+o")) {
+        log_message(L_INFO, state,
+                    "[INFO] Received ops in %s. Clearing op request.\n",
+                    target);
+        state->op_request_pending = false;
+
+        for (int i = 0; i < c->roster_count; i++) {
+          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+            c->roster[i].is_op = true;
+            break;
+          }
+        }
+      } else if (strstr(modes, "-o")) {
+        log_message(L_INFO, state, "[INFO] Lost ops in %s.\n", target);
+
+        for (int i = 0; i < c->roster_count; i++) {
+          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+            c->roster[i].is_op = false;
+            break;
+          }
+        }
+      }
+    }
+  } else if (strcmp(command, "352") == 0) {
+    strtok(params, " ");
+    char *chan_name = strtok(NULL, " ");
+
+    chan_t *c = channel_find(state, chan_name);
+    if (!c || c->roster_count >= MAX_ROSTER_SIZE) return;
+
+    char *ident = strtok(NULL, " ");
+    char *host = strtok(NULL, " ");
+    strtok(NULL, " ");
+    char *nick = strtok(NULL, " ");
+    char *modes = strtok(NULL, " ");
+
+    if (nick && ident && host && modes) {
+      roster_entry_t *entry = &c->roster[c->roster_count];
+      strncpy(entry->nick, nick, MAX_NICK - 1);
+      snprintf(entry->hostmask, MAX_MASK_LEN, "%s!%s@%s", nick, ident, host);
+      entry->is_op = (strstr(modes, "@") != NULL);
+      c->roster_count++;
+    }
+  } else if (strcmp(command, "315") == 0) {
+    strtok(params, " ");
+    char *chan_name = strtok(NULL, " ");
+    if (!chan_name) return;
+
+    chan_t *c = channel_find(state, chan_name);
+    if (!c) return;
+
+    log_message(L_INFO, state, "[INFO] Roster for %s updated with %d users.\n",
+                c->name, c->roster_count);
+
+    bool am_i_opped = false;
+    for (int i = 0; i < c->roster_count; i++) {
+      if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
+          c->roster[i].is_op) {
+        am_i_opped = true;
+        break;
+      }
+    }
+
+    if (!am_i_opped) {
+      log_message(
+          L_INFO, state,
+          "[INFO] Not an operator in %s, searching for a trusted op...\n",
+          c->name);
+      for (int i = 0; i < c->roster_count; i++) {
+        roster_entry_t *entry = &c->roster[i];
+        if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
+          bot_comms_send_command(state, entry->nick, "OPME %s", c->name);
+          state->last_op_request_time = time(NULL);
+          state->op_request_pending = true;
+          return;
+        }
+      }
+    }
+
+    if (!am_i_opped) {
+      log_message(
+          L_INFO, state,
+          "[INFO] Not an operator in %s, searching for a trusted op...\n",
+          c->name);
+      for (int i = 0; i < c->roster_count; i++) {
+        roster_entry_t *entry = &c->roster[i];
+        if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
+          bot_comms_send_command(state, entry->nick, "OPME %s", c->name);
+          state->last_op_request_time = time(NULL);
+          state->op_request_pending = true;
+          return;
+        }
+      }
+    }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
     char *nick = strtok(prefix, "!");
     char *user = strtok(NULL, "@");
@@ -82,6 +189,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_IN;
+        c->roster_count = 0;
+        strncpy(state->who_request_channel, c->name, MAX_CHAN - 1);
+        state->who_request_channel[MAX_CHAN - 1] = '\0';
+        c->last_who_request = time(NULL);
+        irc_printf(state, "WHO %s\r\n", c->name);
       }
     }
   } else if (strcmp(command, "KICK") == 0 && params) {
