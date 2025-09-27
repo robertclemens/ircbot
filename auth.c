@@ -5,8 +5,10 @@
 #include "bot.h"
 
 static bool wildcard_match(const char *pattern, const char *text) {
-  const char *p = pattern, *t = text;
-  const char *last_wildcard = NULL, *last_text_for_wildcard = NULL;
+  const char *p = pattern;
+  const char *t = text;
+  const char *last_wildcard = NULL;
+  const char *last_text_for_wildcard = NULL;
 
   while (*t) {
     if (*p == '*') {
@@ -91,5 +93,16 @@ bool auth_verify_password(const char *hash_attempt,
   }
   if (strcmp(hash_attempt, hex) == 0) return true;
 
+  return false;
+}
+
+bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
+  if (state->trusted_bot_count == 0) return false;
+
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    if (wildcard_match(state->trusted_bots[i], user_host)) {
+      return true;
+    }
+  }
   return false;
 }
