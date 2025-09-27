@@ -23,7 +23,7 @@ How to use:
     * /set bot_auth_password <DEFAULT_BOT_PASS>
     * /botcmd botnick help
 
-h2 Changelog
+Changelog
 
 * v1.1.0 - 20250927
     * Added secure bot communication for granting ops status in channels
