@@ -94,7 +94,6 @@ void config_load(bot_state_t *state, const char *password,
       line = strtok_r(NULL, "\n", &saveptr1);
       continue;
     }
-
     if (strncmp(line, "is:true", 7) == 0) {
       state->default_server_ignored = true;
       line = strtok_r(NULL, "\n", &saveptr1);
@@ -105,7 +104,6 @@ void config_load(bot_state_t *state, const char *password,
       line = strtok_r(NULL, "\n", &saveptr1);
       continue;
     }
-
     char *value = strchr(line, ':');
     if (!value) {
       line = strtok_r(NULL, "\n", &saveptr1);
@@ -113,7 +111,6 @@ void config_load(bot_state_t *state, const char *password,
     }
     *value++ = '\0';
     char type = line[0];
-
     switch (type) {
       case '1':
         strncpy(state->target_nick, value, MAX_NICK - 1);
@@ -146,6 +143,14 @@ void config_load(bot_state_t *state, const char *password,
         break;
       case 'i':
         strncpy(state->ignored_default_channel, value, MAX_CHAN - 1);
+        break;
+      case 'p':
+        strncpy(state->bot_comm_pass, value, MAX_PASS - 1);
+        break;
+      case 'b':
+        if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
+          state->trusted_bots[state->trusted_bot_count++] = strdup(value);
+        }
         break;
       case 'o':
         if (state->op_mask_count < MAX_OP_MASKS) {
@@ -258,6 +263,24 @@ void config_write(const bot_state_t *state, const char *password) {
     if (written > 0 && written < remaining) {
       offset += written;
       remaining -= written;
+    }
+  }
+  if (state->bot_comm_pass[0] != '\0') {
+    written = snprintf(plaintext_overrides + offset, remaining, "p:%s\n",
+                       state->bot_comm_pass);
+    if (written > 0 && written < remaining) {
+      offset += written;
+      remaining -= written;
+    }
+  }
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    if (remaining > 1) {
+      written = snprintf(plaintext_overrides + offset, remaining, "b:%s\n",
+                         state->trusted_bots[i]);
+      if (written > 0 && written < remaining) {
+        offset += written;
+        remaining -= written;
+      }
     }
   }
   for (int i = 0; i < state->op_mask_count; i++) {
