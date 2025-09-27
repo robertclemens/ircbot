@@ -1,6 +1,6 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
-
+#include <string.h>
 #include "bot.h"
 
 int crypto_aes_encrypt_decrypt(bool encrypt, const char *password,
