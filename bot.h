@@ -10,22 +10,25 @@
 #include <time.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "1.0.0"
+#define BOT_VERSION "1.1.0"
 
 // Only edit this section
-#define DEFAULT_NICK "ircbot"           // Default bot nick
-#define DEFAULT_USER "ircbot"           // Default bot user
-#define DEFAULT_IRCNAME "ircbot"        // Default bot ircname
-#define DEFAULT_BOT_PASS "adminpass"    // Administration password
-#define DEFAULT_SERVER "irc.efnet.org"  // Default irc server
-#define DEFAULT_CHANNEL "#ircbot"       // Default channel to join
-#define DEFAULT_USERMASK "*!*@yourhostmask.com"  // Your hostmask (admin)
+#define DEFAULT_NICK "ircbot"         // Default bot nick
+#define DEFAULT_USER "ircbot"         // Default bot user
+#define DEFAULT_IRCNAME "ircbot"      // Default bot ircname
+#define DEFAULT_BOT_PASS "adminpass"  // Administration password
+#define VHOST "NULL"  // NULL for default host, set for alternate
+#define DEFAULT_SERVER "irc.efnet.org"            // Default irc server
+#define DEFAULT_CHANNEL "#ircbot"                 // Default channel to join
+#define DEFAULT_USERMASK "*!*@adminhostmask.com"  // Your hostmask (admin)
+#define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
 
 #define GECOS "ircbot"         // Gecos field storage
 #define FAKE_PS "ircbot"       // Renames the process name in "ps" output.
 #define CONFIG_FILE ".ircbot"  // Do not change this
+#define PID_FILE ".ircbot.pid"
 #define SALT_SIZE 8            // Do not change this
-#define LOGFILE "msg.log"      // Log file name.
+#define LOGFILE ".ircbot.log"  // Log file name.
 // End of edit section
 
 // Timeouts
@@ -34,7 +37,8 @@
 #define NICK_RETRY_TIME 10
 #define DEAD_SERVER_TIMEOUT 120
 #define CHECK_LAG_TIMEOUT 60
-// #define DCC_TIMEOUT 30
+#define OP_REQUEST_RETRY_TIME 30
+#define ROSTER_REFRESH_INTERVAL 120
 
 // Limits
 #define MAX_SERVERS 10
@@ -47,6 +51,9 @@
 #define MAX_IGNORED_CHANS 20
 #define MAX_MASK_LEN 128
 #define MAX_OP_MASKS 20
+#define MAX_TRUSTED_BOTS 20
+#define MAX_ROSTER_SIZE 50
+#define NONCE_CACHE_SIZE 32
 
 // Enums
 typedef enum {
@@ -77,11 +84,20 @@ typedef struct {
 } op_mask_t;
 
 // Struct Definitions
+typedef struct {
+  char nick[MAX_NICK];
+  char hostmask[MAX_MASK_LEN];
+  bool is_op;
+} roster_entry_t;
+
 struct chan_t {
   char name[MAX_CHAN];
   char key[MAX_KEY];
   chan_status_t status;
   chan_mode_t modes;
+  time_t last_who_request;
+  roster_entry_t roster[MAX_ROSTER_SIZE];
+  int roster_count;
   time_t last_join_attempt;
   chan_t *next;
 };
@@ -109,6 +125,8 @@ struct bot_state {
   bool pong_pending;
   bool nick_change_pending;
   bool default_server_ignored;
+  bool op_request_pending;
+  time_t last_op_request_time;
   bool is_ssl;
   SSL_CTX *ssl_ctx;
   SSL *ssl;
@@ -119,6 +137,13 @@ struct bot_state {
   int ignored_chan_count;
   int chan_count;
   char startup_password[MAX_PASS];
+  char bot_comm_pass[MAX_PASS];
+  char *trusted_bots[MAX_TRUSTED_BOTS + 1];
+  int trusted_bot_count;
+  roster_entry_t channel_roster[MAX_ROSTER_SIZE];
+  char who_request_channel[MAX_CHAN];
+  uint64_t recent_nonces[NONCE_CACHE_SIZE];
+  int nonce_idx;
 };
 
 // --- Function Prototypes ---
@@ -130,6 +155,7 @@ bool auth_verify_password(const char *hash_attempt,
 bool auth_check_hostmask(const bot_state_t *state, const char *user_host);
 bool auth_verify_op_command(const bot_state_t *state, const char *user_host,
                             const char *hash_attempt);
+bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host);
 // bot.c
 void setup_signals(void);
 void daemonize(void);
@@ -161,10 +187,17 @@ void parser_handle_line(bot_state_t *state, char *line);
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message);
+// In bot_comms.c
+void bot_comms_send_command(bot_state_t *state, const char *target_nick,
+                            const char *format, ...);
 // utils.c
 void handle_fatal_error(const char *message);
 void get_local_ip(bot_state_t *state);
 // logging.c
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
                  const char *format, ...);
+// crypto.c
+int crypto_aes_encrypt_decrypt(bool encrypt, const char *password,
+                               const unsigned char *data, int data_len,
+                               unsigned char **output);
 #endif  // BOT_H
