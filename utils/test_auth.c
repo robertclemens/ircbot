@@ -23,7 +23,7 @@ int main(int argc, char *argv[]) {
             "Usage: %s \"<nick!user@host>\" \"<password>\" \"<command>\"\n",
             argv[0]);
     fprintf(stderr,
-            "Example: %s \"trojanc_!~rclemens@host.com\" \"test1\" \"help\"\n",
+            "Example: %s \"trojanc_!~user@host.com\" \"test1\" \"help\"\n",
             argv[0]);
     return 1;
   }
