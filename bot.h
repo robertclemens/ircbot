@@ -24,11 +24,11 @@
 #define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
 
 #define GECOS "ircbot"         // Gecos field storage
-#define FAKE_PS "ircbot"       // Renames the process name in "ps" output.
 #define CONFIG_FILE ".ircbot"  // Do not change this
 #define PID_FILE ".ircbot.pid"
 #define SALT_SIZE 8            // Do not change this
-#define LOGFILE ".ircbot.log"  // Log file name.
+#define DEFAULT_LOG_LEVEL 0 // Set the default log level. 0=none
+#define LOGFILE ".ircbot.log"  // Log file name. Only used if log level > 0
 // End of edit section
 
 // Timeouts

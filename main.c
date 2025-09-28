@@ -18,7 +18,7 @@ static void state_init(bot_state_t *state) {
   state->status = S_NONE;
   strncpy(state->target_nick, DEFAULT_NICK, MAX_NICK - 1);
   strncpy(state->bot_pass, DEFAULT_BOT_PASS, MAX_PASS - 1);
-  state->log_type = 0;
+  state->log_type = DEFAULT_LOG_LEVEL;
   state->last_pong_time = time(NULL);
   state->nick_release_time = time(NULL) - NICK_TAKE_TIME;
   state->server_fd = -1;
