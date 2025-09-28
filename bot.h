@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "1.1.0"
+#define BOT_VERSION "1.1.1"
 
 // Only edit this section
 #define DEFAULT_NICK "ircbot"         // Default bot nick
@@ -54,6 +54,8 @@
 #define MAX_TRUSTED_BOTS 20
 #define MAX_ROSTER_SIZE 50
 #define NONCE_CACHE_SIZE 32
+#define GCM_IV_LEN 12
+#define GCM_TAG_LEN 16
 
 // Enums
 typedef enum {
@@ -197,7 +199,10 @@ void get_local_ip(bot_state_t *state);
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
                  const char *format, ...);
 // crypto.c
-int crypto_aes_encrypt_decrypt(bool encrypt, const char *password,
-                               const unsigned char *data, int data_len,
-                               unsigned char **output);
+int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
+                           const unsigned char *key, unsigned char *ciphertext,
+                           unsigned char *tag);
+int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
+                           const unsigned char *key, unsigned char *plaintext,
+                           unsigned char *tag);
 #endif  // BOT_H
