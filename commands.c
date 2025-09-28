@@ -34,17 +34,29 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   snprintf(user_host, sizeof(user_host), "%s!%s@%s", nick, user, host);
 
   if (auth_is_trusted_bot(state, user_host)) {
-    unsigned char *decoded_data = NULL;
-    int decoded_len = base64_decode(message, &decoded_data);
+    char *encoded_ciphertext = strtok(message, ":");
+    char *encoded_tag = strtok(NULL, "");
 
-    if (decoded_len > 0) {
-      unsigned char *decrypted_data = NULL;
-      int decrypted_len = crypto_aes_encrypt_decrypt(
-          false, state->bot_comm_pass, (const unsigned char *)decoded_data,
-          decoded_len, &decrypted_data);
+    if (!encoded_ciphertext || !encoded_tag) return;
 
-      if (decrypted_len > 0) {
+    unsigned char *ciphertext = NULL;
+    unsigned char *tag = NULL;
+    int ciphertext_len = base64_decode(encoded_ciphertext, &ciphertext);
+    int tag_len = base64_decode(encoded_tag, &tag);
+
+    if (ciphertext_len > 0 && tag_len == GCM_TAG_LEN) {
+      unsigned char key[32];
+      EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+                     (const unsigned char *)state->bot_comm_pass,
+                     strlen(state->bot_comm_pass), 1, key, NULL);
+
+      unsigned char *decrypted_data = malloc(ciphertext_len);
+      int decrypted_len = crypto_aes_gcm_decrypt(ciphertext, ciphertext_len,
+                                                 key, decrypted_data, tag);
+
+      if (decrypted_len >= 0) {
         decrypted_data[decrypted_len] = '\0';
+
         char *received_timestamp_str = strtok((char *)decrypted_data, ":");
         char *received_nonce_str = strtok(NULL, ":");
         char *command_part = strtok(NULL, "");
@@ -73,11 +85,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
         free(decrypted_data);
       }
-      free(decoded_data);
     }
+    if (ciphertext) free(ciphertext);
+    if (tag) free(tag);
     return;
   }
-
   if (!auth_check_hostmask(state, user_host)) {
     return;
   }
