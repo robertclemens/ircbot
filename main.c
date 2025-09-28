@@ -37,7 +37,7 @@ static void state_destroy(bot_state_t *state) {
 }
 
 int main(void) {
-  int pid_fd = open(PID_FILE, O_CREAT | O_RDWR, 0666);
+  int pid_fd = open(PID_FILE, O_CREAT | O_RDWR, 0600);
   if (pid_fd == -1) {
     perror("Failed to open PID file");
     return 1;
@@ -138,11 +138,9 @@ int main(void) {
       }
     }
   }
-  printf("Bot shutting down...\n");
   config_write(&state, state.startup_password);
   irc_disconnect(&state);
   state_destroy(&state);
   remove(PID_FILE);
-  printf("-- Clean exit --\n");
   return 0;
 }
