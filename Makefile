@@ -29,3 +29,6 @@ $(TARGET): $(OBJS)
 
 clean:
 	rm -f $(OBJS) $(TARGET)
+
+install:
+	rm -rf $(OBJS) *.c *.h README.md LICENSE Makefile .gitignore .git
