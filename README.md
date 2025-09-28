@@ -15,7 +15,9 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
 ### How to use:
 1) Edit bot.h and modify the default variables in the edit section. This is what the bot will use to start. All later configuration may be modified with bot commands. Please get these variables correct!
 
-2) Run "make"
+2) Run `"make && make install"`
+    * "make" creates the binary
+    * "make install" cleans the directory of all config and compiler objects.
 
 3) Start ircbot. Choose config password and use run_bot.sh in utils/ to start the bot. 
     * ./run_bot.sh
