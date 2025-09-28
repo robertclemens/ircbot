@@ -35,14 +35,16 @@ void parser_handle_line(bot_state_t *state, char *line) {
     return;
   }
 
+  char *saveptr_irc;
+
   if (strcmp(command, "PONG") == 0) {
     state->last_pong_time = time(NULL);
     state->pong_pending = false;
     return;
   }
   if (strcmp(command, "004") == 0) {
-    char *server_name = strtok(params, " ");
-    server_name = strtok(NULL, " ");
+    char *server_name = strtok_r(params, " ", &saveptr_irc);
+    server_name = strtok_r(NULL, " ", &saveptr_irc);
     if (server_name) {
       strncpy(state->actual_server_name, server_name,
               sizeof(state->actual_server_name) - 1);
@@ -56,8 +58,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
       irc_generate_new_nick(state);
     }
   } else if (strcmp(command, "474") == 0) {
-    strtok(params, " ");
-    char *chan_name = strtok(NULL, " ");
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (chan_name) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
@@ -69,9 +71,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
     strncpy(params_copy, params, sizeof(params_copy) - 1);
     params_copy[sizeof(params_copy) - 1] = '\0';
 
-    char *target = strtok(params_copy, " ");
-    char *modes = strtok(NULL, " ");
-    char *nick = strtok(NULL, " ");
+    char *target = strtok_r(params_copy, " ", &saveptr_irc);
+    char *modes = strtok_r(NULL, " ", &saveptr_irc);
+    char *nick = strtok_r(NULL, " ", &saveptr_irc);
 
     if (target && modes && nick && strcasecmp(nick, state->current_nick) == 0) {
       chan_t *c = channel_find(state, target);
@@ -101,17 +103,17 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
   } else if (strcmp(command, "352") == 0) {
-    strtok(params, " ");
-    char *chan_name = strtok(NULL, " ");
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
 
     chan_t *c = channel_find(state, chan_name);
     if (!c || c->roster_count >= MAX_ROSTER_SIZE) return;
 
-    char *ident = strtok(NULL, " ");
-    char *host = strtok(NULL, " ");
-    strtok(NULL, " ");
-    char *nick = strtok(NULL, " ");
-    char *modes = strtok(NULL, " ");
+    char *ident = strtok_r(NULL, " ", &saveptr_irc);
+    char *host = strtok_r(NULL, " ", &saveptr_irc);
+    strtok_r(NULL, " ", &saveptr_irc);
+    char *nick = strtok_r(NULL, " ", &saveptr_irc);
+    char *modes = strtok_r(NULL, " ", &saveptr_irc);
 
     if (nick && ident && host && modes) {
       roster_entry_t *entry = &c->roster[c->roster_count];
@@ -121,8 +123,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
       c->roster_count++;
     }
   } else if (strcmp(command, "315") == 0) {
-    strtok(params, " ");
-    char *chan_name = strtok(NULL, " ");
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (!chan_name) return;
 
     chan_t *c = channel_find(state, chan_name);
@@ -172,17 +174,17 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
-    char *nick = strtok(prefix, "!");
-    char *user = strtok(NULL, "@");
-    char *host = strtok(NULL, "");
-    char *dest = strtok(params, " ");
-    char *message = strtok(NULL, "");
+    char *nick = strtok_r(prefix, "!", &saveptr_irc);
+    char *user = strtok_r(NULL, "@", &saveptr_irc);
+    char *host = strtok_r(NULL, "", &saveptr_irc);
+    char *dest = strtok_r(params, " ", &saveptr_irc);
+    char *message = strtok_r(NULL, "", &saveptr_irc);
     if (message && *message == ':') message++;
     if (nick && dest && message) {
       commands_handle_private_message(state, nick, user, host, dest, message);
     }
   } else if (strcmp(command, "JOIN") == 0 && prefix) {
-    char *nick = strtok(prefix, "!");
+    char *nick = strtok_r(prefix, "!", &saveptr_irc);
     if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
                  strcasecmp(nick, state->target_nick) == 0)) {
       char *chan_name = (*params == ':') ? params + 1 : params;
@@ -201,8 +203,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
     strncpy(params_copy, params, sizeof(params_copy) - 1);
     params_copy[sizeof(params_copy) - 1] = '\0';
 
-    char *chan_name = strtok(params_copy, " ");
-    char *kicked_nick = strtok(NULL, " ");
+    char *chan_name = strtok_r(params_copy, " ", &saveptr_irc);
+    char *kicked_nick = strtok_r(NULL, " ", &saveptr_irc);
     if (chan_name && kicked_nick &&
         strcasecmp(kicked_nick, state->current_nick) == 0) {
       chan_t *c = channel_find(state, chan_name);
@@ -211,7 +213,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
   } else if (strcmp(command, "NICK") == 0 && prefix) {
-    char *old_nick = strtok(prefix, "!");
+    char *old_nick = strtok_r(prefix, "!", &saveptr_irc);
     char *new_nick = (*params == ':') ? params + 1 : params;
     if (old_nick && new_nick &&
         strcasecmp(old_nick, state->current_nick) == 0) {

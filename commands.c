@@ -34,8 +34,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   snprintf(user_host, sizeof(user_host), "%s!%s@%s", nick, user, host);
 
   if (auth_is_trusted_bot(state, user_host)) {
-    char *encoded_ciphertext = strtok(message, ":");
-    char *encoded_tag = strtok(NULL, "");
+    char *saveptr_enc;
+    char *encoded_ciphertext = strtok_r(message, ":", &saveptr_enc);
+    char *encoded_tag = strtok_r(NULL, "", &saveptr_enc);
 
     if (!encoded_ciphertext || !encoded_tag) return;
 
@@ -57,9 +58,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (decrypted_len >= 0) {
         decrypted_data[decrypted_len] = '\0';
 
-        char *received_timestamp_str = strtok((char *)decrypted_data, ":");
-        char *received_nonce_str = strtok(NULL, ":");
-        char *command_part = strtok(NULL, "");
+        char *saveptr_bot;
+        char *received_timestamp_str = strtok_r((char *)decrypted_data, ":", &saveptr_bot);
+        char *received_nonce_str = strtok_r(NULL, ":", &saveptr_bot);
+        char *command_part = strtok_r(NULL, "", &saveptr_bot);
 
         if (received_timestamp_str && received_nonce_str && command_part) {
           time_t received_time = atol(received_timestamp_str);
@@ -75,8 +77,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             if (!nonce_is_reused) {
               state->recent_nonces[state->nonce_idx] = received_nonce;
               state->nonce_idx = (state->nonce_idx + 1) % NONCE_CACHE_SIZE;
-              char *command = strtok(command_part, " ");
-              char *arg1 = strtok(NULL, " ");
+              char *saveptr_cmd;
+              char *command = strtok_r(command_part, " ", &saveptr_cmd);
+              char *arg1 = strtok_r(NULL, " ", &saveptr_cmd);
               if (command && strcasecmp(command, "OPME") == 0 && arg1) {
                 irc_printf(state, "MODE %s +o %s\r\n", arg1, nick);
               }
@@ -98,12 +101,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   strncpy(message_copy, message, sizeof(message_copy) - 1);
   message_copy[sizeof(message_copy) - 1] = '\0';
 
-  char *password_attempt = strtok(message_copy, " ");
+  char *saveptr_adm;
+  char *password_attempt = strtok_r(message_copy, " ", &saveptr_adm);
   if (!password_attempt) return;
-  char *command = strtok(NULL, " ");
+  char *command = strtok_r(NULL, " ", &saveptr_adm);
   if (!command) return;
-  char *arg1 = strtok(NULL, " ");
-  char *arg2 = strtok(NULL, " ");
+  char *arg1 = strtok_r(NULL, " ", &saveptr_adm);
+  char *arg2 = strtok_r(NULL, " ", &saveptr_adm);
 
   if (auth_check_hostmask(state, user_host) &&
       auth_verify_password(password_attempt, state->bot_pass)) {
@@ -687,7 +691,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     log_message(L_CMD, state, "[CMD] Op command from %s: %s\n", user_host,
                 command);
     if (strcasecmp(command, "op") == 0) {
-      char *arg1 = strtok(NULL, " ");
+      char *saveptr_op;
+      char *arg1 = strtok_r(NULL, " ", &saveptr_op);
       if (arg1) {
         irc_printf(state, "MODE %s +o %s\r.n", arg1, nick);
       }
