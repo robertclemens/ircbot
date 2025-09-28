@@ -13,7 +13,6 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * OpenSSL Libs: libssl-dev (Tested with: libssl-dev 3.0.13)   (IE: apt install libssl-dev on Ubuntu)
 
 ### How to use:
-
 1) Edit bot.h and modify the default variables in the edit section. This is what the bot will use to start. All later configuration may be modified with bot commands. Please get these variables correct!
 
 2) Run "make"
@@ -30,7 +29,6 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * /botcmd botnick help
 
 ### Changelog
-
 * v1.1.1 - 20250928
     * Change AES-256-CBC implementation over to AES-256-GCM
 
