@@ -15,7 +15,6 @@
 // Only edit this section
 #define DEFAULT_NICK "ircbot"         // Default bot nick
 #define DEFAULT_USER "ircbot"         // Default bot user
-#define DEFAULT_IRCNAME "ircbot"      // Default bot ircname
 #define DEFAULT_BOT_PASS "adminpass"  // Administration password
 #define VHOST "NULL"  // NULL for default host, set for alternate
 #define DEFAULT_SERVER "irc.efnet.org"            // Default irc server
@@ -37,7 +36,6 @@
 #define NICK_RETRY_TIME 10
 #define DEAD_SERVER_TIMEOUT 120
 #define CHECK_LAG_TIMEOUT 60
-#define OP_REQUEST_RETRY_TIME 30
 #define ROSTER_REFRESH_INTERVAL 120
 
 // Limits
@@ -48,7 +46,6 @@
 #define MAX_NICK 10
 #define MAX_PASS 128
 #define MAX_KEY 31
-#define MAX_IGNORED_CHANS 20
 #define MAX_MASK_LEN 128
 #define MAX_OP_MASKS 20
 #define MAX_TRUSTED_BOTS 20
