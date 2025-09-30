@@ -6,7 +6,7 @@
 #include <sys/stat.h>
 #include <unistd.h>
 
-static volatile bool g_shutdown_flag = false;
+volatile bool g_shutdown_flag = false;
 
 void handle_signal(int signum) {
   (void)signum;
