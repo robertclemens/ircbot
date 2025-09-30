@@ -61,7 +61,7 @@ int main(void) {
 
   ssl_init_openssl();
 
-  char *startup_password = getenv(CONFIG_PASS_ENV_VAR);
+  const char *startup_password = getenv(CONFIG_PASS_ENV_VAR);
   if (!startup_password) {
     fprintf(stderr, "Error: %s environment variable not set.\n",
             CONFIG_PASS_ENV_VAR);
@@ -85,8 +85,6 @@ int main(void) {
 
   setup_signals();
 
-  channel_add(&state, DEFAULT_CHANNEL);
-
   config_load(&state, state.startup_password, CONFIG_FILE);
 
   if (state.server_count == 0 && !state.default_server_ignored) {
@@ -94,6 +92,7 @@ int main(void) {
     state.server_count = 1;
   }
 
+  channel_add(&state, DEFAULT_CHANNEL);
   if (channel_find(&state, DEFAULT_CHANNEL) == NULL) {
     channel_add(&state, DEFAULT_CHANNEL);
   }
@@ -111,7 +110,7 @@ int main(void) {
   state.auth_masks[state.mask_count] = NULL;
   state.trusted_bots[state.trusted_bot_count] = NULL;
 
-  while (!(state.status & S_DIE)) {
+  while (!(state.status & S_DIE) && !g_shutdown_flag) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
     if (state.server_fd == -1 && !(state.status & S_DIE)) {
