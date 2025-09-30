@@ -31,16 +31,27 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * /botcmd botnick help
 
 ### Changelog
+
+* v1.1.2 - main branch (not packaged until further testing is complete)
+    * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for config file read/write
+    * Enhancement: Modified config line values to make more sense as config options have been added
+    * Enhancement: Moved AES-256-CBC config tools to legacy utils in the utils/ folder (legacy)
+    * Enhancement: Created new config tools (encrypt_config.c/decrypt_config.c) using AES-256-GCM
+    * Fix: Makefile now chmods 700 compiled binary
+    * Fix: Added g_shutdown_flag to main bot loop to check for ctrl+c signal
+    * Fix: Corrected utils/run_bot.sh to show ENV_VAR is customizable and must match bot.h value
+    * Fix: log level was being written to config even if default_log_level was not changed
+
 * v1.1.1 - 20250928
-    * Change AES-256-CBC implementation over to AES-256-GCM
+    * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for bot-to-bot communication
 
 * v1.1.0 - 20250927
-    * Added secure bot communication for granting ops status in channels
-    * Changed startup mechanism to use environment variable to store and load configuration password
-    * Added syntax help to admin commands sent to bot. Also added help <command> functionality
-    * Added PID file logic to ircbot to keep multiple instances from running
-    * Included run_bot.sh in utils/ to allow easy ircbot startup and crontab processing (edit config password in this file before running)
-    * Added additional functionality for admin commands sent to ircbot
+    * Enhancement: Added secure bot communication for granting ops status in channels
+    * Enhancement: Changed startup mechanism to use environment variable to store and load configuration password
+    * Enhancement: Added syntax help to admin commands sent to bot. Also added help <command> functionality
+    * Enhancement: Added PID file logic to ircbot to keep multiple instances from running
+    * Enhancement: Included run_bot.sh in utils/ to allow easy ircbot startup and crontab processing (edit config password in this file before running)
+    * Enhancement: Added additional functionality for admin commands sent to ircbot
 
 * v1.0.0 - 20250906
     * Initial commit of ircbot
