@@ -1,15 +1,13 @@
 #!/bin/bash
 
-##########################################
+#########################################################################################
 # Set your config password
 CONFIG_PASS="configpassword"
 
-# Define the lock file path.
-# This should be correct unless
-# you edited bot.h for the PID_FILE value
-PID_FILE=".ircbot.pid"
-
-###########################################
+# Define the variables as you have them in bot.h
+PID_FILE=".ircbot.pid" # PID file name, must match bot.h #define PID_FILE
+ENV_VAR="BOT_PASS"     # ENV variable name, must match bot.h #define CONFIG_PASS_ENV_VAR
+#########################################################################################
 
 
 # Navigate to the bot's directory
@@ -30,4 +28,4 @@ if [ -e "$PID_FILE" ]; then
 fi
 
 # Set the password and run the bot
-BOT_PASS="$CONFIG_PASS" ./ircbot &
+$ENV_VAR="$CONFIG_PASS" ./ircbot &
