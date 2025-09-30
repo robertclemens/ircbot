@@ -1,12 +1,15 @@
 #!/bin/bash
 
 #########################################################################################
-# Set your config password
+# Set your variables
 CONFIG_PASS="configpassword"
+ENV_VAR="BOT_PASS"
+PID_FILE=".ircbot.pid"
 
 # Define the variables as you have them in bot.h
-PID_FILE=".ircbot.pid" # PID file name, must match bot.h #define PID_FILE
-ENV_VAR="BOT_PASS"     # ENV variable name, must match bot.h #define CONFIG_PASS_ENV_VAR
+# CONFIG_PASS is the config encryption password. This is not in bot.h.
+# PID file name, must match bot.h #define PID_FILE
+# ENV variable name, must match bot.h #define CONFIG_PASS_ENV_VAR
 #########################################################################################
 
 
@@ -28,4 +31,5 @@ if [ -e "$PID_FILE" ]; then
 fi
 
 # Set the password and run the bot
-$ENV_VAR="$CONFIG_PASS" ./ircbot &
+export $ENV_VAR="$CONFIG_PASS"
+ ./ircbot &
