@@ -23,6 +23,7 @@ all: $(TARGET)
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
+	@chmod 700 $(TARGET)
 
 %.o: %.c
 	$(CC) $(CFLAGS) -c $< -o $@
