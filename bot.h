@@ -10,7 +10,7 @@
 #include <time.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "1.1.1"
+#define BOT_VERSION "1.1.2"
 
 // Only edit this section
 #define DEFAULT_NICK "ircbot"         // Default bot nick
@@ -23,36 +23,41 @@
 #define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
 
 #define GECOS "ircbot"         // Gecos field storage
-#define CONFIG_FILE ".ircbot"  // Do not change this
-#define PID_FILE ".ircbot.pid"
-#define SALT_SIZE 8            // Do not change this
+#define CONFIG_FILE ".ircbot.cnf"  // Config file name
+#define PID_FILE ".ircbot.pid" // PID file name
+#define SALT_SIZE 8            // You do not need to change this
 #define DEFAULT_LOG_LEVEL 0 // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log"  // Log file name. Only used if log level > 0
 // End of edit section
 
+// You should not edit below this line. While some of the macros may be editable, some macros may cause issues.
+// Proceed at your own risk.
+
 // Timeouts
-#define JOIN_RETRY_TIME 10
-#define NICK_TAKE_TIME 20
-#define NICK_RETRY_TIME 10
-#define DEAD_SERVER_TIMEOUT 120
-#define CHECK_LAG_TIMEOUT 60
-#define ROSTER_REFRESH_INTERVAL 120
+#define JOIN_RETRY_TIME 10 // Time delay between trying to join a channel
+#define NICK_TAKE_TIME 20 // Time delay for givenick to stop trying to take the nick back
+#define NICK_RETRY_TIME 10 // Time delay for trying to gain the target nick (outside of givenick cmd)
+#define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
+#define CHECK_LAG_TIMEOUT 60 // Lag timeout
+#define ROSTER_REFRESH_INTERVAL 120 // How often should a /who #channel be performed to look for known bots that are ops
 
 // Limits
-#define MAX_SERVERS 10
-#define MAX_MASKS 20
-#define MAX_CHAN 65
-#define MAX_BUFFER 512
-#define MAX_NICK 10
-#define MAX_PASS 128
-#define MAX_KEY 31
-#define MAX_MASK_LEN 128
-#define MAX_OP_MASKS 20
-#define MAX_TRUSTED_BOTS 20
-#define MAX_ROSTER_SIZE 50
-#define NONCE_CACHE_SIZE 32
-#define GCM_IV_LEN 12
-#define GCM_TAG_LEN 16
+#define MAX_SERVERS 10 // Max number of servers to store
+#define MAX_MASKS 20 // Max number of admin masks to store
+#define MAX_CHAN 65 // Max length of channel name. Do not change
+#define MAX_BUFFER 512 // Size of RAW IRC message. Do not change
+#define MAX_NICK 10 // Max nick length 9 + NULL terminator = 10. Do not change
+#define MAX_PASS 128 // Max password length.
+#define MAX_KEY 31 // Max length for a channel key
+#define MAX_MASK_LEN 128 // Max usermask length
+#define MAX_OP_MASKS 20 // Max number of operators
+#define MAX_TRUSTED_BOTS 20 // Max number of trusted bots
+#define MAX_ROSTER_SIZE 50 // Max channel roster size to store. Increase if in very large channels.
+#define NONCE_CACHE_SIZE 32 // Nonce cache for secure communication. Prevents replay attacks
+#define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
+#define GCM_TAG_LEN 16 // 16 bytes (128 bits) is industry standard. Do not change.
+
+extern volatile bool g_shutdown_flag;
 
 // Enums
 typedef enum {
