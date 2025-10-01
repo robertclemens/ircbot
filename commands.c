@@ -184,6 +184,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    nick);
         return;
       }
+      for (int i = 0; i < state->trusted_bot_count; i++) {
+          if (strcasecmp(state->trusted_bots[i], arg1) == 0) {
+              irc_printf(state, "PRIVMSG %s :Error: Trusted bot mask '%s' already exists.\r\n", nick, arg1);
+              return;
+          }
+      }
       if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
         state->trusted_bots[state->trusted_bot_count++] = strdup(arg1);
         state->trusted_bots[state->trusted_bot_count] = NULL;
@@ -394,11 +400,21 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             nick);
         return;
       }
+      if (strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
+          irc_printf(state, "PRIVMSG %s :Error: Mask is the same as the hardcoded default.\r\n", nick);
+          return;
+      }
+      for (int i = 0; i < state->mask_count; i++) {
+          if (strcasecmp(state->auth_masks[i], arg1) == 0) {
+              irc_printf(state, "PRIVMSG %s :Error: Admin mask '%s' already exists.\r\n", nick, arg1);
+              return;
+          }
+      }
       if (state->mask_count < MAX_MASKS) {
         state->auth_masks[state->mask_count++] = strdup(arg1);
         state->auth_masks[state->mask_count] = NULL;
         config_write(state, state->startup_password);
-        irc_printf(state, "PRIVMSG %s :Added auth mask: %s\r\n", nick, arg1);
+        irc_printf(state, "PRIVMSG %s :Added admin mask: %s\r\n", nick, arg1);
       }
     } else if (strcasecmp(command, "-adminmask") == 0) {
       if (!arg1) {
@@ -432,7 +448,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         state->mask_count--;
         state->auth_masks[state->mask_count] = NULL;
         config_write(state, state->startup_password);
-        irc_printf(state, "PRIVMSG %s :Removed auth mask: %s\r\n", nick, arg1);
+        irc_printf(state, "PRIVMSG %s :Removed admin mask: %s\r\n", nick, arg1);
       }
     } else if (strcasecmp(command, "adminpass") == 0) {
       if (!arg1) {
@@ -463,6 +479,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    "<password>\r\n",
                    nick);
         return;
+      }
+      for (int i = 0; i < state->op_mask_count; i++) {
+          if (strcasecmp(state->op_masks[i].mask, arg1) == 0) {
+              irc_printf(state, "PRIVMSG %s :Error: Operator mask '%s' already exists.\r\n", nick, arg1);
+              return;
+          }
       }
       if (state->op_mask_count < MAX_OP_MASKS) {
         strncpy(state->op_masks[state->op_mask_count].mask, arg1,

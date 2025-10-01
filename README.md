@@ -40,7 +40,9 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * Fix: Makefile now chmods 700 compiled binary
     * Fix: Added g_shutdown_flag to main bot loop to check for ctrl+c signal
     * Fix: Corrected utils/run_bot.sh to show ENV_VAR is customizable and must match bot.h value
-    * Fix: log level was being written to config even if default_log_level was not changed
+    * Fix: Log level was being written to config even if default_log_level was not changed
+    * Fix: Add validation to +adminmask, +oper, and +bot to prevent duplicate usermask additions
+    * Fix: Modified utils/run_bot.sh for better environment var handling
 
 * v1.1.1 - 20250928
     * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for bot-to-bot communication
