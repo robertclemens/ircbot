@@ -120,11 +120,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "QUIT :Jumping servers...\r\n");
       irc_disconnect(state);
     } else if (strcasecmp(command, "join") == 0) {
+      char channel_name[MAX_CHAN];
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s :Syntax: join <#channel>\r\n", nick);
         return;
       }
-      char channel_name[MAX_CHAN];
+      if (channel_find(state, channel_name)) {
+          irc_printf(state, "PRIVMSG %s :Error: Channel %s is already in my list.\r\n", nick, channel_name);
+          return;
+      }
       if (arg1[0] == '#') {
         strncpy(channel_name, arg1, sizeof(channel_name) - 1);
       } else {
@@ -400,8 +404,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             nick);
         return;
       }
-      if (strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
-          irc_printf(state, "PRIVMSG %s :Error: Mask is the same as the hardcoded default.\r\n", nick);
+      if (state->ignored_default_mask[0] != '\0' && strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
+          state->ignored_default_mask[0] = '\0';
+          config_write(state, state->startup_password);
+          irc_printf(state, "PRIVMSG %s :Re-enabling default admin mask '%'.\r\n", nick, arg1);
           return;
       }
       for (int i = 0; i < state->mask_count; i++) {
