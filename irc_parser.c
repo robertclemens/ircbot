@@ -158,21 +158,6 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
 
-    if (!am_i_opped) {
-      log_message(
-          L_INFO, state,
-          "[INFO] Not an operator in %s, searching for a trusted op...\n",
-          c->name);
-      for (int i = 0; i < c->roster_count; i++) {
-        roster_entry_t *entry = &c->roster[i];
-        if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
-          bot_comms_send_command(state, entry->nick, "OPME %s", c->name);
-          state->last_op_request_time = time(NULL);
-          state->op_request_pending = true;
-          return;
-        }
-      }
-    }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
     char *user = strtok_r(NULL, "@", &saveptr_irc);
