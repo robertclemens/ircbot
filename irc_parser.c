@@ -142,7 +142,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
 
-    if (!am_i_opped) {
+    if (!am_i_opped && !state->op_request_pending) {
       log_message(
           L_INFO, state,
           "[INFO] Not an operator in %s, searching for a trusted op...\n",
