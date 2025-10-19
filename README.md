@@ -32,17 +32,21 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
 
 ### Changelog
 
-* v1.1.2 - main branch (not packaged until further testing is complete)
+* v1.1.2 - 20251019
     * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for config file read/write
     * Enhancement: Modified config line values to make more sense as config options have been added
     * Enhancement: Moved AES-256-CBC config tools to legacy utils in the utils/ folder (legacy)
     * Enhancement: Created new config tools (encrypt_config.c/decrypt_config.c) using AES-256-GCM
+    * Enhancement: Bot now fully parses +o or -o mode lines when multiple nicks are included
+    * Fix: utils/decrypt_config.c no longer outputs decrypted data with superfluous lines
+    * Fix: utils/legacy_decrypt_config.c no longer outputs decrypted data with superfluous lines
     * Fix: Makefile now chmods 700 compiled binary
     * Fix: Added g_shutdown_flag to main bot loop to check for ctrl+c signal
     * Fix: Corrected utils/run_bot.sh to show ENV_VAR is customizable and must match bot.h value
     * Fix: Log level was being written to config even if default_log_level was not changed
     * Fix: Add validation to +adminmask, +oper, and +bot to prevent duplicate usermask additions
     * Fix: Modified utils/run_bot.sh for better environment var handling
+    * Fix: irc_parser.c contained multiple iterations of am_i_opped checks; removed duplicate
 
 * v1.1.1 - 20250928
     * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for bot-to-bot communication
