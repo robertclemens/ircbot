@@ -73,32 +73,39 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     char *target = strtok_r(params_copy, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
-    char *nick = strtok_r(NULL, " ", &saveptr_irc);
 
-    if (target && modes && nick && strcasecmp(nick, state->current_nick) == 0) {
-      chan_t *c = channel_find(state, target);
-      if (!c) return;
+    if (!target || !modes) return;
 
-      if (strstr(modes, "+o")) {
-        log_message(L_INFO, state,
-                    "[INFO] Received ops in %s. Clearing op request.\n",
-                    target);
-        state->op_request_pending = false;
+    chan_t *c = channel_find(state, target);
+    if (!c) return;
 
-        for (int i = 0; i < c->roster_count; i++) {
-          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-            c->roster[i].is_op = true;
-            break;
+    if (strstr(modes, "+o") || strstr(modes, "-o")) {
+      char *nick;
+      while ((nick = strtok_r(NULL, " ", &saveptr_irc)) != NULL) {
+        if (strcasecmp(nick, state->current_nick) == 0) {
+          if (strstr(modes, "+o")) {
+            log_message(L_INFO, state,
+                        "[INFO] Received ops in %s. Clearing op request.\n",
+                        target);
+            state->op_request_pending = false;
+
+            for (int i = 0; i < c->roster_count; i++) {
+              if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+                c->roster[i].is_op = true;
+                break;
+              }
+            }
+          } else if (strstr(modes, "-o")) {
+            log_message(L_INFO, state, "[INFO] Lost ops in %s.\n", target);
+
+            for (int i = 0; i < c->roster_count; i++) {
+              if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+                c->roster[i].is_op = false;
+                break;
+              }
+            }
           }
-        }
-      } else if (strstr(modes, "-o")) {
-        log_message(L_INFO, state, "[INFO] Lost ops in %s.\n", target);
-
-        for (int i = 0; i < c->roster_count; i++) {
-          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-            c->roster[i].is_op = false;
-            break;
-          }
+          break;
         }
       }
     }
