@@ -59,7 +59,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         decrypted_data[decrypted_len] = '\0';
 
         char *saveptr_bot;
-        char *received_timestamp_str = strtok_r((char *)decrypted_data, ":", &saveptr_bot);
+        char *received_timestamp_str =
+            strtok_r((char *)decrypted_data, ":", &saveptr_bot);
         char *received_nonce_str = strtok_r(NULL, ":", &saveptr_bot);
         char *command_part = strtok_r(NULL, "", &saveptr_bot);
 
@@ -91,7 +92,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
     if (ciphertext) free(ciphertext);
     if (tag) free(tag);
-    return;
   }
   if (!auth_check_hostmask(state, user_host)) {
     return;
@@ -126,8 +126,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       if (channel_find(state, channel_name)) {
-          irc_printf(state, "PRIVMSG %s :Error: Channel %s is already in my list.\r\n", nick, channel_name);
-          return;
+        irc_printf(state,
+                   "PRIVMSG %s :Error: Channel %s is already in my list.\r\n",
+                   nick, channel_name);
+        return;
       }
       if (arg1[0] == '#') {
         strncpy(channel_name, arg1, sizeof(channel_name) - 1);
@@ -189,10 +191,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       for (int i = 0; i < state->trusted_bot_count; i++) {
-          if (strcasecmp(state->trusted_bots[i], arg1) == 0) {
-              irc_printf(state, "PRIVMSG %s :Error: Trusted bot mask '%s' already exists.\r\n", nick, arg1);
-              return;
-          }
+        if (strcasecmp(state->trusted_bots[i], arg1) == 0) {
+          irc_printf(
+              state,
+              "PRIVMSG %s :Error: Trusted bot mask '%s' already exists.\r\n",
+              nick, arg1);
+          return;
+        }
       }
       if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
         state->trusted_bots[state->trusted_bot_count++] = strdup(arg1);
@@ -404,17 +409,21 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             nick);
         return;
       }
-      if (state->ignored_default_mask[0] != '\0' && strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
-          state->ignored_default_mask[0] = '\0';
-          config_write(state, state->startup_password);
-          irc_printf(state, "PRIVMSG %s :Re-enabling default admin mask '%'.\r\n", nick, arg1);
-          return;
+      if (state->ignored_default_mask[0] != '\0' &&
+          strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
+        state->ignored_default_mask[0] = '\0';
+        config_write(state, state->startup_password);
+        irc_printf(state, "PRIVMSG %s :Re-enabling default admin mask '%'.\r\n",
+                   nick, arg1);
+        return;
       }
       for (int i = 0; i < state->mask_count; i++) {
-          if (strcasecmp(state->auth_masks[i], arg1) == 0) {
-              irc_printf(state, "PRIVMSG %s :Error: Admin mask '%s' already exists.\r\n", nick, arg1);
-              return;
-          }
+        if (strcasecmp(state->auth_masks[i], arg1) == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Error: Admin mask '%s' already exists.\r\n",
+                     nick, arg1);
+          return;
+        }
       }
       if (state->mask_count < MAX_MASKS) {
         state->auth_masks[state->mask_count++] = strdup(arg1);
@@ -487,10 +496,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       for (int i = 0; i < state->op_mask_count; i++) {
-          if (strcasecmp(state->op_masks[i].mask, arg1) == 0) {
-              irc_printf(state, "PRIVMSG %s :Error: Operator mask '%s' already exists.\r\n", nick, arg1);
-              return;
-          }
+        if (strcasecmp(state->op_masks[i].mask, arg1) == 0) {
+          irc_printf(
+              state,
+              "PRIVMSG %s :Error: Operator mask '%s' already exists.\r\n", nick,
+              arg1);
+          return;
+        }
       }
       if (state->op_mask_count < MAX_OP_MASKS) {
         strncpy(state->op_masks[state->op_mask_count].mask, arg1,
