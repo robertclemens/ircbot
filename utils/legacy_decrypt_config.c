@@ -102,9 +102,7 @@ int main(int argc, char *argv[]) {
   EVP_CIPHER_CTX_free(ctx);
   free(ciphertext);
 
-  printf("\n--- Decrypted Content of '%s' ---\n", in_filename);
   printf("%s", plaintext);
-  printf("---------------------------------------\n");
 
   free(plaintext);
   return 0;
