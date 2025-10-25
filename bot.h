@@ -21,6 +21,7 @@
 #define DEFAULT_CHANNEL "#ircbot"                 // Default channel to join
 #define DEFAULT_USERMASK "*!*@adminhostmask.com"  // Your hostmask (admin)
 #define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
+#define VERSION_RESPONSE "A robot may not injure a human being" // This is the response to a CTCP Version
 
 #define GECOS "ircbot"         // Gecos field storage
 #define CONFIG_FILE ".ircbot.cnf"  // Config file name
@@ -55,7 +56,12 @@
 #define MAX_ROSTER_SIZE 50 // Max channel roster size to store. Increase if in very large channels.
 #define NONCE_CACHE_SIZE 32 // Nonce cache for secure communication. Prevents replay attacks
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
-#define GCM_TAG_LEN 16 // 16 bytes (128 bits) is industry standard. Do not change.
+#define GCM_TAG_LEN 16 // 16 bytes (128 bits) is industry standard. Do not change
+#define NUM_LOG_LEVELS 6 // For L_MSG, L_CTCP, L_INFO, L_CMD, L_RAW, L_DEBUG
+#define LOG_BUFFER_LINES 50   // Store the last 50 log lines for each log level
+#define MAX_LOG_LINE_LEN 256 // Max length of a single log line
+#define DEFAULT_LOG_LINES 10 // Default number of getlog lines to display to admin when requested if not provided
+#define MAX_LOG_LINES 20     // Max number of lines to cap getlog request to help prevent flooding
 
 extern volatile bool g_shutdown_flag;
 
@@ -93,6 +99,15 @@ typedef struct {
   char hostmask[MAX_MASK_LEN];
   bool is_op;
 } roster_entry_t;
+
+typedef struct {
+    char line[MAX_LOG_LINE_LEN];
+} log_entry_t;
+
+typedef struct {
+    log_entry_t entries[LOG_BUFFER_LINES];
+    int log_idx;
+} log_buffer_t;
 
 struct chan_t {
   char name[MAX_CHAN];
@@ -148,6 +163,7 @@ struct bot_state {
   char who_request_channel[MAX_CHAN];
   uint64_t recent_nonces[NONCE_CACHE_SIZE];
   int nonce_idx;
+  log_buffer_t in_memory_logs[NUM_LOG_LEVELS];
 };
 
 // --- Function Prototypes ---
