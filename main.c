@@ -26,13 +26,12 @@ static void state_init(bot_state_t *state) {
   state->mask_count = 0;
   state->op_mask_count = 0;
   state->trusted_bot_count = 0;
+  srand(time(NULL));
 }
 
 static void state_destroy(bot_state_t *state) {
   for (int i = 0; i < state->server_count; i++) free(state->server_list[i]);
   for (int i = 0; i < state->mask_count; i++) free(state->auth_masks[i]);
-  for (int i = 0; i < state->trusted_bot_count; i++)
-    free(state->trusted_bots[i]);
   channel_list_destroy(state);
 }
 
@@ -87,12 +86,13 @@ int main(void) {
 
   config_load(&state, state.startup_password, CONFIG_FILE);
 
+    log_message(L_DEBUG, &state, "[DEBUG] config_load() complete. mask_count: %d\n", state.mask_count);
+
   if (state.server_count == 0 && !state.default_server_ignored) {
     state.server_list[0] = strdup(DEFAULT_SERVER);
     state.server_count = 1;
   }
 
-  channel_add(&state, DEFAULT_CHANNEL);
   if (channel_find(&state, DEFAULT_CHANNEL) == NULL) {
     channel_add(&state, DEFAULT_CHANNEL);
   }
@@ -106,9 +106,13 @@ int main(void) {
     state.auth_masks[state.mask_count++] = strdup(DEFAULT_USERMASK);
   }
 
+   log_message(L_DEBUG, &state, "[DEBUG] Admin mask logic complete. Final mask_count: %d\n", state.mask_count);
+    for (int i = 0; i < state.mask_count; i++) {
+        log_message(L_DEBUG, &state, "[DEBUG] Mask [%d]: %s\n", i, state.auth_masks[i]);
+    }
+
   state.server_list[state.server_count] = NULL;
   state.auth_masks[state.mask_count] = NULL;
-  state.trusted_bots[state.trusted_bot_count] = NULL;
 
   while (!(state.status & S_DIE) && !g_shutdown_flag) {
     irc_check_status(&state);
