@@ -104,6 +104,15 @@ void parser_handle_line(bot_state_t *state, char *line) {
                 break;
               }
             }
+            if (!state->op_request_pending) {
+              log_message(L_DEBUG, state,
+                          "[DEBUG] Proactively refreshing roster for %s to "
+                          "find helper.\n",
+                          c->name);
+              c->roster_count = 0;
+              irc_printf(state, "WHO %s\r\n", c->name);
+              c->last_who_request = time(NULL);
+            }
           }
           break;
         }
@@ -154,17 +163,37 @@ void parser_handle_line(bot_state_t *state, char *line) {
           L_INFO, state,
           "[INFO] Not an operator in %s, searching for a trusted op...\n",
           c->name);
+
+      roster_entry_t *helpers[MAX_ROSTER_SIZE];
+      int helper_count = 0;
+
       for (int i = 0; i < c->roster_count; i++) {
         roster_entry_t *entry = &c->roster[i];
         if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
-          bot_comms_send_command(state, entry->nick, "OPME %s", c->name);
-          state->last_op_request_time = time(NULL);
-          state->op_request_pending = true;
-          return;
+          if (helper_count < MAX_ROSTER_SIZE) {
+            helpers[helper_count++] = entry;
+          }
         }
       }
-    }
 
+      if (helper_count > 0) {
+        int random_index = rand() % helper_count;
+        roster_entry_t *chosen_helper = helpers[random_index];
+
+        log_message(L_INFO, state,
+                    "[INFO] Found %d trusted ops. Randomly selected: %s. "
+                    "Sending OPME request.\n",
+                    helper_count, chosen_helper->nick);
+
+        bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+        state->last_op_request_time = time(NULL);
+        state->op_request_pending = true;
+        return;
+      } else {
+        log_message(L_INFO, state, "[INFO] No trusted operators found in %s.\n",
+                    c->name);
+      }
+    }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
     char *user = strtok_r(NULL, "@", &saveptr_irc);
@@ -172,8 +201,23 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *dest = strtok_r(params, " ", &saveptr_irc);
     char *message = strtok_r(NULL, "", &saveptr_irc);
     if (message && *message == ':') message++;
+
     if (nick && dest && message) {
-      commands_handle_private_message(state, nick, user, host, dest, message);
+      if (message[0] == '\001' && message[strlen(message) - 1] == '\001') {
+        log_message(L_CTCP, state, "[CTCP] (%s) %s\n", nick, message);
+
+        message[strlen(message) - 1] = '\0';
+        char *ctcp_command = message + 1;
+
+        if (strcasecmp(ctcp_command, "VERSION") == 0) {
+          irc_printf(state, "NOTICE %s :\001VERSION %s\001\r\n", nick,
+                     VERSION_RESPONSE);
+        } else if (strncasecmp(ctcp_command, "PING ", 5) == 0) {
+          irc_printf(state, "NOTICE %s :\001%s\001\r\n", nick, ctcp_command);
+        }
+      } else {
+        commands_handle_private_message(state, nick, user, host, dest, message);
+      }
     }
   } else if (strcmp(command, "JOIN") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
