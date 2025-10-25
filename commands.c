@@ -33,6 +33,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   char user_host[256];
   snprintf(user_host, sizeof(user_host), "%s!%s@%s", nick, user, host);
 
+  log_message(L_MSG, state, "[MSG] (%s): %s\n", user_host, message);
+
   if (auth_is_trusted_bot(state, user_host)) {
     char *saveptr_enc;
     char *encoded_ciphertext = strtok_r(message, ":", &saveptr_enc);
@@ -93,9 +95,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     if (ciphertext) free(ciphertext);
     if (tag) free(tag);
   }
-  if (!auth_check_hostmask(state, user_host)) {
-    return;
-  }
 
   char message_copy[MAX_BUFFER];
   strncpy(message_copy, message, sizeof(message_copy) - 1);
@@ -111,8 +110,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   if (auth_check_hostmask(state, user_host) &&
       auth_verify_password(password_attempt, state->bot_pass)) {
-    log_message(L_CMD, state, "[CMD] Admin command from %s: %s\n", user_host,
-                command);
+
+    log_message(L_CMD, state, "[CMD_ADMIN] Admin command from %s: %s %s %s\n", 
+                    user_host,
+                    command,
+                    (arg1 ? arg1 : ""),
+                    (arg2 ? arg2 : ""));
+
     if (strcasecmp(command, "die") == 0) {
       irc_printf(state, "QUIT :Sayonara.\r\n");
       state->status |= S_DIE;
@@ -253,7 +257,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         uptime_str[sizeof(uptime_str) - 1] = '\0';
       }
 
-      irc_printf(state, "PRIVMSG %s :--- Bot Status ---\r\n", nick);
+      irc_printf(state, "PRIVMSG %s :--- Bot Status :: %s %s ---\r\n", nick,
+                 BOT_NAME, BOT_VERSION);
       irc_printf(state, "PRIVMSG %s : Nick: %s (Target: %s)\r\n", nick,
                  state->current_nick, state->target_nick);
       irc_printf(state, "PRIVMSG %s : Server: %s (%s)\r\n", nick,
@@ -290,18 +295,30 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           strncpy(server_part, state->server_list[i], sizeof(server_part) - 1);
         }
         if (current_chan) {
+          bool am_i_opped = false;
+          for (int j = 0; j < current_chan->roster_count; j++) {
+            if (strcasecmp(current_chan->roster[j].nick, state->current_nick) ==
+                    0 &&
+                current_chan->roster[j].is_op) {
+              am_i_opped = true;
+              break;
+            }
+          }
+
+          const char *op_prefix = am_i_opped ? "@" : "";
           const char *status_str =
               (current_chan->status == C_IN) ? "IN" : "OUT";
+
           if (current_chan->key[0] != '\0') {
-            snprintf(chan_part, sizeof(chan_part), "%s (Key: %s) (%s)",
-                     current_chan->name, current_chan->key, status_str);
+            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s)",
+                     op_prefix, current_chan->name, current_chan->key,
+                     status_str);
           } else {
-            snprintf(chan_part, sizeof(chan_part), "%s (%s)",
+            snprintf(chan_part, sizeof(chan_part), "%s%s (%s)", op_prefix,
                      current_chan->name, status_str);
           }
           current_chan = current_chan->next;
         }
-
         snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
                  server_part, chan_part);
         irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
@@ -401,6 +418,81 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    "integer.\r\n",
                    nick);
       }
+    } else if (strcasecmp(command, "getlog") == 0) {
+      if (!arg1) {
+        irc_printf(state,
+                   "PRIVMSG %s :Syntax: getlog <level> [lines]. Levels are "
+                   "'msg' 'ctcp' 'info' 'cmd' 'raw' 'debug'. Default number of "
+                   "lines: %d. Max number of lines: %d.\r\n",
+                   nick, DEFAULT_LOG_LINES, MAX_LOG_LINES);
+        return;
+      }
+
+      int buffer_index = -1;
+      if (strcasecmp(arg1, "msg") == 0)
+        buffer_index = 0;
+      else if (strcasecmp(arg1, "ctcp") == 0)
+        buffer_index = 1;
+      else if (strcasecmp(arg1, "info") == 0)
+        buffer_index = 2;
+      else if (strcasecmp(arg1, "cmd") == 0)
+        buffer_index = 3;
+      else if (strcasecmp(arg1, "raw") == 0)
+        buffer_index = 4;
+      else if (strcasecmp(arg1, "debug") == 0)
+        buffer_index = 5;
+
+      if (buffer_index == -1) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: Unknown log level '%s'. Available "
+                   "levels are 'msg' 'ctcp' 'info' 'cmd' 'raw' 'debug'.\r\n",
+                   nick, arg1);
+        return;
+      }
+
+      int lines_to_show = DEFAULT_LOG_LINES;
+      if (arg2) {
+        lines_to_show = atoi(arg2);
+        if (lines_to_show <= 0) lines_to_show = DEFAULT_LOG_LINES;
+        if (lines_to_show > MAX_LOG_LINES) {
+          irc_printf(state,
+                     "PRIVMSG %s :Warning: Line count capped at %d to prevent "
+                     "flooding.\r\n",
+                     nick, MAX_LOG_LINES);
+          lines_to_show = MAX_LOG_LINES;
+        }
+      }
+
+      log_entry_t *matches[LOG_BUFFER_LINES];
+      int matches_found = 0;
+
+      log_buffer_t *buffer = &state->in_memory_logs[buffer_index];
+
+      for (int i = 0; i < LOG_BUFFER_LINES; i++) {
+        int idx = (buffer->log_idx + i) % LOG_BUFFER_LINES;
+        log_entry_t *entry = &buffer->entries[idx];
+        if (entry->line[0] != '\0') {
+          matches[matches_found++] = entry;
+        }
+      }
+
+      int lines_to_print =
+          (matches_found < lines_to_show) ? matches_found : lines_to_show;
+      int start_index = matches_found - lines_to_print;
+
+      irc_printf(state,
+                 "PRIVMSG %s :--- Start of Log (%s) - Showing last %d of %d "
+                 "lines --- \r\n",
+                 nick, arg1, lines_to_print, matches_found);
+
+      struct timespec delay = {0, 250000000};
+      nanosleep(&delay, NULL);
+
+      for (int i = matches_found - 1; i >= start_index; i--) {
+        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, matches[i]->line);
+        nanosleep(&delay, NULL);
+      }
+      irc_printf(state, "PRIVMSG %s :--- End of Log (%s) --- \r\n", nick, arg1);
     } else if (strcasecmp(command, "+adminmask") == 0) {
       if (!arg1) {
         irc_printf(
@@ -603,7 +695,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    "PRIVMSG %s :Admin commands: die, jump, op, join, part, "
                    "status, givenick, setnick, +server, -server, adminpass, "
                    "+adminmask, -adminmask, +oper, -oper, botpass, +bot, -bot, "
-                   "saveconf, setlog, help\r\n",
+                   "saveconf, setlog, getlog, help\r\n",
                    nick);
       } else {
         if (strcasecmp(arg1, "die") == 0) {
@@ -710,6 +802,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: setlog <loglevel> - Set loglevel for "
                      "output to a log file. 0=NONE,15=INFO,63=DEBUG.\r\n",
                      nick);
+        } else if (strcasecmp(arg1, "getlog") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: getlog <loglevel> [lines]. Get "
+                     "latest logs for requested loglevel. Levels are 'msg' "
+                     "'ctcp' 'info' 'cmd' 'raw' 'debug'. Default number of "
+                     "lines: %d. Max number of lines: %d.\r\n",
+                     nick, DEFAULT_LOG_LINES, MAX_LOG_LINES);
         } else if (strcasecmp(arg1, "join") == 0) {
           irc_printf(
               state,
@@ -728,14 +827,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
     }
   } else if (auth_verify_op_command(state, user_host, password_attempt)) {
-    log_message(L_CMD, state, "[CMD] Op command from %s: %s\n", user_host,
-                command);
-    if (strcasecmp(command, "op") == 0) {
-      char *saveptr_op;
-      char *arg1 = strtok_r(NULL, " ", &saveptr_op);
-      if (arg1) {
-        irc_printf(state, "MODE %s +o %s\r.n", arg1, nick);
-      }
+        log_message(L_CMD, state, "[CMD_OP] Op command from %s: %s %s\n",
+                    user_host,
+                    command,
+                    (arg1 ? arg1 : ""));
+
+        if (strcasecmp(command, "op") == 0) {
+            if (arg1) {
+                irc_printf(state, "MODE %s +o %s\r\n", arg1, nick);
+            }
+        }
     }
-  }
 }
