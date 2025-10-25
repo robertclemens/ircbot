@@ -53,20 +53,32 @@ bool auth_check_hostmask(const bot_state_t *state, const char *user_host) {
   if (is_explicitly_ignored) {
     return false;
   }
-  return true;
+  return false;
 }
 
 bool auth_verify_op_command(const bot_state_t *state, const char *user_host,
                             const char *hash_attempt) {
-  for (int i = 0; i < state->op_mask_count; i++) {
-    if (wildcard_match(state->op_masks[i].mask, user_host)) {
-      if (auth_verify_password(hash_attempt, state->op_masks[i].password)) {
-        return true;
-      }
+    log_message(L_DEBUG, state, "[DEBUG_OP] Checking op command from: %s\n", user_host);
+
+    for (int i = 0; i < state->op_mask_count; i++) {
+        log_message(L_DEBUG, state, "[DEBUG_OP] Checking against mask: %s\n", state->op_masks[i].mask);
+
+        if (wildcard_match(state->op_masks[i].mask, user_host)) {
+            log_message(L_DEBUG, state, "[DEBUG_OP] Hostmask MATCH. Checking password.\n");
+
+            if (auth_verify_password(hash_attempt, state->op_masks[i].password)) {
+                log_message(L_DEBUG, state, "[DEBUG_OP] Password MATCH. Authorizing.\n");
+                return true;
+            } else {
+                log_message(L_DEBUG, state, "[DEBUG_OP] Password FAIL. Denying.\n");
+            }
+        }
     }
-  }
-  return false;
+
+    log_message(L_DEBUG, state, "[DEBUG_OP] No matching op masks found. Denied.\n");
+    return false;
 }
+
 bool auth_verify_password(const char *hash_attempt,
                           const char *stored_password) {
   if (!hash_attempt || !stored_password || stored_password[0] == '\0')
