@@ -1,3 +1,3 @@
-v2.0.0 2025-10-25 https://github.com/robertclemens/ircbot/blob/main/releases/ircbot-2.0.0.tgz 0761a37e1b7f54a62ea8ebc2f16d42079de225301c9508611a59161ccc53c578 gcc,make,libssl,libcurl
+v2.0.0 2025-10-25 https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/ircbot-2.0.0.tgz 0761a37e1b7f54a62ea8ebc2f16d42079de225301c9508611a59161ccc53c578 gcc,make,libssl,libcurl
 v2.1.0 2025-10-26 https://github.com/user/repo/releases/download/v2.1.0/ircbot aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 gcc,make,libssl,libcurl
 v2.1.1 2025-10-27 https://github.com/user/repo/releases/download/v2.1.1/ircbot e149049665c5ff336fe528b07bde05775a1074ffb3e692586268c886b6476936 gcc,make,libssl,libcurl,libz
