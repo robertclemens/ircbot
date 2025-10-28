@@ -12,11 +12,11 @@
 
 void handle_crypto_errors_silent() { ERR_clear_error(); }
 
-void config_load(bot_state_t *state, const char *password,
+bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {
   FILE *in_file = fopen(filename, "rb");
   if (!in_file) {
-    return;
+    return false;
   }
 
   unsigned char iv[GCM_IV_LEN];
@@ -25,7 +25,7 @@ void config_load(bot_state_t *state, const char *password,
       fread(tag, 1, sizeof(tag), in_file) != sizeof(tag)) {
     log_message(L_INFO, state, "[CFG] Failed to read IV/Tag from config.\n");
     fclose(in_file);
-    return;
+    return false;
   }
 
   fseek(in_file, 0, SEEK_END);
@@ -33,7 +33,7 @@ void config_load(bot_state_t *state, const char *password,
   fseek(in_file, GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
   if (ciphertext_len <= 0) {
     fclose(in_file);
-    return;
+    return false;
   }
 
   unsigned char *ciphertext = malloc(ciphertext_len);
@@ -44,7 +44,7 @@ void config_load(bot_state_t *state, const char *password,
         "[CFG] Error: Could not read the full contents of the config file.\n");
     fclose(in_file);
     free(ciphertext);
-    return;
+    return false;
   }
   fclose(in_file);
 
@@ -74,21 +74,7 @@ void config_load(bot_state_t *state, const char *password,
         line = strtok_r(NULL, "\n", &saveptr1);
         continue;
       }
-      if (strncmp(line, "is:true", 7) == 0) {
-        state->default_server_ignored = true;
-        line = strtok_r(NULL, "\n", &saveptr1);
-        continue;
-      }
-      if (strncmp(line, "im:", 3) == 0) {
-        strncpy(state->ignored_default_mask, line + 3, MAX_MASK_LEN - 1);
-        line = strtok_r(NULL, "\n", &saveptr1);
-        continue;
-      }
-      if (strncmp(line, "ic:", 3) == 0) {
-        strncpy(state->ignored_default_channel, line + 3, MAX_CHAN - 1);
-        line = strtok_r(NULL, "\n", &saveptr1);
-        continue;
-      }
+
       char *value = strchr(line, ':');
       if (!value) {
         line = strtok_r(NULL, "\n", &saveptr1);
@@ -155,11 +141,26 @@ void config_load(bot_state_t *state, const char *password,
     log_message(
         L_INFO, state,
         "[CFG] GCM decryption failed. Incorrect password or corrupt file.\n");
+    EVP_CIPHER_CTX_free(ctx);
+    free(ciphertext);
+    free(plaintext);
+    return false;
   }
 
   EVP_CIPHER_CTX_free(ctx);
   free(ciphertext);
   free(plaintext);
+
+  if (state->target_nick[0] == '\0' || state->bot_pass[0] == '\0' ||
+      state->mask_count == 0 || state->server_count == 0 ||
+      state->chan_count == 0) {
+    log_message(L_INFO, state,
+                "[CFG] Config file is missing required fields (nick, admin "
+                "pass, admin mask, server, or channel).\n");
+    return false;
+  }
+
+  return true;
 }
 
 void config_write(const bot_state_t *state, const char *password) {
@@ -172,14 +173,13 @@ void config_write(const bot_state_t *state, const char *password) {
   int remaining = sizeof(plaintext_overrides);
   int written;
 
-  if (strcmp(state->target_nick, DEFAULT_NICK) != 0) {
-    written = snprintf(plaintext_overrides + offset, remaining, "n:%s\n",
-                       state->target_nick);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
+  written = snprintf(plaintext_overrides + offset, remaining, "n:%s\n",
+                     state->target_nick);
+  if (written > 0 && written < remaining) {
+    offset += written;
+    remaining -= written;
   }
+
   if (state->log_type != DEFAULT_LOG_LEVEL) {
     written = snprintf(plaintext_overrides + offset, remaining, "l:%d\n",
                        state->log_type);
@@ -188,16 +188,16 @@ void config_write(const bot_state_t *state, const char *password) {
       remaining -= written;
     }
   }
-  if (strcmp(state->bot_pass, DEFAULT_BOT_PASS) != 0) {
-    written = snprintf(plaintext_overrides + offset, remaining, "a:%s\n",
-                       state->bot_pass);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
+
+  written = snprintf(plaintext_overrides + offset, remaining, "a:%s\n",
+                     state->bot_pass);
+  if (written > 0 && written < remaining) {
+    offset += written;
+    remaining -= written;
   }
+
   for (int i = 0; i < state->server_count; i++) {
-    if (strcmp(state->server_list[i], DEFAULT_SERVER) != 0 && remaining > 1) {
+    if (remaining > 1) {
       written = snprintf(plaintext_overrides + offset, remaining, "s:%s\n",
                          state->server_list[i]);
       if (written > 0 && written < remaining) {
@@ -207,7 +207,7 @@ void config_write(const bot_state_t *state, const char *password) {
     }
   }
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    if (strcasecmp(c->name, DEFAULT_CHANNEL) != 0 && remaining > 1) {
+    if (remaining > 1) {
       if (c->key[0] != '\0') {
         written = snprintf(plaintext_overrides + offset, remaining, "c:%s %s\n",
                            c->name, c->key);
@@ -222,8 +222,7 @@ void config_write(const bot_state_t *state, const char *password) {
     }
   }
   for (int i = 0; i < state->mask_count; i++) {
-    if (strcasecmp(state->auth_masks[i], DEFAULT_USERMASK) != 0 &&
-        remaining > 1) {
+    if (remaining > 1) {
       written = snprintf(plaintext_overrides + offset, remaining, "m:%s\n",
                          state->auth_masks[i]);
       if (written > 0 && written < remaining) {
@@ -232,29 +231,7 @@ void config_write(const bot_state_t *state, const char *password) {
       }
     }
   }
-  if (state->ignored_default_channel[0] != '\0' && remaining > 1) {
-    written = snprintf(plaintext_overrides + offset, remaining, "ic:%s\n",
-                       state->ignored_default_channel);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
-  if (state->ignored_default_mask[0] != '\0' && remaining > 1) {
-    written = snprintf(plaintext_overrides + offset, remaining, "im:%s\n",
-                       state->ignored_default_mask);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
-  if (state->default_server_ignored && remaining > 1) {
-    written = snprintf(plaintext_overrides + offset, remaining, "is:true\n");
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
+
   if (state->bot_comm_pass[0] != '\0') {
     written = snprintf(plaintext_overrides + offset, remaining, "p:%s\n",
                        state->bot_comm_pass);
