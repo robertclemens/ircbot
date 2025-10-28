@@ -3,8 +3,13 @@
 ircbot
 config_tool
 decrypt_tool
-hash-password
 
 # Logs and configs
 *.log
 .ircbot
+.ircbot.cnf
+.ircbot.log
+.ircbot.pid
+
+#release information
+releases/
