@@ -4,22 +4,19 @@
 #include <netinet/in.h>
 #include <openssl/err.h>
 #include <openssl/ssl.h>
+#include <curl/curl.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <sys/socket.h>
 #include <time.h>
+#include <limits.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "1.1.2"
+#define BOT_VERSION "2.0.0"
 
 // Only edit this section
-#define DEFAULT_NICK "ircbot"         // Default bot nick
 #define DEFAULT_USER "ircbot"         // Default bot user
-#define DEFAULT_BOT_PASS "adminpass"  // Administration password
 #define VHOST "NULL"  // NULL for default host, set for alternate
-#define DEFAULT_SERVER "irc.efnet.org"            // Default irc server
-#define DEFAULT_CHANNEL "#ircbot"                 // Default channel to join
-#define DEFAULT_USERMASK "*!*@adminhostmask.com"  // Your hostmask (admin)
 #define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
 #define VERSION_RESPONSE "A robot may not injure a human being" // This is the response to a CTCP Version
 
@@ -29,6 +26,7 @@
 #define SALT_SIZE 8            // You do not need to change this
 #define DEFAULT_LOG_LEVEL 0 // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log"  // Log file name. Only used if log level > 0
+#define BOT_UPDATE_URL "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/releases.txt"
 // End of edit section
 
 // You should not edit below this line. While some of the macros may be editable, some macros may cause issues.
@@ -109,6 +107,11 @@ typedef struct {
     int log_idx;
 } log_buffer_t;
 
+typedef struct {
+    char *buffer;
+    size_t size;
+} http_response_t;
+
 struct chan_t {
   char name[MAX_CHAN];
   char key[MAX_KEY];
@@ -123,6 +126,8 @@ struct chan_t {
 
 struct bot_state {
   int server_fd;
+  int pid_fd;
+  char executable_path[PATH_MAX];
   bot_status_t status;
   char current_nick[MAX_NICK];
   char target_nick[MAX_NICK];
@@ -183,7 +188,7 @@ void change_proc_name(int argc, char *argv[]);
 void handle_signal(int signum);
 // config.c
 void config_read(bot_state_t *state, const char *filename);
-void config_load(bot_state_t *state, const char *password,
+bool config_load(bot_state_t *state, const char *password,
                  const char *filename);
 void config_write(const bot_state_t *state, const char *password);
 // channel.c
@@ -213,6 +218,12 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
 // utils.c
 void handle_fatal_error(const char *message);
 void get_local_ip(bot_state_t *state);
+void updater_check_for_updates(bot_state_t *state, const char *nick);
+void updater_perform_upgrade(bot_state_t *state, const char *nick, const char *version);
+// Function to download the file from the given URL
+bool util_download_file(const char *url, const char *path);
+// Function to compute the SHA256 hash of a local file
+bool util_sha256_file(const char *path, char *output_hash_hex);
 // logging.c
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
                  const char *format, ...);
