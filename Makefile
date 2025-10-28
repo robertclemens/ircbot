@@ -4,9 +4,9 @@ CC = gcc
 #FOR DEV
 #CFLAGS = -D_POSIX_C_SOURCE=200809L -Wall -Wextra -std=c11 -g
 #FOR RELEASE
-CFLAGS = -D_POSIX_C_SOURCE=200809L -Wall -Wextra -std=c11 -O2
+CFLAGS = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -std=c11 -O2
 
-LDFLAGS = -lssl -lcrypto
+LDFLAGS = -lssl -lcrypto -lcurl
 
 # Source files
 SRCS = main.c bot.c config.c channel.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c
