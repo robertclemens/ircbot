@@ -36,8 +36,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   log_message(L_MSG, state, "[MSG] (%s): %s\n", user_host, message);
 
   if (auth_is_trusted_bot(state, user_host)) {
+    char message_copy_bot[MAX_BUFFER];
+    strncpy(message_copy_bot, message, sizeof(message_copy_bot) - 1);
+    message_copy_bot[sizeof(message_copy_bot) - 1] = '\0';
+
     char *saveptr_enc;
-    char *encoded_ciphertext = strtok_r(message, ":", &saveptr_enc);
+    char *encoded_ciphertext = strtok_r(message_copy_bot, ":", &saveptr_enc);
     char *encoded_tag = strtok_r(NULL, "", &saveptr_enc);
 
     if (!encoded_ciphertext || !encoded_tag) return;
@@ -110,12 +114,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   if (auth_check_hostmask(state, user_host) &&
       auth_verify_password(password_attempt, state->bot_pass)) {
-
-    log_message(L_CMD, state, "[CMD_ADMIN] Admin command from %s: %s %s %s\n", 
-                    user_host,
-                    command,
-                    (arg1 ? arg1 : ""),
-                    (arg2 ? arg2 : ""));
+    log_message(L_CMD, state, "[CMD_ADMIN] Admin command from %s: %s %s %s\n",
+                user_host, command, (arg1 ? arg1 : ""), (arg2 ? arg2 : ""));
 
     if (strcasecmp(command, "die") == 0) {
       irc_printf(state, "QUIT :Sayonara.\r\n");
@@ -129,22 +129,21 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Syntax: join <#channel>\r\n", nick);
         return;
       }
+
+      if (arg1[0] == '#') {
+        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
+      } else {
+        snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
+      }
+      channel_name[sizeof(channel_name) - 1] = '\0';
+
       if (channel_find(state, channel_name)) {
         irc_printf(state,
                    "PRIVMSG %s :Error: Channel %s is already in my list.\r\n",
                    nick, channel_name);
         return;
       }
-      if (arg1[0] == '#') {
-        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
-      } else {
-        snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
-      }
-      if (state->ignored_default_channel[0] != '\0' &&
-          strcasecmp(arg1, DEFAULT_CHANNEL) == 0) {
-        state->ignored_default_channel[0] = '\0';
-        config_write(state, state->startup_password);
-      }
+
       chan_t *c = channel_add(state, channel_name);
       if (c && arg2) {
         strncpy(c->key, arg2, MAX_KEY - 1);
@@ -162,10 +161,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         strncpy(channel_name, arg1, sizeof(channel_name) - 1);
       } else {
         snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
-      }
-      if (strcasecmp(arg1, DEFAULT_CHANNEL) == 0) {
-        strncpy(state->ignored_default_channel, arg1, MAX_CHAN - 1);
-        config_write(state, state->startup_password);
       }
       if (channel_remove(state, arg1)) {
         irc_printf(state, "PART %s\r\n", channel_name);
@@ -501,14 +496,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             nick);
         return;
       }
-      if (state->ignored_default_mask[0] != '\0' &&
-          strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
-        state->ignored_default_mask[0] = '\0';
-        config_write(state, state->startup_password);
-        irc_printf(state, "PRIVMSG %s :Re-enabling default admin mask '%'.\r\n",
-                   nick, arg1);
-        return;
-      }
       for (int i = 0; i < state->mask_count; i++) {
         if (strcasecmp(state->auth_masks[i], arg1) == 0) {
           irc_printf(state,
@@ -528,15 +515,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(
             state,
             "PRIVMSG %s :Syntax: -adminmask <nick*!*user@hostmask.com>\r\n",
-            nick);
-        return;
-      }
-      if (strcasecmp(arg1, DEFAULT_USERMASK) == 0) {
-        strncpy(state->ignored_default_mask, arg1, MAX_MASK_LEN - 1);
-        config_write(state, state->startup_password);
-        irc_printf(
-            state,
-            "PRIVMSG %s :Default user mask is now ignored and saved.\r\n",
             nick);
         return;
       }
@@ -573,14 +551,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    nick);
       }
     } else if (strcasecmp(command, "+oper") == 0) {
-      if (!arg1) {
-        irc_printf(state,
-                   "PRIVMSG %s :Syntax: +oper <nick*!*user@hostmask.com> "
-                   "<password>\r\n",
-                   nick);
-        return;
-      }
-      if (!arg2) {
+      if (!arg1 || !arg2) {
         irc_printf(state,
                    "PRIVMSG %s :Syntax: +oper <nick*!*user@hostmask.com> "
                    "<password>\r\n",
@@ -635,14 +606,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                    nick);
         return;
       }
-      if (strcasecmp(arg1, DEFAULT_SERVER) == 0) {
-        state->default_server_ignored = false;
-        config_write(state, state->startup_password);
-        irc_printf(state,
-                   "PRIVMSG %s :Default server is now enabled and saved.\r\n",
-                   nick);
-        return;
-      }
       if (state->server_count < MAX_SERVERS) {
         state->server_list[state->server_count++] = strdup(arg1);
         state->server_list[state->server_count] = NULL;
@@ -656,14 +619,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (!arg1) {
         irc_printf(state,
                    "PRIVMSG %s :Syntax: -server <irc.network.net:6667>\r\n",
-                   nick);
-        return;
-      }
-      if (strcasecmp(arg1, DEFAULT_SERVER) == 0) {
-        state->default_server_ignored = true;
-        config_write(state, state->startup_password);
-        irc_printf(state,
-                   "PRIVMSG %s :Default server is now ignored and saved.\r\n",
                    nick);
         return;
       }
@@ -689,13 +644,19 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Error: Server not found in list.\r\n",
                    nick);
       }
+    } else if (strcasecmp(command, "update") == 0) {
+      if (arg1) {
+        updater_perform_upgrade(state, nick, arg1);
+      } else {
+        updater_check_for_updates(state, nick);
+      }
     } else if (strcasecmp(command, "help") == 0) {
       if (!arg1) {
         irc_printf(state,
                    "PRIVMSG %s :Admin commands: die, jump, op, join, part, "
                    "status, givenick, setnick, +server, -server, adminpass, "
                    "+adminmask, -adminmask, +oper, -oper, botpass, +bot, -bot, "
-                   "saveconf, setlog, getlog, help\r\n",
+                   "saveconf, setlog, getlog, update, help\r\n",
                    nick);
       } else {
         if (strcasecmp(arg1, "die") == 0) {
@@ -809,6 +770,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                      "'ctcp' 'info' 'cmd' 'raw' 'debug'. Default number of "
                      "lines: %d. Max number of lines: %d.\r\n",
                      nick, DEFAULT_LOG_LINES, MAX_LOG_LINES);
+        } else if (strcasecmp(arg1, "update") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: update without argument shows "
+                     "available versions. "
+                     "Run with update <ver> to download/compile/and update bot "
+                     "binary.\r\n",
+                     nick);
         } else if (strcasecmp(arg1, "join") == 0) {
           irc_printf(
               state,
@@ -825,17 +793,17 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                      nick, arg1);
         }
       }
-    }
-  } else if (auth_verify_op_command(state, user_host, password_attempt)) {
-        log_message(L_CMD, state, "[CMD_OP] Op command from %s: %s %s\n",
-                    user_host,
-                    command,
-                    (arg1 ? arg1 : ""));
+    } else if (auth_verify_op_command(state, user_host, password_attempt)) {
+      log_message(L_CMD, state, "[CMD_OP] Op command from %s: %s %s\n",
+                  user_host, command, (arg1 ? arg1 : ""));
 
-        if (strcasecmp(command, "op") == 0) {
-            if (arg1) {
-                irc_printf(state, "MODE %s +o %s\r\n", arg1, nick);
-            }
+      if (strcasecmp(command, "op") == 0) {
+        char *saveptr_op;
+        char *op_arg1 = strtok_r(arg1, " ", &saveptr_op);
+        if (op_arg1) {
+          irc_printf(state, "MODE %s +o %s\r\n", op_arg1, nick);
         }
+      }
     }
+  }
 }
