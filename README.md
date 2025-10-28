@@ -37,7 +37,7 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * Enhancement: Add ops status symbol @ to status output command to show whether bot is ops
     * Enhancement: Add bot program name and version to status output
     * Enhancement: Add getlog command to see last x lines of log from each type submitted with the latest logs shown first
-    * Enhancement: Add update command to update to a new version by downloading .tgz and compiling. Add libcurl-devel dependency. Dependency checks are run on update cmd before downloading. (still needs to be tested on multiple platforms)
+    * Enhancement: Add update command to update to a new version by downloading .tar.gz and compiling. Add libcurl-devel dependency. Dependency checks are run on update cmd before downloading. (still needs to be tested on multiple platforms)
     * Enhancement: Make sure help has all of the getlog help listings
     * Enhancement: Randomize which bot is selected from /who #channel for op request.
     * Enhancement: Bot now does an op check when deop'd to quickly ask for ops again

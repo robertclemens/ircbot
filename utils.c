@@ -335,7 +335,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   if (filename) {
     filename++;
   } else {
-    filename = "ircbot.new.tgz";
+    filename = "ircbot.new.tar.gz";
   }
 
   irc_printf(state, "PRIVMSG %s :Downloading %s...\r\n", nick, filename);
@@ -364,13 +364,13 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   char dir_name[256];
   strncpy(dir_name, filename, sizeof(dir_name) - 1);
   dir_name[sizeof(dir_name) - 1] = '\0';
-  char *tar_gz = strstr(dir_name, ".tgz");
+  char *tar_gz = strstr(dir_name, ".tar.gz");
   if (tar_gz) {
     *tar_gz = '\0';
   } else {
     irc_printf(
         state,
-        "PRIVMSG %s :Error: Invalid archive name. Must end in .tgz\r\n",
+        "PRIVMSG %s :Error: Invalid archive name. Must end in .tar.gz\r\n",
         nick);
     remove(filename);
     return;
