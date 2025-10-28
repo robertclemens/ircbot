@@ -11,6 +11,7 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * Compiler: gcc (Tested with: GCC 13.3.0)
     * Make: GNU Make (Tested with: GNU Make 4.3)
     * OpenSSL Libs: libssl-dev (Tested with: libssl-dev 3.0.13)   (IE: apt install libssl-dev on Ubuntu)
+    * LibCURL Libs: libcurl-dev
 
 ### How to use:
 1) Edit bot.h and modify the default variables in the edit section. This is what the bot will use to start. All later configuration may be modified with bot commands. Please get these variables correct!
@@ -31,6 +32,23 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * /botcmd botnick help
 
 ### Changelog
+
+* v2.0.0 - 20251028
+    *Enhancement: Add ops status symbol @ to status output command to show whether bot is ops
+    *Enhancement: Add bot program name and version to status output
+    *Enhancement: Add getlog command to see last x lines of log from each type submitted with the latest logs shown first
+    *Enhancement: Add update command to update to a new version by downloading .tgz and compiling. Add libcurl-devel dependency. Dependency checks are run on update cmd before downloading. (still needs to be tested on multiple platforms)
+    *Enhancement: Make sure help has all of the getlog help listings
+    *Enhancement: Randomize which bot is selected from /who #channel for op request.
+    *Enhancement: Bot now does an op check when deop'd to quickly ask for ops again
+    *Enhancement: Added a CTCP Version response that is modifiable to send a reply
+    *Enhancement: Most of the bot config is now done at first run with a -c parameter (more changes coming)
+    *Fix: L_MSG wasn't actually being used. Added log_message for inbound msg logging
+    *Fix: CTCPs were being logged in L_MSG and nothing in L_CTCP. Added basic CTCP processing
+    *Fix: L_CMD logs were missing the entire CMD string for Admin and Op commands sent
+    *Fix: add -D_XOPEN_SOURCE=700 to Makefile CFLAG for more platform support
+    *Critical Fix: auth_check_hostname was mistakenly left in a default allow state (return true) and was not blocking unknown user masks.
+    *Critical Fix: op command from opers (not admins) was not working. Refactored command logic
 
 * v1.1.2 - 20251019
     * Enhancement: Change AES-256-CBC implementation over to AES-256-GCM for config file read/write
