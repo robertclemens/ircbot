@@ -1,0 +1,4 @@
+#[ver] [release date] [download url] [sha256 hash] [dependencies]
+v2.0.0 2025-10-25 https://github.com/user/repo/releases/download/v2.0.0/ircbot 0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef gcc,make,libssl,libcurl
+v2.1.0 2025-10-26 https://github.com/user/repo/releases/download/v2.1.0/ircbot aabbccddeeff00112233445566778899aabbccddeeff00112233445566778899 gcc,make,libssl,libcurl
+v2.1.1 2025-10-27 https://github.com/user/repo/releases/download/v2.1.1/ircbot 1111111111111111111111111111111111111111111111111111111111111111 gcc,make,libssl,libcurl,libz
