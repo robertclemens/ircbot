@@ -137,6 +137,9 @@ static void run_config_wizard(void) {
           "cannot be too long.\n",
           MAX_NICK - 1);
     }
+    get_input("Enter bot username (ident)", state.user, sizeof(state.user));
+    get_input("Enter bot real name (gecos)", state.gecos, sizeof(state.gecos));
+    get_input("Enter VHOST IP (optional, press Enter for default [no vhost])", state.vhost, sizeof(state.vhost));
 
     printf("\n--- Setup Admin Password ---\n");
 
@@ -190,10 +193,14 @@ static void run_config_wizard(void) {
     printf("     Configuration Summary (Review)         \n");
     printf("==========================================\n");
     printf("Bot Nick:                   %s\n", state.target_nick);
+    printf("Bot Ident:                  %s\n", state.user);
+    printf("Bot GECOS (Real Name):      %s\n", state.gecos);
     printf("Admin Usermask:             %s\n", mask_buf);
     printf("IRC Server:                 %s\n", server_buf);
     printf("Initial Channel:            %s\n", chan_buf);
-    printf("Bot Pass / Admin Pass:      SET (Hidden)\n");
+    printf("Admin Password:             %s\n", state.bot_pass);
+    printf("Config Password:            %s\n", config_pass);
+    printf("Vhost:                      %s\n", state.vhost);
     printf("------------------------------------------\n");
 
     get_input("Does this configuration look correct? (Y/n)", confirm_char,
