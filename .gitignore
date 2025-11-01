@@ -10,6 +10,3 @@ decrypt_tool
 .ircbot.cnf
 .ircbot.log
 .ircbot.pid
-
-#release information
-releases/
