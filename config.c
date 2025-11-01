@@ -102,6 +102,15 @@ bool config_load(bot_state_t *state, const char *password,
         case 'a':
           strncpy(state->bot_pass, value, MAX_PASS - 1);
           break;
+        case 'u':
+          strncpy(state->user, value, sizeof(state->user) - 1);
+          break;
+        case 'g':
+          strncpy(state->gecos, value, sizeof(state->gecos) - 1);
+          break;
+        case 'v':
+          strncpy(state->vhost, value, sizeof(state->vhost) - 1);
+          break;
         case 's':
           if (state->server_count < MAX_SERVERS) {
             state->server_list[state->server_count++] = strdup(value);
@@ -151,15 +160,12 @@ bool config_load(bot_state_t *state, const char *password,
   free(ciphertext);
   free(plaintext);
 
-  if (state->target_nick[0] == '\0' || state->bot_pass[0] == '\0' ||
-      state->mask_count == 0 || state->server_count == 0 ||
-      state->chan_count == 0) {
-    log_message(L_INFO, state,
-                "[CFG] Config file is missing required fields (nick, admin "
-                "pass, admin mask, server, or channel).\n");
-    return false;
-  }
-
+  if (state->target_nick[0] == '\0' || state->user[0] == '\0' || state->gecos[0] == '\0' ||
+        state->bot_pass[0] == '\0' || state->mask_count == 0 || 
+        state->server_count == 0 || state->chan_count == 0) {
+        log_message(L_INFO, state, "[CFG] Config file is missing required fields (nick, user, gecos, admin pass, admin mask, server, or channel).\n");
+        return false;
+    }
   return true;
 }
 
@@ -195,7 +201,17 @@ void config_write(const bot_state_t *state, const char *password) {
     offset += written;
     remaining -= written;
   }
-
+    written = snprintf(plaintext_overrides + offset, remaining, "u:%s\n",
+                       state->user);
+    if (written > 0 && written < remaining) { offset += written; remaining -= written; }
+    
+    written = snprintf(plaintext_overrides + offset, remaining, "g:%s\n",
+                       state->gecos);
+    if (written > 0 && written < remaining) { offset += written; remaining -= written; }
+  if (state->vhost[0] != '\0') {
+      written = snprintf(plaintext_overrides + offset, remaining, "v:%s\n", state->vhost);
+      if (written > 0 && written < remaining) { offset += written; remaining -= written; }
+  }
   for (int i = 0; i < state->server_count; i++) {
     if (remaining > 1) {
       written = snprintf(plaintext_overrides + offset, remaining, "s:%s\n",
