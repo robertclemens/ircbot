@@ -15,12 +15,12 @@
 #define BOT_VERSION "2.0.0"
 
 // Only edit this section
-#define DEFAULT_USER "ircbot"         // Default bot user
+//#define DEFAULT_USER "ircbot"         // Default bot user
 #define VHOST "NULL"  // NULL for default host, set for alternate
 #define CONFIG_PASS_ENV_VAR "BOT_PASS"  // ENV variable for config password
 #define VERSION_RESPONSE "A robot may not injure a human being" // This is the response to a CTCP Version
 
-#define GECOS "ircbot"         // Gecos field storage
+//#define GECOS "ircbot"         // Gecos field storage
 #define CONFIG_FILE ".ircbot.cnf"  // Config file name
 #define PID_FILE ".ircbot.pid" // PID file name
 #define SALT_SIZE 8            // You do not need to change this
@@ -131,6 +131,9 @@ struct bot_state {
   bot_status_t status;
   char current_nick[MAX_NICK];
   char target_nick[MAX_NICK];
+  char user[64];
+  char gecos[128];
+  char vhost[128];
   char bot_pass[MAX_PASS];
   op_mask_t op_masks[MAX_OP_MASKS];
   int op_mask_count;
