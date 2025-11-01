@@ -91,20 +91,21 @@ void irc_connect(bot_state_t *state) {
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
       if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
         continue;
-      if (VHOST != NULL) {
-        struct sockaddr_in local_addr;
-        local_addr.sin_family = AF_INET;
-        local_addr.sin_port = 0;
-        local_addr.sin_addr.s_addr = inet_addr(VHOST);
 
-        if (bind(sockfd, (struct sockaddr *)&local_addr, sizeof(local_addr)) <
-            0) {
-          perror("bind failed");
-          close(sockfd);
-          sockfd = -1;
-          continue;
+     if (state->vhost[0] != '\0') {
+            struct sockaddr_in local_addr;
+            local_addr.sin_family = AF_INET;
+            local_addr.sin_port = 0;
+            local_addr.sin_addr.s_addr = inet_addr(state->vhost);
+
+            if (bind(sockfd, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
+                perror("bind failed");
+                close(sockfd);
+                sockfd = -1;
+                continue;
+            }
         }
-      }
+
       if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) {
         if (i == 0) {
           state->ssl_ctx = SSL_CTX_new(TLS_client_method());
@@ -150,7 +151,7 @@ void irc_connect(bot_state_t *state) {
     strncpy(state->current_nick, state->target_nick, MAX_NICK - 1);
     state->current_nick[MAX_NICK - 1] = '\0';
     irc_printf(state, "NICK %s\r\n", state->current_nick);
-    irc_printf(state, "USER %s 0 * :%s\r\n", DEFAULT_USER, GECOS);
+    irc_printf(state, "USER %s 0 * :%s\r\n", state->user, state->gecos);
   }
   state->current_server_index++;
 }
