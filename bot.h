@@ -121,9 +121,11 @@ struct chan_t {
   roster_entry_t roster[MAX_ROSTER_SIZE];
   int roster_count;
   time_t last_join_attempt;
+  bool op_request_pending;      // Is an op request pending for THIS channel?
+  time_t last_op_request_time;  // When was the last op request sent?
+  int op_request_retry_count;   // How many times have we tried?
   chan_t *next;
 };
-
 struct bot_state {
   int server_fd;
   int pid_fd;
@@ -152,8 +154,6 @@ struct bot_state {
   bool pong_pending;
   bool nick_change_pending;
   bool default_server_ignored;
-  bool op_request_pending;
-  time_t last_op_request_time;
   bool is_ssl;
   SSL_CTX *ssl_ctx;
   SSL *ssl;
