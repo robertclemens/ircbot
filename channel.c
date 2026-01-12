@@ -1,7 +1,6 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-
 #include "bot.h"
 
 chan_t *channel_add(bot_state_t *state, const char *name) {
@@ -14,9 +13,11 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
   strncpy(new_chan->name, name, MAX_CHAN - 1);
   new_chan->status = C_OUT;
   new_chan->last_join_attempt = 0;
-
   new_chan->key[0] = '\0';
-
+  new_chan->roster_count = 0;
+  new_chan->op_request_pending = false;
+  new_chan->last_op_request_time = 0;
+  new_chan->op_request_retry_count = 0;
   new_chan->next = NULL;
 
   if (state->chanlist == NULL) {
@@ -41,6 +42,7 @@ bool channel_remove(bot_state_t *state, const char *name) {
       else
         state->chanlist = current->next;
       free(current);
+      state->chan_count--;
       return true;
     }
     prev = current;
@@ -64,12 +66,15 @@ void channel_list_destroy(bot_state_t *state) {
     current = next;
   }
   state->chanlist = NULL;
+  state->chan_count = 0;
 }
 
 void channel_list_reset_status(bot_state_t *state) {
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     c->status = C_OUT;
     c->last_join_attempt = 0;
+    c->op_request_pending = false;
+    c->op_request_retry_count = 0;
   }
 }
 
@@ -86,25 +91,54 @@ void channel_manager_check_joins(bot_state_t *state) {
         irc_printf(state, "JOIN %s\r\n", c->name);
       }
       c->last_join_attempt = now;
+      continue;
     }
-
-    bool am_i_opped = false;
-    for (int i = 0; i < c->roster_count; i++) {
-      if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
-          c->roster[i].is_op) {
-        am_i_opped = true;
-        break;
+    if (c->status == C_IN) {
+      bool am_i_opped = false;
+      for (int i = 0; i < c->roster_count; i++) {
+        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
+            c->roster[i].is_op) {
+          am_i_opped = true;
+          break;
+        }
       }
-    }
-
-    if (c->status == C_IN && !am_i_opped &&
-        (now - c->last_who_request > ROSTER_REFRESH_INTERVAL)) {
-      log_message(L_DEBUG, state,
-                  "[DEBUG] Refreshing roster for %s because I am not an op.\n",
-                  c->name);
-      c->roster_count = 0;
-      irc_printf(state, "WHO %s\r\n", c->name);
-      c->last_who_request = now;
+      if (am_i_opped) {
+        if (c->op_request_pending) {
+          log_message(L_DEBUG, state,
+                      "[DEBUG] We have ops in %s. Clearing pending request.\n",
+                      c->name);
+          c->op_request_pending = false;
+          c->op_request_retry_count = 0;
+        }
+        continue;
+      }
+      bool should_refresh = false;
+      if (c->roster_count == 0 && (now - c->last_who_request > 30)) {
+        log_message(L_DEBUG, state,
+                    "[DEBUG] No roster for %s. Requesting WHO.\n",
+                    c->name);
+        should_refresh = true;
+      }
+      else if (now - c->last_who_request > ROSTER_REFRESH_INTERVAL) {
+        log_message(L_DEBUG, state,
+                    "[DEBUG] Periodic roster refresh for %s (not opped).\n",
+                    c->name);
+        should_refresh = true;
+      }
+      else if (c->op_request_pending && 
+               (now - c->last_op_request_time > 60) &&
+               c->op_request_retry_count < 5) {
+        log_message(L_DEBUG, state,
+                    "[DEBUG] Op request timeout in %s. Refreshing to retry.\n",
+                    c->name);
+        should_refresh = true;
+        c->op_request_pending = false;
+      }
+      if (should_refresh) {
+        c->roster_count = 0;
+        irc_printf(state, "WHO %s\r\n", c->name);
+        c->last_who_request = now;
+      }
     }
   }
 }
