@@ -79,46 +79,104 @@ void parser_handle_line(bot_state_t *state, char *line) {
     chan_t *c = channel_find(state, target);
     if (!c) return;
 
-    if (strstr(modes, "+o") || strstr(modes, "-o")) {
-      char *nick;
-      while ((nick = strtok_r(NULL, " ", &saveptr_irc)) != NULL) {
-        if (strcasecmp(nick, state->current_nick) == 0) {
-          if (strstr(modes, "+o")) {
-            log_message(L_INFO, state,
-                        "[INFO] Received ops in %s. Clearing op request.\n",
-                        target);
-            state->op_request_pending = false;
+    char *mode_ptr = modes;
+    bool adding = true;
+    int nick_index = 0;
 
-            for (int i = 0; i < c->roster_count; i++) {
-              if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-                c->roster[i].is_op = true;
-                break;
-              }
-            }
-          } else if (strstr(modes, "-o")) {
-            log_message(L_INFO, state, "[INFO] Lost ops in %s.\n", target);
-
-            for (int i = 0; i < c->roster_count; i++) {
-              if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-                c->roster[i].is_op = false;
-                break;
-              }
-            }
-            if (!state->op_request_pending) {
-              log_message(L_DEBUG, state,
-                          "[DEBUG] Proactively refreshing roster for %s to "
-                          "find helper.\n",
-                          c->name);
-              c->roster_count = 0;
-              irc_printf(state, "WHO %s\r\n", c->name);
-              c->last_who_request = time(NULL);
-            }
-          }
-          break;
-        }
-      }
+    char *nicks[MAX_ROSTER_SIZE];
+    int nick_count = 0;
+    char *nick;
+    while ((nick = strtok_r(NULL, " ", &saveptr_irc)) != NULL && nick_count < MAX_ROSTER_SIZE) {
+        nicks[nick_count++] = nick;
     }
-  } else if (strcmp(command, "352") == 0) {
+
+    while (*mode_ptr) {
+        if (*mode_ptr == '+') {
+            adding = true;
+        } else if (*mode_ptr == '-') {
+            adding = false;
+        } else if (*mode_ptr == 'o' && nick_index < nick_count) {
+            char *affected_nick = nicks[nick_index++];
+
+            if (strcasecmp(affected_nick, state->current_nick) == 0) {
+                if (adding) {
+                    log_message(L_INFO, state,
+                                "[INFO] Received ops in %s. Clearing op request.\n",
+                                target);
+                    c->op_request_pending = false;
+
+                    for (int i = 0; i < c->roster_count; i++) {
+                        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+                            c->roster[i].is_op = true;
+                            break;
+                        }
+                    }
+                } else {
+                    log_message(L_INFO, state, "[INFO] Lost ops in %s. Requesting help immediately.\n", target);
+
+                    for (int i = 0; i < c->roster_count; i++) {
+                        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
+                            c->roster[i].is_op = false;
+                            break;
+                        }
+                    }
+
+                    bool found_helper = false;
+                    if (!c->op_request_pending) {
+                        roster_entry_t *helpers[MAX_ROSTER_SIZE];
+                        int helper_count = 0;
+
+                        for (int i = 0; i < c->roster_count; i++) {
+                            roster_entry_t *entry = &c->roster[i];
+                            if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
+                                if (helper_count < MAX_ROSTER_SIZE) {
+                                    helpers[helper_count++] = entry;
+                                }
+                            }
+                        }
+
+                        if (helper_count > 0) {
+                            int random_index = rand() % helper_count;
+                            roster_entry_t *chosen_helper = helpers[random_index];
+
+                            log_message(L_INFO, state,
+                                        "[INFO] Found %d trusted ops in current roster. "
+                                        "Requesting ops from: %s\n",
+                                        helper_count, chosen_helper->nick);
+
+                            bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+                            c->op_request_pending = true;
+                            found_helper = true;
+                        }
+                    }
+
+                    if (!found_helper && !c->op_request_pending) {
+                        log_message(L_DEBUG, state,
+                                    "[DEBUG] No trusted ops in current roster. "
+                                    "Refreshing roster for %s\n",
+                                    c->name);
+                        c->roster_count = 0;
+                        irc_printf(state, "WHO %s\r\n", c->name);
+                        c->last_who_request = time(NULL);
+                    }
+                }
+            } else {
+                for (int i = 0; i < c->roster_count; i++) {
+                    if (strcasecmp(c->roster[i].nick, affected_nick) == 0) {
+                        c->roster[i].is_op = adding;
+                        log_message(L_DEBUG, state, "[DEBUG] Updated roster: %s is_op=%d in %s\n",
+                                    affected_nick, adding, target);
+                        break;
+                    }
+                }
+            }
+        } else if (*mode_ptr == 'v' || *mode_ptr == 'b' || *mode_ptr == 'k' ||
+                   *mode_ptr == 'l' || *mode_ptr == 'e' || *mode_ptr == 'I') {
+            nick_index++;
+        }
+        mode_ptr++;
+    }
+   } else if (strcmp(command, "352") == 0) {
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
 
@@ -151,48 +209,71 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     bool am_i_opped = false;
     for (int i = 0; i < c->roster_count; i++) {
-      if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
-          c->roster[i].is_op) {
-        am_i_opped = true;
-        break;
-      }
+        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
+            c->roster[i].is_op) {
+            am_i_opped = true;
+            break;
+        }
     }
 
-    if (!am_i_opped && !state->op_request_pending) {
-      log_message(
-          L_INFO, state,
-          "[INFO] Not an operator in %s, searching for a trusted op...\n",
-          c->name);
+    if (am_i_opped) {
+        if (c->op_request_pending) {
+            log_message(L_INFO, state, "[INFO] We have ops in %s now. Clearing request.\n",
+                        c->name);
+            c->op_request_pending = false;
+            c->op_request_retry_count = 0;
+        }
+        return;
+    }
 
-      roster_entry_t *helpers[MAX_ROSTER_SIZE];
-      int helper_count = 0;
+    time_t now = time(NULL);
+    if (c->op_request_pending && (now - c->last_op_request_time < 60)) {
+        log_message(L_DEBUG, state,
+                    "[DEBUG] Op request already pending for %s (sent %ld seconds ago)\n",
+                    c->name, now - c->last_op_request_time);
+        return;
+    }
+    if (c->op_request_retry_count >= 5) {
+        log_message(L_INFO, state,
+                    "[INFO] Gave up requesting ops in %s after %d attempts.\n",
+                    c->name, c->op_request_retry_count);
+        return;
+    }
 
-      for (int i = 0; i < c->roster_count; i++) {
+    log_message(L_INFO, state,
+                "[INFO] Not an operator in %s, searching for a trusted op...\n",
+                c->name);
+
+    roster_entry_t *helpers[MAX_ROSTER_SIZE];
+    int helper_count = 0;
+
+    for (int i = 0; i < c->roster_count; i++) {
         roster_entry_t *entry = &c->roster[i];
         if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
-          if (helper_count < MAX_ROSTER_SIZE) {
-            helpers[helper_count++] = entry;
-          }
+            if (helper_count < MAX_ROSTER_SIZE) {
+                helpers[helper_count++] = entry;
+            }
         }
-      }
+    }
 
-      if (helper_count > 0) {
+    if (helper_count > 0) {
         int random_index = rand() % helper_count;
         roster_entry_t *chosen_helper = helpers[random_index];
 
         log_message(L_INFO, state,
                     "[INFO] Found %d trusted ops. Randomly selected: %s. "
-                    "Sending OPME request.\n",
-                    helper_count, chosen_helper->nick);
+                    "Sending OPME request (attempt %d).\n",
+                    helper_count, chosen_helper->nick, c->op_request_retry_count + 1);
 
         bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
-        state->last_op_request_time = time(NULL);
-        state->op_request_pending = true;
-        return;
-      } else {
+        c->last_op_request_time = now;
+        c->op_request_pending = true;
+        c->op_request_retry_count++;
+    } else {
         log_message(L_INFO, state, "[INFO] No trusted operators found in %s.\n",
                     c->name);
-      }
+        c->last_op_request_time = now;
+        c->op_request_retry_count++;
     }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
