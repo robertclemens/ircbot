@@ -46,19 +46,26 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
     if (!encoded_ciphertext || !encoded_tag) return;
 
-    unsigned char *ciphertext = NULL;
+    unsigned char *decoded_data = NULL;
     unsigned char *tag = NULL;
-    int ciphertext_len = base64_decode(encoded_ciphertext, &ciphertext);
+    int decoded_len = base64_decode(encoded_ciphertext, &decoded_data);
     int tag_len = base64_decode(encoded_tag, &tag);
 
-    if (ciphertext_len > 0 && tag_len == GCM_TAG_LEN) {
+    if (decoded_len > (SALT_SIZE + GCM_IV_LEN) && tag_len == GCM_TAG_LEN) {
+
+      unsigned char salt[SALT_SIZE];
+      memcpy(salt, decoded_data, SALT_SIZE);
+
       unsigned char key[32];
-      EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+      EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
                      (const unsigned char *)state->bot_comm_pass,
                      strlen(state->bot_comm_pass), 1, key, NULL);
 
+      unsigned char *ciphertext_ptr = decoded_data + SALT_SIZE;
+      int ciphertext_len = decoded_len - SALT_SIZE;
+
       unsigned char *decrypted_data = malloc(ciphertext_len);
-      int decrypted_len = crypto_aes_gcm_decrypt(ciphertext, ciphertext_len,
+      int decrypted_len = crypto_aes_gcm_decrypt(ciphertext_ptr, ciphertext_len,
                                                  key, decrypted_data, tag);
 
       if (decrypted_len >= 0) {
@@ -93,10 +100,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             }
           }
         }
-        free(decrypted_data);
       }
+      free(decrypted_data);
     }
-    if (ciphertext) free(ciphertext);
+    if (decoded_data) free(decoded_data);
     if (tag) free(tag);
   }
 
@@ -105,17 +112,45 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   message_copy[sizeof(message_copy) - 1] = '\0';
 
   char *saveptr_adm;
-  char *password_attempt = strtok_r(message_copy, " ", &saveptr_adm);
-  if (!password_attempt) return;
+  char *auth_token = strtok_r(message_copy, " ", &saveptr_adm);
+  if (!auth_token) return;
+
+  char *saveptr_token;
+  char *nonce_str = strtok_r(auth_token, ":", &saveptr_token);
+  char *hash_str = strtok_r(NULL, "", &saveptr_token);
+
+  if (!nonce_str || !hash_str) {
+      return;
+  }
+
   char *command = strtok_r(NULL, " ", &saveptr_adm);
   if (!command) return;
   char *arg1 = strtok_r(NULL, " ", &saveptr_adm);
   char *arg2 = strtok_r(NULL, " ", &saveptr_adm);
 
-  if (auth_check_hostmask(state, user_host) &&
-      auth_verify_password(password_attempt, state->bot_pass)) {
-    log_message(L_CMD, state, "[CMD_ADMIN] Admin command from %s: %s %s %s\n",
-                user_host, command, (arg1 ? arg1 : ""), (arg2 ? arg2 : ""));
+  log_message(L_DEBUG, state, "[CMD_DEBUG] Parsed: Cmd='%s' Arg1='%s' Nonce='%s'\n",
+              command, (arg1 ? arg1 : "NULL"), nonce_str);
+
+  bool is_admin = false;
+  bool is_op    = false;
+
+  if (auth_check_hostmask(state, user_host)) {
+      if (auth_verify_password(state, nonce_str, hash_str, state->bot_pass)) {
+          is_admin = true;
+      }
+  }
+
+  if (!is_admin) {
+      log_message(L_CMD, state, "[CMD_DEBUG] Not Admin. Attempting Op Auth...\n");
+      if (auth_verify_op_command(state, user_host, nonce_str, hash_str)) {
+          is_op = true;
+      } else {
+          log_message(L_CMD, state, "[CMD_DEBUG] Op Auth returned FALSE.\n");
+      }
+  }
+
+  if (is_admin) {
+      log_message(L_CMD, state, "[CMD_ADMIN] Executing Admin Command...\n");
 
     if (strcasecmp(command, "die") == 0) {
       irc_printf(state, "QUIT :Sayonara.\r\n");
@@ -793,11 +828,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                      nick, arg1);
         }
       }
-    } else if (auth_verify_op_command(state, user_host, password_attempt)) {
+    }
+  } else if (is_op) {
       log_message(L_CMD, state, "[CMD_OP] Op command from %s: %s %s\n",
                   user_host, command, (arg1 ? arg1 : ""));
-
       if (strcasecmp(command, "op") == 0) {
+        if (arg1) {
         char *saveptr_op;
         char *op_arg1 = strtok_r(arg1, " ", &saveptr_op);
         if (op_arg1) {
