@@ -76,6 +76,26 @@ void irc_connect(bot_state_t *state) {
     ports_to_try[0] = port_from_config;
   }
 
+  struct sockaddr_storage vhost_addr;
+  int vhost_family = AF_UNSPEC;
+
+  if (state->vhost[0] != '\0' && strcasecmp(state->vhost, "NULL") != 0) {
+      struct sockaddr_in *v4 = (struct sockaddr_in *)&vhost_addr;
+      struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&vhost_addr;
+
+      if (inet_pton(AF_INET, state->vhost, &v4->sin_addr) == 1) {
+          vhost_family = AF_INET;
+          v4->sin_family = AF_INET;
+          v4->sin_port = 0;
+      } else if (inet_pton(AF_INET6, state->vhost, &v6->sin6_addr) == 1) {
+          vhost_family = AF_INET6;
+          v6->sin6_family = AF_INET6;
+          v6->sin6_port = 0;
+      } else {
+          log_message(L_INFO, state, "[WARN] Invalid VHOST IP '%s'. Ignoring.\n", state->vhost);
+      }
+  }
+
   int sockfd = -1;
   for (int i = 0; ports_to_try[i] != NULL && sockfd == -1; i++) {
     log_message(L_INFO, state, "[INFO] Attempting to connect to %s:%s...\n",
@@ -89,22 +109,26 @@ void irc_connect(bot_state_t *state) {
     if (getaddrinfo(host, ports_to_try[i], &hints, &res) != 0) continue;
 
     for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
+
+      if (vhost_family != AF_UNSPEC && p->ai_family != vhost_family) {
+          continue;
+      }
+
       if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
         continue;
 
-     if (state->vhost[0] != '\0') {
-            struct sockaddr_in local_addr;
-            local_addr.sin_family = AF_INET;
-            local_addr.sin_port = 0;
-            local_addr.sin_addr.s_addr = inet_addr(state->vhost);
+      if (vhost_family != AF_UNSPEC) {
+            socklen_t addr_len = (vhost_family == AF_INET) ? sizeof(struct sockaddr_in)
+                                                           : sizeof(struct sockaddr_in6);
 
-            if (bind(sockfd, (struct sockaddr*)&local_addr, sizeof(local_addr)) < 0) {
-                perror("bind failed");
+            if (bind(sockfd, (struct sockaddr*)&vhost_addr, addr_len) < 0) {
+                log_message(L_INFO, state, "[WARN] Failed to bind VHOST %s: %s\n",
+                            state->vhost, strerror(errno));
                 close(sockfd);
                 sockfd = -1;
                 continue;
             }
-        }
+      }
 
       if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) {
         if (i == 0) {
@@ -159,6 +183,12 @@ void irc_connect(bot_state_t *state) {
 void irc_handle_read(bot_state_t *state) {
   static char read_buffer[MAX_BUFFER * 2];
   static int buffer_len = 0;
+
+  if (buffer_len >= (int)(sizeof(read_buffer) - 1)) {
+      log_message(L_INFO, state, "[WARN] Receive buffer full (line too long). Flushing buffer.\n");
+      buffer_len = 0;
+  }
+
   ssize_t bytes_read;
   if (state->is_ssl) {
     bytes_read = SSL_read(state->ssl, read_buffer + buffer_len,
@@ -167,25 +197,38 @@ void irc_handle_read(bot_state_t *state) {
     bytes_read = read(state->server_fd, read_buffer + buffer_len,
                       sizeof(read_buffer) - buffer_len - 1);
   }
+
   if (bytes_read <= 0) {
     if (state->is_ssl &&
         SSL_get_error(state->ssl, bytes_read) != SSL_ERROR_ZERO_RETURN) {
       ERR_print_errors_fp(stderr);
     }
-    irc_disconnect(state);
-    buffer_len = 0;
+    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+        irc_disconnect(state);
+        buffer_len = 0;
+    }
     return;
   }
+
   buffer_len += bytes_read;
   read_buffer[buffer_len] = '\0';
+
+  char *line_start = read_buffer;
   char *line_end;
-  while ((line_end = strstr(read_buffer, "\r\n")) != NULL) {
+
+  while ((line_end = strstr(line_start, "\r\n")) != NULL) {
     *line_end = '\0';
-    log_message(L_RAW, state, "[RAW_RECV] %s\n", read_buffer);
-    parser_handle_line(state, read_buffer);
-    memmove(read_buffer, line_end + 2, strlen(line_end + 2) + 1);
-    buffer_len = strlen(read_buffer);
+    log_message(L_RAW, state, "[RAW_RECV] %s\n", line_start);
+    parser_handle_line(state, line_start);
+    line_start = line_end + 2;
   }
+
+  int remaining = buffer_len - (line_start - read_buffer);
+  if (remaining > 0 && line_start != read_buffer) {
+      memmove(read_buffer, line_start, remaining);
+  }
+  buffer_len = remaining;
+  read_buffer[buffer_len] = '\0';
 }
 
 void irc_check_status(bot_state_t *state) {
