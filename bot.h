@@ -52,6 +52,7 @@
 #define MAX_OP_MASKS 20 // Max number of operators
 #define MAX_TRUSTED_BOTS 20 // Max number of trusted bots
 #define MAX_ROSTER_SIZE 50 // Max channel roster size to store. Increase if in very large channels.
+#define MAX_SEEN_HASHES 64 // Stores admin request hashes to protect against anti-replay attacks
 #define NONCE_CACHE_SIZE 32 // Nonce cache for secure communication. Prevents replay attacks
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
 #define GCM_TAG_LEN 16 // 16 bytes (128 bits) is industry standard. Do not change
@@ -60,6 +61,7 @@
 #define MAX_LOG_LINE_LEN 256 // Max length of a single log line
 #define DEFAULT_LOG_LINES 10 // Default number of getlog lines to display to admin when requested if not provided
 #define MAX_LOG_LINES 20     // Max number of lines to cap getlog request to help prevent flooding
+#define MAX_CONFIG_SIZE (1024 * 1024) // Limit config file size to 1MB to provent OOM
 
 extern volatile bool g_shutdown_flag;
 
@@ -171,6 +173,8 @@ struct bot_state {
   char who_request_channel[MAX_CHAN];
   uint64_t recent_nonces[NONCE_CACHE_SIZE];
   int nonce_idx;
+  uint64_t admin_nonces[MAX_SEEN_HASHES]; 
+  int admin_nonce_idx;
   log_buffer_t in_memory_logs[NUM_LOG_LEVELS];
 };
 
@@ -178,11 +182,10 @@ struct bot_state {
 // main.c
 void ssl_init_openssl();
 // auth.c
-bool auth_verify_password(const char *hash_attempt,
-                          const char *stored_password);
+bool auth_verify_password(bot_state_t *state, const char *nonce_str, const char *hash_attempt, const char *stored_password);
 bool auth_check_hostmask(const bot_state_t *state, const char *user_host);
-bool auth_verify_op_command(const bot_state_t *state, const char *user_host,
-                            const char *hash_attempt);
+bool auth_verify_op_command(bot_state_t *state, const char *user_host,
+                            const char *nonce_str, const char *hash_attempt);
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host);
 // bot.c
 void setup_signals(void);
