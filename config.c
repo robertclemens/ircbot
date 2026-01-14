@@ -19,6 +19,13 @@ bool config_load(bot_state_t *state, const char *password,
     return false;
   }
 
+  unsigned char salt[SALT_SIZE];
+  if (fread(salt, 1, sizeof(salt), in_file) != sizeof(salt)) {
+      log_message(L_INFO, state, "[CFG] Failed to read Salt from config.\n");
+      fclose(in_file);
+      return false;
+  }
+
   unsigned char iv[GCM_IV_LEN];
   unsigned char tag[GCM_TAG_LEN];
   if (fread(iv, 1, sizeof(iv), in_file) != sizeof(iv) ||
@@ -29,15 +36,18 @@ bool config_load(bot_state_t *state, const char *password,
   }
 
   fseek(in_file, 0, SEEK_END);
-  long ciphertext_len = ftell(in_file) - GCM_IV_LEN - GCM_TAG_LEN;
-  fseek(in_file, GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
-  if (ciphertext_len <= 0) {
+  long ciphertext_len = ftell(in_file) - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
+  fseek(in_file, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
+
+  if (ciphertext_len <= 0 || ciphertext_len > MAX_CONFIG_SIZE) {
+    log_message(L_INFO, state, "[CFG] Error: Config file is empty or too large (Max 1MB).\n");
     fclose(in_file);
     return false;
   }
 
   unsigned char *ciphertext = malloc(ciphertext_len);
   if (!ciphertext) handle_fatal_error("malloc failed for ciphertext");
+
   if (fread(ciphertext, 1, ciphertext_len, in_file) != (size_t)ciphertext_len) {
     log_message(
         L_INFO, state,
@@ -49,7 +59,7 @@ bool config_load(bot_state_t *state, const char *password,
   fclose(in_file);
 
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
                  (unsigned char *)password, strlen(password), 1, key, NULL);
 
   unsigned char *plaintext = malloc(ciphertext_len + 1);
@@ -161,7 +171,7 @@ bool config_load(bot_state_t *state, const char *password,
   free(plaintext);
 
   if (state->target_nick[0] == '\0' || state->user[0] == '\0' || state->gecos[0] == '\0' ||
-        state->bot_pass[0] == '\0' || state->mask_count == 0 || 
+        state->bot_pass[0] == '\0' || state->mask_count == 0 ||
         state->server_count == 0 || state->chan_count == 0) {
         log_message(L_INFO, state, "[CFG] Config file is missing required fields (nick, user, gecos, admin pass, admin mask, server, or channel).\n");
         return false;
@@ -204,7 +214,7 @@ void config_write(const bot_state_t *state, const char *password) {
     written = snprintf(plaintext_overrides + offset, remaining, "u:%s\n",
                        state->user);
     if (written > 0 && written < remaining) { offset += written; remaining -= written; }
-    
+
     written = snprintf(plaintext_overrides + offset, remaining, "g:%s\n",
                        state->gecos);
     if (written > 0 && written < remaining) { offset += written; remaining -= written; }
@@ -282,8 +292,11 @@ void config_write(const bot_state_t *state, const char *password) {
     return;
   }
 
+  unsigned char salt[SALT_SIZE];
+  RAND_bytes(salt, sizeof(salt));
+
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
                  (unsigned char *)password, strlen(password), 1, key, NULL);
 
   unsigned char iv[GCM_IV_LEN];
@@ -312,6 +325,7 @@ void config_write(const bot_state_t *state, const char *password) {
     return;
   }
 
+  fwrite(salt, 1, sizeof(salt), out_file);
   fwrite(iv, 1, sizeof(iv), out_file);
   fwrite(tag, 1, sizeof(tag), out_file);
   fwrite(ciphertext, 1, ciphertext_len, out_file);
