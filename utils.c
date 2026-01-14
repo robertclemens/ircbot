@@ -187,16 +187,32 @@ static bool verify_sha256(const char *filepath, const char *expected_hash) {
   return (strcasecmp(hex_hash, expected_hash) == 0);
 }
 
+static bool validate_dependency_name(const char *dep) {
+  if (!dep || strlen(dep) == 0) return false;
+  if (strlen(dep) > 64) return false;
+
+  for (const char *p = dep; *p; p++) {
+    if (!isalnum(*p) && *p != '-' && *p != '_' && *p != '.' && *p != '+') {
+      return false;
+    }
+  }
+  return true;
+}
+
 static bool check_dependency(const char *dep) {
+  if (!validate_dependency_name(dep)) {
+      return false;
+  }
+
   char command[256];
 
-  if (strcmp(dep, "gcc") == 0 || strcmp(dep, "make") == 0 || 
+  if (strcmp(dep, "gcc") == 0 || strcmp(dep, "make") == 0 ||
       strcmp(dep, "tar") == 0 || strcmp(dep, "bash") == 0) {
     snprintf(command, sizeof(command), "command -v %s >/dev/null 2>&1", dep);
   } else {
     snprintf(command, sizeof(command),
              "pkg-config --exists %s >/dev/null 2>&1 || "
-             "echo '#include <%s.h>' | gcc -E - >/dev/null 2>&1", 
+             "echo '#include <%s.h>' | gcc -E - >/dev/null 2>&1",
              dep, dep);
   }
   return (system(command) == 0);
@@ -228,7 +244,7 @@ static bool validate_url(const char *url) {
       strstr(url, "githubusercontent.com") == NULL) {
     return false;
   }
-  if (strstr(url, ";") || strstr(url, "|") || strstr(url, "&") || 
+  if (strstr(url, ";") || strstr(url, "|") || strstr(url, "&") ||
       strstr(url, "`") || strstr(url, "$") || strstr(url, "$(")) {
     return false;
   }
@@ -239,7 +255,7 @@ void updater_check_for_updates(bot_state_t *state, const char *nick) {
   log_message(L_DEBUG, state, "[DEBUG] updater_check_for_updates called.\n");
   http_response_t response;
   response.buffer = NULL;
-  
+
   if (!fetch_url(BOT_UPDATE_URL, &response)) {
     irc_printf(state, "PRIVMSG %s :Failed to download release file.\r\n", nick);
     return;
@@ -304,7 +320,7 @@ void updater_check_for_updates(bot_state_t *state, const char *nick) {
         "PRIVMSG %s :To upgrade, type: update <version>. IE: update v2.0.0\r\n",
         nick);
   }
-  
+
   if (response.buffer) {
     free(response.buffer);
   }
@@ -507,7 +523,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
           safe_filename);
   fprintf(f, "echo \"[UPGRADE] Restarting bot...\"\n");
   fprintf(f, "exec %s\n", state->executable_path);
-  
+
   fclose(f);
 
   chmod("upgrade.sh", 0700);
