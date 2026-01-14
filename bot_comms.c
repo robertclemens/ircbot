@@ -37,24 +37,33 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   time_t current_time = time(NULL);
   uint64_t nonce;
   RAND_bytes((unsigned char *)&nonce, sizeof(nonce));
+
   snprintf(plaintext_message, sizeof(plaintext_message), "%ld:%llu:%s",
            current_time, (unsigned long long)nonce, command_part);
 
+  unsigned char salt[SALT_SIZE];
+  if (RAND_bytes(salt, sizeof(salt)) != 1) return;
+
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
                  (const unsigned char *)state->bot_comm_pass,
                  strlen(state->bot_comm_pass), 1, key, NULL);
 
   int plaintext_len = strlen(plaintext_message);
-  unsigned char ciphertext[512 + GCM_IV_LEN];
+
+  unsigned char ciphertext[SALT_SIZE + GCM_IV_LEN + 512 + 32];
   unsigned char tag[GCM_TAG_LEN];
 
   int encrypted_len =
       crypto_aes_gcm_encrypt((unsigned char *)plaintext_message, plaintext_len,
-                             key, ciphertext + GCM_IV_LEN, tag);
+                             key, ciphertext + SALT_SIZE, tag);
 
   if (encrypted_len > 0) {
-    char *encoded_ciphertext = base64_encode(ciphertext, encrypted_len);
+    memcpy(ciphertext, salt, SALT_SIZE);
+
+    int total_len = SALT_SIZE + encrypted_len;
+
+    char *encoded_ciphertext = base64_encode(ciphertext, total_len);
     char *encoded_tag = base64_encode(tag, GCM_TAG_LEN);
 
     irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick, encoded_ciphertext,
