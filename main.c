@@ -34,37 +34,43 @@ static void state_destroy(bot_state_t *state) {
   channel_list_destroy(state);
 }
 
+static void flush_stdin_if_needed(const char *buffer, size_t len) {
+  if (strlen(buffer) == len - 1 && strchr(buffer, '\n') == NULL) {
+    int c;
+    while ((c = getchar()) != '\n' && c != EOF);
+  }
+}
+
 static void get_input(const char *prompt, char *buffer, size_t len) {
   printf("%s: ", prompt);
   fflush(stdout);
 
-  char *result = fgets(buffer, len, stdin);
-  (void)result;
-
-  if (buffer[len - 1] != 0 && strchr(buffer, '\n') == NULL) {
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF) {
-    }
-    buffer[0] = 0;
-    buffer[1] = 0;
-  } else {
-    buffer[strcspn(buffer, "\r\n")] = 0;
+  if (fgets(buffer, len, stdin) == NULL) {
+    buffer[0] = '\0';
+    return;
   }
+
+  flush_stdin_if_needed(buffer, len);
+  buffer[strcspn(buffer, "\r\n")] = 0;
 }
 
 static void get_password(const char *prompt, char *buffer, size_t len) {
   struct termios oldt, newt;
   printf("%s: ", prompt);
   fflush(stdout);
+
   tcgetattr(STDIN_FILENO, &oldt);
   newt = oldt;
   newt.c_lflag &= ~ECHO;
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
 
-  char *result = fgets(buffer, len, stdin);
-  (void)result;
+  if (fgets(buffer, len, stdin) == NULL) {
+    buffer[0] = '\0';
+  } else {
+    flush_stdin_if_needed(buffer, len);
+    buffer[strcspn(buffer, "\r\n")] = 0;
+  }
 
-  buffer[strcspn(buffer, "\r\n")] = 0;
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   printf("\n");
 }
@@ -76,11 +82,11 @@ static bool get_confirmed_password(const char *prompt, char *buffer,
   get_password(prompt, buffer, len);
   get_password("Confirm password", confirm_buffer, sizeof(confirm_buffer));
 
-  if (strcmp(buffer, confirm_buffer) == 0) {
+  if (strcmp(buffer, confirm_buffer) == 0 && strlen(buffer) > 0) {
     printf("Passwords match. Accepted.\n");
     return true;
   } else {
-    printf("🚨 ERROR: Passwords do not match. Please try again.\n");
+    printf("🚨 ERROR: Passwords do not match or are empty. Please try again.\n");
     memset(buffer, 0, len);
     return false;
   }
@@ -92,7 +98,7 @@ static void run_config_wizard(void) {
   char mask_buf[MAX_MASK_LEN];
   char server_buf[MAX_BUFFER];
   char chan_buf[MAX_CHAN];
-  char confirm_char[2];
+  char confirm_char[16];
 
   printf("--- IRC Bot Initial Setup ---\n");
   printf("No config file found. Let's create one.\n\n");
@@ -109,16 +115,9 @@ static void run_config_wizard(void) {
     printf("==========================================\n");
 
     printf("\n--- Setup Config Master Password ---\n");
-    while (true) {
-      int c;
-      while ((c = getchar()) != '\n' && c != EOF);
-
-      if (get_confirmed_password(
+    while (!get_confirmed_password(
               "Enter new config password (for BOT_PASS env var)", config_pass,
-              MAX_PASS)) {
-        break;
-      }
-    }
+              MAX_PASS));
 
     printf("\n--- Setup Bot Nickname ---\n");
     while (true) {
@@ -132,23 +131,17 @@ static void run_config_wizard(void) {
         printf("Nick accepted: %s\n", state.target_nick);
         break;
       }
-      printf(
-          "🚨 ERROR: Invalid nick. Must be between 1 and %d characters and "
-          "cannot be too long.\n",
-          MAX_NICK - 1);
+      printf("🚨 ERROR: Invalid nick length.\n");
     }
+
     get_input("Enter bot username (ident)", state.user, sizeof(state.user));
     get_input("Enter bot real name (gecos)", state.gecos, sizeof(state.gecos));
-    get_input("Enter VHOST IP (optional, press Enter for default [no vhost])", state.vhost, sizeof(state.vhost));
+    get_input("Enter VHOST IP (optional, press Enter for default [no vhost])", 
+              state.vhost, sizeof(state.vhost));
 
     printf("\n--- Setup Admin Password ---\n");
-
-    int c;
-    while ((c = getchar()) != '\n' && c != EOF);
     while (!get_confirmed_password("Enter new bot ADMIN password",
-                                   state.bot_pass, MAX_PASS)) {
-      while ((c = getchar()) != '\n' && c != EOF);
-    }
+                                   state.bot_pass, MAX_PASS));
 
     printf("\n--- Setup Admin Usermask ---\n");
     while (true) {
@@ -159,22 +152,18 @@ static void run_config_wizard(void) {
         printf("Usermask accepted: %s\n", mask_buf);
         break;
       }
-      printf(
-          "🚨 ERROR: Invalid usermask format. Please include both '!' and '@' "
-          "(e.g., *!*@host).\n");
+      printf("🚨 ERROR: Invalid usermask. Must include '!' and '@' (e.g., *!*@host).\n");
     }
 
     printf("\n--- Setup IRC Server ---\n");
     while (true) {
       get_input("Enter IRC server (e.g., irc.efnet.org)", server_buf,
                 MAX_BUFFER);
-      if (strlen(server_buf) > 0 && strchr(server_buf, '.')) {
+      if (strlen(server_buf) > 3 && strchr(server_buf, '.')) {
         printf("Server accepted: %s\n", server_buf);
         break;
       }
-      printf(
-          "🚨 ERROR: Invalid server format. Please ensure it's a valid "
-          "hostname (e.g., irc.example.org).\n");
+      printf("🚨 ERROR: Invalid server format.\n");
     }
 
     printf("\n--- Setup Initial Channel ---\n");
@@ -184,9 +173,7 @@ static void run_config_wizard(void) {
         printf("Channel accepted: %s\n", chan_buf);
         break;
       }
-      printf(
-          "🚨 ERROR: Invalid channel format. Channel must start with '#' "
-          "(e.g., #channel).\n");
+      printf("🚨 ERROR: Channel must start with '#'.\n");
     }
 
     printf("\n==========================================\n");
