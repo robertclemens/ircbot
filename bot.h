@@ -12,7 +12,7 @@
 #include <limits.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "2.0.0"
+#define BOT_VERSION "2.1.0"
 
 // Only edit this section
 //#define DEFAULT_USER "ircbot"         // Default bot user
