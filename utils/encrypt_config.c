@@ -4,6 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
+#define SALT_SIZE 8 // Do not edit. This must match bot.h defines.
 #define GCM_IV_LEN 12 // Do not edit. This must match bot.h defines and is industry standard.
 #define GCM_TAG_LEN 16 // Do not edit. This must match bot.h defines and is industry standard.
 
@@ -33,14 +34,20 @@ int main(int argc, char *argv[]) {
     fread(plaintext, 1, plaintext_len, in_file);
     fclose(in_file);
 
+    unsigned char salt[SALT_SIZE];
+    if (RAND_bytes(salt, sizeof(salt)) != 1) {
+        fprintf(stderr, "Error generating salt.\n");
+        return 1;
+    }
+
     unsigned char key[32];
-    EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL, (unsigned char*)password, strlen(password), 1, key, NULL);
+    EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt, (unsigned char*)password, strlen(password), 1, key, NULL);
 
     unsigned char iv[GCM_IV_LEN];
     RAND_bytes(iv, sizeof(iv));
 
     unsigned char tag[GCM_TAG_LEN];
-    unsigned char *ciphertext = malloc(plaintext_len);
+    unsigned char *ciphertext = malloc(plaintext_len + 16);
     int ciphertext_len;
     int len;
 
@@ -54,6 +61,7 @@ int main(int argc, char *argv[]) {
     FILE *out_file = fopen(out_filename, "wb");
     if (!out_file) { perror("fopen output"); return 1; }
 
+    fwrite(salt, 1, sizeof(salt), out_file);
     fwrite(iv, 1, sizeof(iv), out_file);
     fwrite(tag, 1, sizeof(tag), out_file);
     fwrite(ciphertext, 1, ciphertext_len, out_file);
