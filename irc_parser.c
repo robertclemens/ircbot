@@ -4,6 +4,120 @@
 
 #include "bot.h"
 
+// [UPDATED] Helper to handle mode changes securely + immediate Op Recovery
+static void channel_handle_mode_change(bot_state_t *state, const char *channel, 
+                                       const char *modes, char *args) {
+    chan_t *c = channel_find(state, channel);
+    if (!c) return;
+
+    bool adding = true; // Default direction
+    char *saveptr;
+    // Initialize tokenizing the arguments string
+    char *current_arg = strtok_r(args, " ", &saveptr);
+
+    for (int i = 0; modes[i] != '\0'; i++) {
+        char mode = modes[i];
+
+        if (mode == '+') {
+            adding = true;
+        } else if (mode == '-') {
+            adding = false;
+        } 
+        // --- Modes that ALWAYS take an argument ---
+        else if (mode == 'o' || mode == 'v' || mode == 'b' || mode == 'e' || mode == 'I') {
+            if (current_arg) {
+                // Handle OPS (+o / -o)
+                if (mode == 'o') {
+                    // Check if it affects US
+                    if (strcasecmp(current_arg, state->current_nick) == 0) {
+                        for(int k=0; k < c->roster_count; k++) {
+                            if(strcasecmp(c->roster[k].nick, state->current_nick) == 0) {
+                                c->roster[k].is_op = adding;
+                                break;
+                            }
+                        }
+                        if (adding) {
+                            c->op_request_pending = false; 
+                            log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
+                        } else {
+                            // [RESTORED] Immediate Op Recovery Logic
+                            log_message(L_INFO, state, "[INFO] I was DEOPPED in %s. Requesting help immediately.\n", channel);
+                            
+                            bool found_helper = false;
+                            
+                            // Only request if we aren't already pending (to prevent spam loops)
+                            if (!c->op_request_pending) {
+                                roster_entry_t *helpers[MAX_ROSTER_SIZE];
+                                int helper_count = 0;
+
+                                // 1. Scan existing roster for trusted bots that are OPs
+                                for (int x = 0; x < c->roster_count; x++) {
+                                    roster_entry_t *entry = &c->roster[x];
+                                    if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
+                                        if (helper_count < MAX_ROSTER_SIZE) {
+                                            helpers[helper_count++] = entry;
+                                        }
+                                    }
+                                }
+
+                                // 2. Pick one and request ops
+                                if (helper_count > 0) {
+                                    int random_index = rand() % helper_count;
+                                    roster_entry_t *chosen_helper = helpers[random_index];
+
+                                    log_message(L_INFO, state,
+                                                "[INFO] Found %d trusted ops. Requesting ops from: %s\n",
+                                                helper_count, chosen_helper->nick);
+
+                                    bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+                                    c->op_request_pending = true;
+                                    c->last_op_request_time = time(NULL);
+                                    found_helper = true;
+                                }
+                            }
+
+                            // 3. If no helper found, trigger immediate roster refresh
+                            if (!found_helper && !c->op_request_pending) {
+                                log_message(L_DEBUG, state,
+                                            "[DEBUG] No trusted ops found locally. Refreshing roster for %s\n",
+                                            c->name);
+                                c->roster_count = 0;
+                                irc_printf(state, "WHO %s\r\n", c->name);
+                                c->last_who_request = time(NULL);
+                            }
+                        }
+                    } 
+                    // Check if it affects SOMEONE ELSE in our roster
+                    else {
+                        for(int k=0; k < c->roster_count; k++) {
+                            if(strcasecmp(c->roster[k].nick, current_arg) == 0) {
+                                c->roster[k].is_op = adding;
+                                log_message(L_DEBUG, state, "[DEBUG] Roster update: %s is_op=%d in %s\n", 
+                                            current_arg, adding, channel);
+                                break;
+                            }
+                        }
+                    }
+                }
+                
+                // Consumed one argument, move to next
+                current_arg = strtok_r(NULL, " ", &saveptr);
+            }
+        }
+        // --- Modes that CONDITIONALLY take an argument ---
+        else if (mode == 'k') {
+            if (current_arg) current_arg = strtok_r(NULL, " ", &saveptr);
+        }
+        else if (mode == 'l') {
+            // +l takes arg (limit). -l DOES NOT take arg.
+            if (adding && current_arg) {
+                current_arg = strtok_r(NULL, " ", &saveptr);
+            }
+        }
+        // --- Modes that NEVER take an argument (t, s, i, n, m, p, etc) ---
+    }
+}
+
 void parser_handle_line(bot_state_t *state, char *line) {
   if (strncmp(line, "PING :", 6) == 0) {
     irc_printf(state, "PONG :%s\r\n", line + 6);
@@ -66,117 +180,22 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
       }
     }
-  } else if (strcmp(command, "MODE") == 0 && params) {
-    char params_copy[MAX_BUFFER];
-    strncpy(params_copy, params, sizeof(params_copy) - 1);
-    params_copy[sizeof(params_copy) - 1] = '\0';
+  } 
+  // [MODIFIED] Robust MODE Parsing + Immediate Op Recovery
+  else if (strcmp(command, "MODE") == 0 && params) {
+      char params_copy[MAX_BUFFER];
+      strncpy(params_copy, params, sizeof(params_copy) - 1);
+      params_copy[sizeof(params_copy) - 1] = '\0';
 
-    char *target = strtok_r(params_copy, " ", &saveptr_irc);
-    char *modes = strtok_r(NULL, " ", &saveptr_irc);
-
-    if (!target || !modes) return;
-
-    chan_t *c = channel_find(state, target);
-    if (!c) return;
-
-    char *mode_ptr = modes;
-    bool adding = true;
-    int nick_index = 0;
-
-    char *nicks[MAX_ROSTER_SIZE];
-    int nick_count = 0;
-    char *nick;
-    while ((nick = strtok_r(NULL, " ", &saveptr_irc)) != NULL && nick_count < MAX_ROSTER_SIZE) {
-        nicks[nick_count++] = nick;
-    }
-
-    while (*mode_ptr) {
-        if (*mode_ptr == '+') {
-            adding = true;
-        } else if (*mode_ptr == '-') {
-            adding = false;
-        } else if (*mode_ptr == 'o' && nick_index < nick_count) {
-            char *affected_nick = nicks[nick_index++];
-
-            if (strcasecmp(affected_nick, state->current_nick) == 0) {
-                if (adding) {
-                    log_message(L_INFO, state,
-                                "[INFO] Received ops in %s. Clearing op request.\n",
-                                target);
-                    c->op_request_pending = false;
-
-                    for (int i = 0; i < c->roster_count; i++) {
-                        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-                            c->roster[i].is_op = true;
-                            break;
-                        }
-                    }
-                } else {
-                    log_message(L_INFO, state, "[INFO] Lost ops in %s. Requesting help immediately.\n", target);
-
-                    for (int i = 0; i < c->roster_count; i++) {
-                        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0) {
-                            c->roster[i].is_op = false;
-                            break;
-                        }
-                    }
-
-                    bool found_helper = false;
-                    if (!c->op_request_pending) {
-                        roster_entry_t *helpers[MAX_ROSTER_SIZE];
-                        int helper_count = 0;
-
-                        for (int i = 0; i < c->roster_count; i++) {
-                            roster_entry_t *entry = &c->roster[i];
-                            if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
-                                if (helper_count < MAX_ROSTER_SIZE) {
-                                    helpers[helper_count++] = entry;
-                                }
-                            }
-                        }
-
-                        if (helper_count > 0) {
-                            int random_index = rand() % helper_count;
-                            roster_entry_t *chosen_helper = helpers[random_index];
-
-                            log_message(L_INFO, state,
-                                        "[INFO] Found %d trusted ops in current roster. "
-                                        "Requesting ops from: %s\n",
-                                        helper_count, chosen_helper->nick);
-
-                            bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
-                            c->op_request_pending = true;
-                            found_helper = true;
-                        }
-                    }
-
-                    if (!found_helper && !c->op_request_pending) {
-                        log_message(L_DEBUG, state,
-                                    "[DEBUG] No trusted ops in current roster. "
-                                    "Refreshing roster for %s\n",
-                                    c->name);
-                        c->roster_count = 0;
-                        irc_printf(state, "WHO %s\r\n", c->name);
-                        c->last_who_request = time(NULL);
-                    }
-                }
-            } else {
-                for (int i = 0; i < c->roster_count; i++) {
-                    if (strcasecmp(c->roster[i].nick, affected_nick) == 0) {
-                        c->roster[i].is_op = adding;
-                        log_message(L_DEBUG, state, "[DEBUG] Updated roster: %s is_op=%d in %s\n",
-                                    affected_nick, adding, target);
-                        break;
-                    }
-                }
-            }
-        } else if (*mode_ptr == 'v' || *mode_ptr == 'b' || *mode_ptr == 'k' ||
-                   *mode_ptr == 'l' || *mode_ptr == 'e' || *mode_ptr == 'I') {
-            nick_index++;
-        }
-        mode_ptr++;
-    }
-   } else if (strcmp(command, "352") == 0) {
+      char *target = strtok_r(params_copy, " ", &saveptr_irc);
+      char *modes = strtok_r(NULL, " ", &saveptr_irc);
+      char *args = strtok_r(NULL, "", &saveptr_irc);
+      
+      if (target && modes && (target[0] == '#' || target[0] == '&')) {
+          channel_handle_mode_change(state, target, modes, args);
+      }
+  } 
+  else if (strcmp(command, "352") == 0) {
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
 
@@ -228,9 +247,6 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     time_t now = time(NULL);
     if (c->op_request_pending && (now - c->last_op_request_time < 60)) {
-        log_message(L_DEBUG, state,
-                    "[DEBUG] Op request already pending for %s (sent %ld seconds ago)\n",
-                    c->name, now - c->last_op_request_time);
         return;
     }
     if (c->op_request_retry_count >= 5) {
@@ -240,10 +256,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
         return;
     }
 
-    log_message(L_INFO, state,
-                "[INFO] Not an operator in %s, searching for a trusted op...\n",
-                c->name);
-
+    // Standard Polling Logic (runs if roster refresh happened naturally)
     roster_entry_t *helpers[MAX_ROSTER_SIZE];
     int helper_count = 0;
 
@@ -270,8 +283,6 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->op_request_pending = true;
         c->op_request_retry_count++;
     } else {
-        log_message(L_INFO, state, "[INFO] No trusted operators found in %s.\n",
-                    c->name);
         c->last_op_request_time = now;
         c->op_request_retry_count++;
     }
