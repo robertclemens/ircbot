@@ -4,6 +4,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#define SALT_SIZE 8 // Do not edit. This must match bot.h defines.
 #define GCM_IV_LEN 12 // Do not edit. This must match bot.h defines and is industry standard.
 #define GCM_TAG_LEN 16 // Do not edit. This must match bot.h defines and is industry standard.
 
@@ -28,7 +29,13 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 1. Read the IV and Authentication Tag from the beginning of the file
+    unsigned char salt[SALT_SIZE];
+    if (fread(salt, 1, sizeof(salt), in_file) != sizeof(salt)) {
+        fprintf(stderr, "Error: Could not read Salt.\n");
+        fclose(in_file);
+        return 1;
+    }
+
     unsigned char iv[GCM_IV_LEN];
     unsigned char tag[GCM_TAG_LEN];
     if (fread(iv, 1, sizeof(iv), in_file) != sizeof(iv) ||
@@ -38,10 +45,9 @@ int main(int argc, char *argv[]) {
         return 1;
     }
 
-    // 2. Read the rest of the file as the ciphertext
     fseek(in_file, 0, SEEK_END);
-    long ciphertext_len = ftell(in_file) - GCM_IV_LEN - GCM_TAG_LEN;
-    fseek(in_file, GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
+    long ciphertext_len = ftell(in_file) - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
+    fseek(in_file, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
 
     if (ciphertext_len <= 0) {
         fprintf(stderr, "Error: No ciphertext found in file.\n");
@@ -58,16 +64,14 @@ int main(int argc, char *argv[]) {
     fread(ciphertext, 1, ciphertext_len, in_file);
     fclose(in_file);
 
-    // 3. Derive the key from the password (no salt needed for GCM key derivation here)
     unsigned char key[32];
-    if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), NULL,
+    if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
                        (unsigned char *)password, strlen(password), 1, key,
                        NULL) == 0) {
         fprintf(stderr, "Error: Failed to derive key from password.\n");
         handle_crypto_errors();
     }
 
-    // 4. Decrypt the data using GCM
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
     unsigned char *plaintext = malloc(ciphertext_len + 1);
     if (!plaintext) {
@@ -83,13 +87,16 @@ int main(int argc, char *argv[]) {
     EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
 
     if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) <= 0) {
-        fprintf(stderr, "Error: Decryption failed. The password is incorrect or the file has been tampered with.\n");
+        fprintf(stderr, "Error: Decryption failed. The password or salt is incorrect or the file has been tampered with.\n");
         handle_crypto_errors();
+        EVP_CIPHER_CTX_free(ctx);
+        free(ciphertext);
+        free(plaintext);
+        return 1;
     }
     plaintext_len += len;
     plaintext[plaintext_len] = '\0';
 
-    // 5. Clean up and print the result
     EVP_CIPHER_CTX_free(ctx);
     free(ciphertext);
 
