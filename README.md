@@ -14,17 +14,20 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * LibCURL Libs: libcurl-dev
 
 ### How to use:
-1) Edit bot.h and modify the default variables in the edit section. This is what the bot will use to start. All later configuration may be modified with bot commands. Please get these variables correct!
+1) Take a look at bot.h if you want to set any custom time intervals. Defaults should be good so I recommend leaving alone unless you run into something later.
 
 2) Run `"make && make install"`
     * "make" creates the binary
     * "make install" cleans the directory of all config and compiler objects.
 
-3) Start ircbot. Choose config password and use run_bot.sh in utils/ to start the bot. 
+3) Run `"./ircbot -c"`
+    * This loads the config wizard to create your initial config file. 
+
+4) Start ircbot. Choose config password and use run_bot.sh in utils/ to start the bot. Config password must be set in run_bot.sh before running. 
     * ./run_bot.sh
     * Example crontab line:  */5 * * * * /home/user/ircbot/run_bot.sh 1>/dev/null 2>/dev/null
 
-4) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
+5) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
 * Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
     * /msg botnick <hash_output> help
 * IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/ or place in ~/.irssi/scripts/autorun/ for automatic loading upon starting irssi. 
@@ -32,6 +35,15 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * /botcmd botnick help
 
 ### Changelog
+
+* v2.1.0 - 20260115
+    * Enhancement: Flattened admin and op command functions to make it easier to determine communication type
+    * Enchancement: Changed vhost processing to more reliable functions and allow for ipv6 usage
+    * Fix: Refactored authentication to all use a nonce to increase replay protection further
+    * Fix: Ensured proper salting in AES-256-GCM implementations as standard even when using a nonce
+    * Fix: Refactored irc_parser.c for mode handling to catch some rare scenarios where the bot did not have op awareness
+    * Fix: Added additional parsing and mode handlers for the update functions in utils including the potential for MITM attacks
+
 
 * v2.0.0 - 20251028
     * Enhancement: Add ops status symbol @ to status output command to show whether bot is ops
