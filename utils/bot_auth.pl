@@ -5,7 +5,7 @@ use Irssi::Irc;
 use Digest::SHA qw(sha256_hex);
 
 # --- Script Information ---
-our $VERSION = '1.2-final';
+our $VERSION = '2.0.0';
 our %IRSSI = (
     authors     => 'Gemini & rclemens',
     contact     => '',
@@ -27,6 +27,8 @@ sub cmd_bot_auth {
         }
     }
 
+    my $nonce = int(rand(1000000));
+
     my ($bot_nick, $command, @args) = split / /, $data;
 
     if (!$bot_nick || !$command) {
@@ -41,11 +43,11 @@ sub cmd_bot_auth {
     }
 
     my $time_minute = int(time() / 60);
-    my $string_to_hash = "$password:$time_minute";
+    my $string_to_hash = "$password:$time_minute:$nonce";
     my $hash = sha256_hex($string_to_hash);
 
     my $full_command = join(' ', $command, @args);
-    my $raw_line_to_send = "PRIVMSG $bot_nick :$hash $full_command";
+    my $raw_line_to_send = "PRIVMSG $bot_nick :$nonce:$hash $full_command";
 
     # FIX: Use 'quote' to send the command as a raw line to the server
     $server->command("quote $raw_line_to_send");
