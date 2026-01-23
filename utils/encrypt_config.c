@@ -4,7 +4,7 @@
 #include <stdio.h>
 #include <string.h>
 
-#define SALT_SIZE 8 // Do not edit. This must match bot.h defines.
+#define SALT_SIZE 16 // Do not edit. This must match bot.h defines.
 #define GCM_IV_LEN 12 // Do not edit. This must match bot.h defines and is industry standard.
 #define GCM_TAG_LEN 16 // Do not edit. This must match bot.h defines and is industry standard.
 

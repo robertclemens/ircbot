@@ -12,7 +12,7 @@
 #include <limits.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "2.1.0"
+#define BOT_VERSION "2.2.0-managed"
 
 // Only edit this section
 //#define DEFAULT_USER "ircbot"         // Default bot user
@@ -23,8 +23,8 @@
 //#define GECOS "ircbot"         // Gecos field storage
 #define CONFIG_FILE ".ircbot.cnf"  // Config file name
 #define PID_FILE ".ircbot.pid" // PID file name
-#define SALT_SIZE 8            // You do not need to change this
-#define DEFAULT_LOG_LEVEL 0 // Set the default log level. 0=none
+#define SALT_SIZE 16           // Modern standard: 128-bit entropy (matches hub)
+#define DEFAULT_LOG_LEVEL 63 // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log"  // Log file name. Only used if log level > 0
 #define BOT_UPDATE_URL "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/releases.txt"
 // End of edit section
@@ -39,12 +39,13 @@
 #define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
 #define CHECK_LAG_TIMEOUT 60 // Lag timeout
 #define ROSTER_REFRESH_INTERVAL 120 // How often should a /who #channel be performed to look for known bots that are ops
+#define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
 
 // Limits
 #define MAX_SERVERS 10 // Max number of servers to store
 #define MAX_MASKS 20 // Max number of admin masks to store
 #define MAX_CHAN 65 // Max length of channel name. Do not change
-#define MAX_BUFFER 512 // Size of RAW IRC message. Do not change
+#define MAX_BUFFER 4096 // Size of RAW IRC message. Do not change
 #define MAX_NICK 10 // Max nick length 9 + NULL terminator = 10. Do not change
 #define MAX_PASS 128 // Max password length.
 #define MAX_KEY 31 // Max length for a channel key
@@ -62,6 +63,37 @@
 #define DEFAULT_LOG_LINES 10 // Default number of getlog lines to display to admin when requested if not provided
 #define MAX_LOG_LINES 20     // Max number of lines to cap getlog request to help prevent flooding
 #define MAX_CONFIG_SIZE (1024 * 1024) // Limit config file size to 1MB to provent OOM
+#define MAX_HUB_KEY_SIZE 2400 // [NEW] Increased to allow Base64 encoding of PEM keys
+
+#define CMD_PING 0x01
+#define CMD_CONFIG_PUSH 0x02
+#define CMD_CONFIG_PULL 0x03
+#define CMD_CONFIG_DATA 0x04
+#define CMD_UPDATE_PUBKEY 0x05
+#define CMD_PEER_SYNC     0x06
+#define CMD_MESH_STATE 0x07
+
+#define CMD_ADMIN_AUTH          0x10
+#define CMD_ADMIN_LIST_FULL     0x11
+#define CMD_ADMIN_ADD           0x12
+#define CMD_ADMIN_DEL           0x13
+#define CMD_ADMIN_REGEN_KEYS    0x14
+#define CMD_ADMIN_LIST_SUMMARY  0x15
+#define CMD_ADMIN_GET_PENDING   0x16
+#define CMD_ADMIN_APPROVE       0x17
+#define CMD_ADMIN_ADD_PEER      0x18
+#define CMD_ADMIN_LIST_PEERS    0x19
+#define CMD_ADMIN_DEL_PEER      0x1A
+#define CMD_ADMIN_GET_PUBKEY    0x1B
+#define CMD_ADMIN_SET_PRIVKEY   0x1C
+#define CMD_ADMIN_GET_PRIVKEY   0x1D
+#define CMD_ADMIN_SET_PUBKEY    0x1E
+#define CMD_ADMIN_SYNC_MESH     0x1F
+#define CMD_ADMIN_CREATE_BOT    0x32  // 50 decimal
+#define CMD_ADMIN_REKEY_BOT     0x20  // Generate new bot keypair
+#define CMD_ADMIN_DISCONNECT_BOT 0x21  // Force disconnect bot
+#define CMD_ADMIN_BOT_STATUS    0x22  // Get bot connection info
+
 
 extern volatile bool g_shutdown_flag;
 
@@ -81,6 +113,14 @@ typedef enum {
   L_RAW = 16,
   L_DEBUG = 32
 } log_type_t;
+
+typedef enum {
+    HUB_AUTH_NONE,
+    HUB_AUTH_SENT_UUID,
+    HUB_AUTH_SENT_SIGNATURE,
+    HUB_AUTH_COMPLETE
+} hub_auth_state_t;
+
 typedef enum { C_NONE = 0, C_OUT = 1 << 0, C_IN = 1 << 1 } chan_status_t;
 typedef enum { M_NONE = 0, M_K = 64 } chan_mode_t;
 typedef enum { LS_NONE = 0, LS_LISTEN = 1, LS_CONNECTED = 2 } listen_status_t;
@@ -88,12 +128,20 @@ typedef enum { LS_NONE = 0, LS_LISTEN = 1, LS_CONNECTED = 2 } listen_status_t;
 // Struct Forward Declarations
 typedef struct bot_state bot_state_t;
 typedef struct chan_t chan_t;
+
+typedef struct {
+  char mask[MAX_MASK_LEN];
+  bool is_managed;
+  time_t timestamp;
+} admin_entry_t;
+
 typedef struct {
   char mask[MAX_MASK_LEN];
   char password[MAX_PASS];
-} op_mask_t;
+  bool is_managed;
+  time_t timestamp;
+} op_entry_t;
 
-// Struct Definitions
 typedef struct {
   char nick[MAX_NICK];
   char hostmask[MAX_MASK_LEN];
@@ -119,15 +167,18 @@ struct chan_t {
   char key[MAX_KEY];
   chan_status_t status;
   chan_mode_t modes;
+  bool is_managed;
+  time_t timestamp;
   time_t last_who_request;
   roster_entry_t roster[MAX_ROSTER_SIZE];
   int roster_count;
   time_t last_join_attempt;
-  bool op_request_pending;      // Is an op request pending for THIS channel?
-  time_t last_op_request_time;  // When was the last op request sent?
-  int op_request_retry_count;   // How many times have we tried?
+  bool op_request_pending;
+  time_t last_op_request_time;
+  int op_request_retry_count;
   chan_t *next;
 };
+
 struct bot_state {
   int server_fd;
   int pid_fd;
@@ -139,14 +190,14 @@ struct bot_state {
   char gecos[128];
   char vhost[128];
   char bot_pass[MAX_PASS];
-  op_mask_t op_masks[MAX_OP_MASKS];
+  op_entry_t op_masks[MAX_OP_MASKS];
   int op_mask_count;
   char *server_list[MAX_SERVERS + 1];
   char actual_server_name[256];
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
-  char *auth_masks[MAX_MASKS + 1];
+  admin_entry_t auth_masks[MAX_MASKS];
   int mask_count;
   unsigned long local_ip_long;
   time_t connection_time;
@@ -173,38 +224,48 @@ struct bot_state {
   char who_request_channel[MAX_CHAN];
   uint64_t recent_nonces[NONCE_CACHE_SIZE];
   int nonce_idx;
-  uint64_t admin_nonces[MAX_SEEN_HASHES]; 
+  uint64_t admin_nonces[MAX_SEEN_HASHES];
   int admin_nonce_idx;
   log_buffer_t in_memory_logs[NUM_LOG_LEVELS];
+
+  // Hub Management
+  char bot_uuid[64];
+  char hub_key[MAX_HUB_KEY_SIZE]; // [UPDATED] Size 8192
+  char *hub_list[MAX_SERVERS];
+  char hub_key_parts[16][256];      // 16 slots × 256 bytes each
+  uint16_t hub_key_parts_received;  // Bitmask
+  uint16_t hub_key_parts_expected;
+  int hub_count;
+  int hub_fd;
+  bool hub_connecting;
+  bool hub_connected;
+  bool hub_authenticated;
+  unsigned char hub_session_key[32];
+  time_t last_hub_connect_attempt;
+  time_t last_hub_ping_time;    // Last time we sent a PING to the hub
+  time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
 };
 
-// --- Function Prototypes ---
-// main.c
+// ... [Function Prototypes same as before] ...
 void ssl_init_openssl();
-// auth.c
 bool auth_verify_password(bot_state_t *state, const char *nonce_str, const char *hash_attempt, const char *stored_password);
 bool auth_check_hostmask(const bot_state_t *state, const char *user_host);
-bool auth_verify_op_command(bot_state_t *state, const char *user_host,
-                            const char *nonce_str, const char *hash_attempt);
+bool auth_verify_op_command(bot_state_t *state, const char *user_host, const char *nonce_str, const char *hash_attempt);
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host);
-// bot.c
 void setup_signals(void);
 void daemonize(void);
 void change_proc_name(int argc, char *argv[]);
 void handle_signal(int signum);
-// config.c
 void config_read(bot_state_t *state, const char *filename);
-bool config_load(bot_state_t *state, const char *password,
-                 const char *filename);
+bool config_load(bot_state_t *state, const char *password, const char *filename);
 void config_write(const bot_state_t *state, const char *password);
-// channel.c
+void config_notify_hub_if_changed(bot_state_t *state);
 chan_t *channel_add(bot_state_t *state, const char *name);
 bool channel_remove(bot_state_t *state, const char *name);
 chan_t *channel_find(const bot_state_t *state, const char *name);
 void channel_list_destroy(bot_state_t *state);
 void channel_list_reset_status(bot_state_t *state);
 void channel_manager_check_joins(bot_state_t *state);
-// irc_client.c
 void irc_connect(bot_state_t *state);
 void irc_disconnect(bot_state_t *state);
 int irc_printf(bot_state_t *state, const char *format, ...);
@@ -212,32 +273,27 @@ void irc_handle_read(bot_state_t *state);
 void irc_check_status(bot_state_t *state);
 void irc_attempt_nick_change(bot_state_t *state, const char *new_nick);
 void irc_generate_new_nick(bot_state_t *state);
-// irc_parser.c
 void parser_handle_line(bot_state_t *state, char *line);
-// commands.c
-void commands_handle_private_message(bot_state_t *state, const char *nick,
-                                     const char *user, const char *host,
-                                     const char *dest, char *message);
-// In bot_comms.c
-void bot_comms_send_command(bot_state_t *state, const char *target_nick,
-                            const char *format, ...);
-// utils.c
+void commands_handle_private_message(bot_state_t *state, const char *nick, const char *user, const char *host, const char *dest, char *message);
+void bot_comms_send_command(bot_state_t *state, const char *target_nick, const char *format, ...);
 void handle_fatal_error(const char *message);
 void get_local_ip(bot_state_t *state);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 void updater_perform_upgrade(bot_state_t *state, const char *nick, const char *version);
-// Function to download the file from the given URL
 bool util_download_file(const char *url, const char *path);
-// Function to compute the SHA256 hash of a local file
 bool util_sha256_file(const char *path, char *output_hash_hex);
-// logging.c
-void log_message(log_type_t log_type_flag, const bot_state_t *state,
-                 const char *format, ...);
-// crypto.c
-int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
-                           const unsigned char *key, unsigned char *ciphertext,
-                           unsigned char *tag);
-int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
-                           const unsigned char *key, unsigned char *plaintext,
-                           unsigned char *tag);
-#endif  // BOT_H
+void log_message(log_type_t log_type_flag, const bot_state_t *state, const char *format, ...);
+int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len, const unsigned char *key, unsigned char *ciphertext, unsigned char *tag);
+int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len, const unsigned char *key, unsigned char *plaintext, unsigned char *tag);
+void hub_client_init(bot_state_t *state);
+void hub_client_connect(bot_state_t *state);
+void hub_client_process(bot_state_t *state);
+void hub_client_promote_local_config(bot_state_t *state);
+void hub_client_heartbeat(bot_state_t *state);
+void hub_client_disconnect(bot_state_t *state);
+static inline void debug_hex_dump(const char *label, const unsigned char *data, int len) {
+    printf("[DEBUG] %s (%d bytes): ", label, len);
+    for (int i = 0; i < len; i++) printf("%02x", data[i]);
+    printf("\n");
+}
+#endif

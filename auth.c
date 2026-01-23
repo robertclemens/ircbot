@@ -2,6 +2,7 @@
 #include <string.h>
 #include <strings.h>
 #include <inttypes.h>
+#include <time.h> // Ensure time() is available
 
 #include "bot.h"
 
@@ -46,16 +47,12 @@ bool auth_check_hostmask(const bot_state_t *state, const char *user_host) {
   }
 
   for (int i = 0; i < state->mask_count; i++) {
-    log_message(L_DEBUG, state, "[AUTH_CHECK] Inspecting mask index %d...\n", i);
+    // [UPDATED] Check .mask field of struct
+    if (state->auth_masks[i].mask[0] == '\0') continue; 
 
-    if (state->auth_masks[i] == NULL) {
-        log_message(L_DEBUG, state, "[AUTH_CHECK] WARNING: Index %d is NULL. Skipping.\n", i);
-        continue;
-    }
+    log_message(L_DEBUG, state, "[AUTH_CHECK] Comparing against: %s\n", state->auth_masks[i].mask);
 
-    log_message(L_DEBUG, state, "[AUTH_CHECK] Comparing against: %s\n", state->auth_masks[i]);
-
-    if (wildcard_match(state->auth_masks[i], user_host)) {
+    if (wildcard_match(state->auth_masks[i].mask, user_host)) {
       log_message(L_DEBUG, state, "[AUTH_CHECK] MATCH FOUND at index %d.\n", i);
       is_explicitly_allowed = true;
       break;
@@ -132,6 +129,7 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
 
   long min = (long)(time(NULL) / 60);
 
+  // Time Window 1 (Current Minute)
   snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
            stored_password, min, nonce);
   SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
@@ -150,6 +148,7 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
       return true;
   }
 
+  // Time Window 2 (Previous Minute - allowing clock skew/lag)
   snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
            stored_password, (min - 1), nonce);
   SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
@@ -175,6 +174,7 @@ bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
   if (state->trusted_bot_count == 0) return false;
 
   for (int i = 0; i < state->trusted_bot_count; i++) {
+    // Trusted bots list is still char*, so no struct access needed here
     if (wildcard_match(state->trusted_bots[i], user_host)) {
       return true;
     }

@@ -9,7 +9,7 @@ CFLAGS = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -std=c11 -O
 LDFLAGS = -lssl -lcrypto -lcurl
 
 # Source files
-SRCS = main.c bot.c config.c channel.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c
+SRCS = main.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)

@@ -232,23 +232,47 @@ void irc_handle_read(bot_state_t *state) {
 }
 
 void irc_check_status(bot_state_t *state) {
+  time_t now = time(NULL);
+
+  // --- HUB WATCHDOG ---
+  // Only monitor the hub connection if we aren't in standalone mode
+  if (state->hub_count > 0 && state->hub_fd != -1 && state->hub_authenticated) {
+    // If we haven't received a PONG or any encrypted data for 120 seconds,
+    // the hub connection has likely "zombied" or the network path is dead.
+    if (now - state->last_hub_activity > 120) {
+      log_message(L_INFO, state, "[HUB] Connection timed out (Watchdog). Reconnecting...\n");
+      
+      close(state->hub_fd);
+      state->hub_fd = -1;
+      state->hub_connected = false;
+      state->hub_authenticated = false;
+      state->hub_connecting = false;
+      // Note: the main loop's hub_client_connect() will handle the retry logic
+    }
+  }
+
+  // --- IRC SERVER STATUS ---
   if (!(state->status & S_CONNECTED)) {
     irc_connect(state);
     return;
   }
-  time_t now = time(NULL);
+
   if (now - state->last_pong_time > DEAD_SERVER_TIMEOUT) {
     log_message(L_INFO, state, "[INFO] Server timed out. Disconnecting.\n");
     irc_disconnect(state);
     return;
   }
+
   if (!state->pong_pending &&
       (now - state->last_pong_time > CHECK_LAG_TIMEOUT)) {
     irc_printf(state, "PING :%ld\r\n", now);
     state->pong_pending = true;
   }
+
+  // --- NICK & CHANNEL MANAGEMENT ---
   if (state->status & S_AUTHED) {
     channel_manager_check_joins(state);
+    
     if (!state->nick_change_pending) {
       if (strcasecmp(state->current_nick, state->target_nick) != 0) {
         if (now - state->nick_release_time > NICK_TAKE_TIME) {
@@ -265,6 +289,7 @@ void irc_check_status(bot_state_t *state) {
         }
       }
     } else {
+      // Logic for skipped reclaim logs
       if (state->nick_change_pending) {
         log_message(L_INFO, state,
                     "[INFO] Nick reclaim skipped: nick change pending.\n");
