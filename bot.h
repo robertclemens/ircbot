@@ -57,7 +57,7 @@
 #define MAX_NICK 10  // Max nick length 9 + NULL terminator = 10. Do not change
 #define MAX_PASS 128 // Max password length.
 #define MAX_KEY 31   // Max length for a channel key
-#define MAX_MASK_LEN 128    // Max usermask length
+#define MAX_MASK_LEN 256    // Max usermask length
 #define MAX_OP_MASKS 20     // Max number of operators
 #define MAX_TRUSTED_BOTS 20 // Max number of trusted bots
 #define MAX_ROSTER_SIZE                                                        \
