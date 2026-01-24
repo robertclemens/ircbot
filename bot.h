@@ -210,7 +210,7 @@ struct bot_state {
   int op_mask_count;
   char *server_list[MAX_SERVERS + 1];
   char actual_server_name[256];
-  char actual_hostname[128];
+  char actual_hostname[MAX_MASK_LEN];
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
