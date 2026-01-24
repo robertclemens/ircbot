@@ -125,17 +125,28 @@ bool config_load(bot_state_t *state, const char *password,
         int parsed =
             sscanf(data, "%64[^|]|%30[^|]|%15[^|]|%ld", chan, key, op, &ts);
 
-        if (parsed >= 3) { // Need at least chan, key, op
+        // Fallback for empty key: channel||add/del|timestamp
+        if (parsed < 3) {
+          parsed = sscanf(data, "%64[^|]||%15[^|]|%ld", chan, op, &ts);
+          key[0] = '\0';
+        }
+
+        if (parsed >= 2) { // Need at least chan, op (key can be empty)
+          // If fallback matched 3 items (chan, op, ts) or first matched 4
+          // (chan,key,op,ts) Actually fallback matches 3 items. First matches 4
+          // items. Adjust logic:
+
           chan_t *c = channel_add(state, chan);
           if (c) {
             if (strlen(key) > 0) {
               strncpy(c->key, key, MAX_KEY - 1);
               c->key[MAX_KEY - 1] = '\0';
-              state->chan_count++;
             }
-            c->is_managed =
-                (strcmp(op, "del") != 0); // is_managed = false if deleted
-            c->timestamp = (parsed == 4) ? ts : time(NULL);
+            c->is_managed = (strcmp(op, "del") != 0);
+            c->timestamp = (ts > 0) ? ts : time(NULL);
+
+            if (strlen(key) > 0)
+              state->chan_count++;
 
             // Don't join deleted channels
             if (!c->is_managed) {
@@ -202,14 +213,36 @@ bool config_load(bot_state_t *state, const char *password,
       } break;
 
       case 'a': // Admin password (global, no operation field)
-        strncpy(state->bot_pass, data, MAX_PASS - 1);
-        state->bot_pass[MAX_PASS - 1] = '\0';
-        break;
+      {
+        // Format: a|password|timestamp (optional timestamp for legacy compat)
+        char pass[MAX_PASS];
+        time_t ts = 0;
+        if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
+          strncpy(state->bot_pass, pass, MAX_PASS - 1);
+          state->bot_pass[MAX_PASS - 1] = '\0';
+          state->bot_pass_ts = (ts > 0) ? ts : time(NULL);
+        } else {
+          // Legacy fallback
+          strncpy(state->bot_pass, data, MAX_PASS - 1);
+          state->bot_pass[MAX_PASS - 1] = '\0';
+          state->bot_pass_ts = time(NULL);
+        }
+      } break;
 
       case 'p': // Bot password (global, no operation field)
-        strncpy(state->bot_comm_pass, data, MAX_PASS - 1);
-        state->bot_comm_pass[MAX_PASS - 1] = '\0';
-        break;
+      {
+        char pass[MAX_PASS];
+        time_t ts = 0;
+        if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
+          strncpy(state->bot_comm_pass, pass, MAX_PASS - 1);
+          state->bot_comm_pass[MAX_PASS - 1] = '\0';
+          state->bot_comm_pass_ts = (ts > 0) ? ts : time(NULL);
+        } else {
+          strncpy(state->bot_comm_pass, data, MAX_PASS - 1);
+          state->bot_comm_pass[MAX_PASS - 1] = '\0';
+          state->bot_comm_pass_ts = time(NULL);
+        }
+      } break;
 
       case 'b': // Bot line (hub-generated, no timestamp)
         if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
@@ -368,8 +401,8 @@ void config_write(const bot_state_t *state, const char *password) {
   }
 
   // Admin password (global, no timestamp, no operation)
-  written = snprintf(plaintext_overrides + offset, remaining, "a|%s\n",
-                     state->bot_pass);
+  written = snprintf(plaintext_overrides + offset, remaining, "a|%s|%ld\n",
+                     state->bot_pass, (long)state->bot_pass_ts);
   if (written > 0 && written < remaining) {
     offset += written;
     remaining -= written;
@@ -377,8 +410,8 @@ void config_write(const bot_state_t *state, const char *password) {
 
   // Bot password (global, no timestamp, no operation)
   if (state->bot_comm_pass[0] != '\0') {
-    written = snprintf(plaintext_overrides + offset, remaining, "p|%s\n",
-                       state->bot_comm_pass);
+    written = snprintf(plaintext_overrides + offset, remaining, "p|%s|%ld\n",
+                       state->bot_comm_pass, (long)state->bot_comm_pass_ts);
     if (written > 0 && written < remaining) {
       offset += written;
       remaining -= written;

@@ -235,6 +235,8 @@ struct bot_state {
   int chan_count;
   char startup_password[MAX_PASS];
   char bot_comm_pass[MAX_PASS];
+  time_t bot_pass_ts;
+  time_t bot_comm_pass_ts;
   char *trusted_bots[MAX_TRUSTED_BOTS + 1];
   int trusted_bot_count;
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
