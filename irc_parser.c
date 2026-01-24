@@ -178,6 +178,25 @@ void parser_handle_line(bot_state_t *state, char *line) {
   }
   if (strcmp(command, "001") == 0) {
     state->status |= S_AUTHED;
+    // [NEW] Parse hostmask from 001 message
+    // 001 params typically: "Nick :Welcome... Nick!User@Host"
+    // We want the last token
+    char *last_token = strrchr(params, ' ');
+    if (last_token) {
+      last_token++; // Skip space
+      if (strchr(last_token, '!') && strchr(last_token, '@')) {
+        strncpy(state->actual_hostname, last_token,
+                sizeof(state->actual_hostname) - 1);
+        state->actual_hostname[sizeof(state->actual_hostname) - 1] = '\0';
+        log_message(L_INFO, state, "[INFO] Discovered my hostmask: %s\n",
+                    state->actual_hostname);
+
+        // Trigger Hub Sync
+        if (state->hub_connected && state->hub_authenticated) {
+          hub_client_sync_hostmask(state);
+        }
+      }
+    }
   } else if (strcmp(command, "433") == 0) {
     state->nick_change_pending = false;
     if (!(state->status & S_AUTHED)) {
@@ -232,9 +251,10 @@ void parser_handle_line(bot_state_t *state, char *line) {
     hostname = strtok_r(NULL, " ", &saveptr_irc);         // Host
 
     if (hostname) {
-      strncpy(state->actual_hostname, hostname,
-              sizeof(state->actual_hostname) - 1);
-      state->actual_hostname[sizeof(state->actual_hostname) - 1] = '\0';
+      // [UPDATED] Reconstruct full hostmask: Nick!User@NewHost
+      snprintf(state->actual_hostname, sizeof(state->actual_hostname),
+               "%s!%s@%s", state->current_nick, state->user, hostname);
+
       log_message(L_INFO, state, "[INFO] My visible host is now: %s\n",
                   state->actual_hostname);
 
@@ -379,6 +399,28 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (old_nick && new_nick &&
         strcasecmp(old_nick, state->current_nick) == 0) {
       strncpy(state->current_nick, new_nick, MAX_NICK - 1);
+
+      // [NEW] Update hostmask on nick change
+      // Hostmask format: nick!user@host
+      // We need to parse existing actual_hostname to get user@host?
+      // Or just use state->user?
+      // Parsing existing is safer if user changed, but state->user should be
+      // source of truth for own user. However host part might have changed
+      // (e.g. vhost). Let's try to extract @host from current actual_hostname
+      char *at = strchr(state->actual_hostname, '@');
+      if (at) {
+        char host[128];
+        strncpy(host, at + 1, sizeof(host) - 1);
+        host[sizeof(host) - 1] = '\0';
+
+        snprintf(state->actual_hostname, sizeof(state->actual_hostname),
+                 "%s!%s@%s", state->current_nick, state->user, host);
+
+        if (state->hub_connected && state->hub_authenticated) {
+          hub_client_sync_hostmask(state);
+        }
+      }
+
       state->nick_change_pending = false;
       if (strcasecmp(state->current_nick, state->target_nick) == 0) {
         state->nick_generation_attempt = 0;

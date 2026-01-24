@@ -16,7 +16,6 @@
 #include <time.h>
 #include <unistd.h>
 
-
 extern char *base64_encode(const unsigned char *input, int length);
 extern unsigned char *base64_decode(const char *input, int *out_len);
 extern int crypto_aes_gcm_encrypt(const unsigned char *plain, int plain_len,
@@ -183,51 +182,25 @@ void hub_client_heartbeat(bot_state_t *state) {
 void hub_client_sync_hostmask(bot_state_t *state) {
   // Don't sync if we don't have a hostmask yet
   if (state->actual_hostname[0] == '\0') {
-    log_message(L_DEBUG, state, "[DEBUG] No hostmask to sync yet\n");
     return;
   }
-
   // Don't sync if not hub-managed
-  if (state->hub_count == 0) {
-    log_message(L_DEBUG, state,
-                "[DEBUG] Not hub-managed, skipping hostmask sync\n");
+  if (state->hub_count == 0 || state->hub_fd == -1 ||
+      !state->hub_authenticated) {
     return;
   }
 
-  time_t now = time(NULL);
-  char payload[512];
-  int payload_len = snprintf(payload, sizeof(payload), "%s|%ld",
-                             state->actual_hostname, (long)now);
-
-  if (payload_len < 0 || payload_len >= (int)sizeof(payload)) {
-    log_message(L_INFO, state, "[WARN] Hostmask payload too large\n");
-    return;
-  }
-
-  // Send to all connected hubs
-  // NOTE: This assumes hub connection infrastructure exists
-  // If not yet implemented, this is placeholder for Phase 3
-
-  log_message(L_DEBUG, state, "[DEBUG] Syncing hostmask to hub(s): %s\n",
+  log_message(L_DEBUG, state, "[DEBUG] Syncing hostmask to hub: %s\n",
               state->actual_hostname);
 
-  // TODO: Actual hub send implementation
-  // For now, just log that we would send it
-  // In Phase 3, this will use the hub connection code
-
-  /*
-  for (int i = 0; i < state->hub_count; i++) {
-    if (state->hub_connections[i].authenticated) {
-      send_encrypted_command(state, i, CMD_UPDATE_HOSTMASK, payload);
-    }
-  }
-  */
+  // Use standard config push which includes 'h' lines
+  hub_client_push_config(state);
 }
 
 /**
  * Generate config payload for hub sync
- * Includes: c|, m|, o|, a|, p|, h| (hostmask)
- * Excludes: n|, s|, u|, g|, v|, l|, i|, k| (bot-specific)
+ * Includes: c|, m|, o|, a|, p|, h| (hostmask), n| (nick)
+ * Excludes: s|, u|, g|, v|, l|, i|, k| (bot-specific)
  */
 void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
                                         int max_len) {
@@ -298,6 +271,15 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     }
   }
 
+  // Nick
+  if (state->current_nick[0] != '\0') {
+    written = snprintf(buffer + offset, max_len - offset, "n|%s|%ld\n",
+                       state->current_nick, (long)time(NULL));
+    if (written > 0 && written < max_len - offset) {
+      offset += written;
+    }
+  }
+
   buffer[offset] = '\0';
 }
 
@@ -352,10 +334,6 @@ void hub_client_push_config(bot_state_t *state) {
   }
 }
 
-/**
- * Process incoming config from hub
- * Merges with local config using timestamp comparison
- */
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB] Processing config data from hub\n");
 
@@ -558,21 +536,53 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'b': // Bot line (trusted bot hostmask)
+    case 'b': // Bot line. Handles 'b|uuid|h|hostmask|ts' OR 'b|hostmask'
+              // (legacy)
     {
-      // Check if already exists
-      bool exists = false;
-      for (int i = 0; i < state->trusted_bot_count; i++) {
-        if (strcmp(state->trusted_bots[i], data) == 0) {
-          exists = true;
-          break;
+      char hostmask[MAX_MASK_LEN];
+      hostmask[0] = '\0';
+
+      char *p1 = strchr(data, '|');
+      if (p1) {
+        // Complex format: UUID|KEY|VALUE|TS
+        // Check if key is 'h'
+        char *p2 = strchr(p1 + 1, '|');
+        if (p2) {
+          size_t key_len = p2 - (p1 + 1);
+          if (key_len == 1 && *(p1 + 1) == 'h') {
+            // It is a hostmask update
+            char *p3 = strrchr(p2 + 1, '|'); // Find TS
+            if (p3) {
+              size_t val_len = p3 - (p2 + 1);
+              if (val_len < MAX_MASK_LEN) {
+                strncpy(hostmask, p2 + 1, val_len);
+                hostmask[val_len] = '\0';
+              }
+            }
+          }
         }
+      } else {
+        // Legacy format: Just hostmask
+        strncpy(hostmask, data, MAX_MASK_LEN - 1);
+        hostmask[MAX_MASK_LEN - 1] = '\0';
       }
 
-      if (!exists && state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-        state->trusted_bots[state->trusted_bot_count++] = strdup(data);
-        updates++;
-        log_message(L_INFO, state, "[HUB] Added trusted bot: %s\n", data);
+      if (hostmask[0] != '\0') {
+        // Check if already exists
+        bool exists = false;
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          if (strcmp(state->trusted_bots[i], hostmask) == 0) {
+            exists = true;
+            break;
+          }
+        }
+
+        if (!exists && state->trusted_bot_count < MAX_TRUSTED_BOTS) {
+          state->trusted_bots[state->trusted_bot_count++] = strdup(hostmask);
+          updates++;
+          log_message(L_INFO, state, "[HUB] Added trusted bot (synced): %s\n",
+                      hostmask);
+        }
       }
     } break;
     }
