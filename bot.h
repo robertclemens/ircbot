@@ -11,7 +11,6 @@
 #include <sys/socket.h>
 #include <time.h>
 
-
 #define BOT_NAME "ircbot.c by trojanman"
 #define BOT_VERSION "2.2.0-managed"
 
@@ -320,6 +319,8 @@ void hub_client_init(bot_state_t *state);
 void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
 void hub_client_promote_local_config(bot_state_t *state);
+void hub_client_push_config(bot_state_t *state);
+void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
 void hub_client_disconnect(bot_state_t *state);
 static inline void debug_hex_dump(const char *label, const unsigned char *data,
