@@ -113,14 +113,19 @@ static int rsa_sign_with_bot_privkey(bot_state_t *state,
     return -1;
   int pem_len = 0;
   unsigned char *pem_data = base64_decode(b64_priv_key, &pem_len);
-  if (!pem_data)
+  if (!pem_data) {
+    log_message(L_INFO, state, "[HUB] Base64 decode failed in signing\n");
     return -1;
+  }
   BIO *bio = BIO_new_mem_buf(pem_data, pem_len);
   EVP_PKEY *priv_key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
   BIO_free(bio);
   free(pem_data);
-  if (!priv_key)
+  if (!priv_key) {
+    log_message(L_INFO, state,
+                "[HUB] Failed to load private key for signing\n");
     return -1;
+  }
   EVP_MD_CTX *ctx = EVP_MD_CTX_new();
   if (!ctx) {
     EVP_PKEY_free(priv_key);
@@ -137,6 +142,9 @@ static int rsa_sign_with_bot_privkey(bot_state_t *state,
   }
   EVP_MD_CTX_free(ctx);
   EVP_PKEY_free(priv_key);
+  if (res < 0) {
+    log_message(L_INFO, state, "[HUB] Signature calculation failed\n");
+  }
   return res;
 }
 
@@ -795,12 +803,12 @@ void hub_client_process(bot_state_t *state) {
   if (!state->hub_authenticated) {
     if (auth_state == HUB_AUTH_SENT_UUID) {
       unsigned char challenge[32];
-      if (rsa_decrypt_with_bot_privkey(state->hub_key, packet_body, packet_len,
-                                       challenge) == 32) {
+      if (rsa_decrypt_with_bot_privkey(state, state->hub_key, packet_body,
+                                       packet_len, challenge) == 32) {
         memcpy(challenge_received, challenge, 32);
         unsigned char signature[512];
-        int sig_len =
-            rsa_sign_with_bot_privkey(state->hub_key, challenge, 32, signature);
+        int sig_len = rsa_sign_with_bot_privkey(state, state->hub_key,
+                                                challenge, 32, signature);
         if (sig_len > 0) {
           uint32_t sig_net_len = htonl(sig_len);
           if (send(state->hub_fd, &sig_net_len, 4, 0) == 4 &&
