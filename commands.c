@@ -222,9 +222,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (c) {
         if (arg2)
           strncpy(c->key, arg2, MAX_KEY - 1);
-        c->is_managed = false;
+        c->is_managed = true;      // Mark as managed for syncing
+        c->timestamp = time(NULL); // Set timestamp for sync
       }
       config_write(state, state->startup_password);
+      hub_client_push_config(state); // Sync to hub immediately
       irc_printf(state, "PRIVMSG %s :JOIN %s and saving config file.\r\n", nick,
                  arg1);
     } else if (strcasecmp(command, "part") == 0) {

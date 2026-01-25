@@ -291,6 +291,54 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   buffer[offset] = '\0';
 }
 
+/**
+ * Send an op request via hub to another bot
+ * Returns true if request was sent via hub, false to fallback to PRIVMSG
+ */
+bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
+                           const char *channel) {
+  if (!state->hub_connected || !state->hub_authenticated ||
+      state->hub_fd == -1) {
+    return false; // Hub not available, use PRIVMSG fallback
+  }
+
+  // Don't request from ourselves
+  if (strcmp(target_uuid, state->bot_uuid) == 0) {
+    return false;
+  }
+
+  // Build payload: target_uuid|channel
+  char payload[256];
+  snprintf(payload, sizeof(payload), "%s|%s", target_uuid, channel);
+
+  log_message(L_INFO, state,
+              "[HUB] Requesting ops via hub: target=%s chan=%s\n", target_uuid,
+              channel);
+
+  int pay_len = strlen(payload);
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_OP_REQUEST;
+  uint32_t inner_len = htonl(pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    memcpy(cipher, &net_len, 4);
+
+    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+      return true; // Request sent successfully
+    }
+  }
+
+  return false; // Failed to send, use PRIVMSG fallback
+}
+
 // Alias for promoting local config to hub (e.g. on connect)
 void hub_client_promote_local_config(bot_state_t *state) {
   hub_client_push_config(state);
@@ -649,8 +697,67 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       hub_client_process_config_data(state, payload);
     }
     break;
+
   case CMD_UPDATE_PUBKEY:
     // Existing handler...
+    break;
+
+  case CMD_OP_GRANT: {
+    // Payload: requester_hostmask|channel
+    // Example: bot3!~ident@47.217.20.145|#ircbot
+    char hostmask[MAX_MASK_LEN];
+    char channel[MAX_CHAN];
+
+    if (sscanf(payload, "%255[^|]|%64s", hostmask, channel) == 2) {
+      // Extract nick from hostmask (nick!user@host)
+      char nick[MAX_NICK];
+      char *bang = strchr(hostmask, '!');
+      if (bang) {
+        size_t nick_len = bang - hostmask;
+        if (nick_len >= MAX_NICK)
+          nick_len = MAX_NICK - 1;
+        memcpy(nick, hostmask, nick_len);
+        nick[nick_len] = '\0';
+      } else {
+        strncpy(nick, hostmask, MAX_NICK - 1);
+        nick[MAX_NICK - 1] = '\0';
+      }
+
+      // Check if we're in that channel and have ops
+      chan_t *c = channel_find(state, channel);
+      if (c && c->status == C_IN) {
+        bool am_i_opped = false;
+        for (int i = 0; i < c->roster_count; i++) {
+          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
+              c->roster[i].is_op) {
+            am_i_opped = true;
+            break;
+          }
+        }
+
+        if (am_i_opped) {
+          log_message(L_INFO, state,
+                      "[HUB] Granting ops to %s in %s (hub request)\n", nick,
+                      channel);
+          irc_printf(state, "MODE %s +o %s\r\n", channel, nick);
+        } else {
+          log_message(L_INFO, state,
+                      "[HUB] Cannot grant ops to %s in %s - I'm not opped\n",
+                      nick, channel);
+        }
+      } else {
+        log_message(L_INFO, state,
+                    "[HUB] Cannot grant ops - not in channel %s\n", channel);
+      }
+    } else {
+      log_message(L_INFO, state, "[HUB] Invalid OP_GRANT payload\n");
+    }
+  } break;
+
+  case CMD_OP_FAILED:
+    log_message(L_INFO, state, "[HUB] Op request failed: %s\n", payload);
+    // Trigger fallback to PRIVMSG method
+    // The channel manager will retry via PRIVMSG on next cycle
     break;
   }
 }

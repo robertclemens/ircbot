@@ -77,8 +77,35 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
                       "[INFO] Found %d trusted ops. Requesting ops from: %s\n",
                       helper_count, chosen_helper->nick);
 
-                  bot_comms_send_command(state, chosen_helper->nick, "OPME %s",
-                                         c->name);
+                  // Try hub first - look up UUID for this helper
+                  bool sent_via_hub = false;
+                  for (int tb = 0;
+                       tb < state->trusted_bot_count && !sent_via_hub; tb++) {
+                    char mask[MAX_MASK_LEN];
+                    char uuid[64];
+                    // Format: hostmask|uuid|timestamp
+                    if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]",
+                               mask, uuid) >= 2) {
+                      // Check if this trusted_bot entry matches our helper
+                      // Simple prefix match on hostmask
+                      char helper_check[MAX_MASK_LEN];
+                      snprintf(helper_check, sizeof(helper_check), "%s!",
+                               chosen_helper->nick);
+                      if (strncasecmp(state->trusted_bots[tb], helper_check,
+                                      strlen(helper_check)) == 0 ||
+                          strcasecmp(mask, chosen_helper->hostmask) == 0) {
+                        // Found matching UUID, try hub
+                        sent_via_hub =
+                            hub_client_request_op(state, uuid, c->name);
+                      }
+                    }
+                  }
+
+                  // Fallback to PRIVMSG if hub unavailable
+                  if (!sent_via_hub) {
+                    bot_comms_send_command(state, chosen_helper->nick,
+                                           "OPME %s", c->name);
+                  }
                   c->op_request_pending = true;
                   c->last_op_request_time = time(NULL);
                   found_helper = true;
@@ -330,7 +357,31 @@ void parser_handle_line(bot_state_t *state, char *line) {
                   helper_count, chosen_helper->nick,
                   c->op_request_retry_count + 1);
 
-      bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+      // Try hub first - look up UUID for this helper
+      bool sent_via_hub = false;
+      for (int tb = 0; tb < state->trusted_bot_count && !sent_via_hub; tb++) {
+        char mask[MAX_MASK_LEN];
+        char uuid[64];
+        // Format: hostmask|uuid|timestamp
+        if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]", mask, uuid) >=
+            2) {
+          // Check if this trusted_bot entry matches our helper
+          char helper_check[MAX_MASK_LEN];
+          snprintf(helper_check, sizeof(helper_check), "%s!",
+                   chosen_helper->nick);
+          if (strncasecmp(state->trusted_bots[tb], helper_check,
+                          strlen(helper_check)) == 0 ||
+              strcasecmp(mask, chosen_helper->hostmask) == 0) {
+            // Found matching UUID, try hub
+            sent_via_hub = hub_client_request_op(state, uuid, c->name);
+          }
+        }
+      }
+
+      // Fallback to PRIVMSG if hub unavailable
+      if (!sent_via_hub) {
+        bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+      }
       c->last_op_request_time = now;
       c->op_request_pending = true;
       c->op_request_retry_count++;

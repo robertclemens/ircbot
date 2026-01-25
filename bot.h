@@ -111,6 +111,11 @@
 #define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
 #define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
 
+// Bot-to-Bot Op Commands (via Hub)
+#define CMD_OP_REQUEST 0x28 // Bot -> Hub: Request ops from another bot
+#define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot
+#define CMD_OP_FAILED 0x2A  // Hub -> Bot: Op request failed
+
 extern volatile bool g_shutdown_flag;
 
 // Enums
@@ -325,6 +330,8 @@ void hub_client_push_config(bot_state_t *state);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
 void hub_client_disconnect(bot_state_t *state);
+bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
+                           const char *channel);
 static inline void debug_hex_dump(const char *label, const unsigned char *data,
                                   int len) {
   printf("[DEBUG] %s (%d bytes): ", label, len);
