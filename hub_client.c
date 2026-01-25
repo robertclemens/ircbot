@@ -244,19 +244,19 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     offset += written;
   }
 
-  // Admin password (no operation field)
+  // Admin password (with timestamp for conflict resolution)
   if (state->bot_pass[0] != '\0') {
-    written =
-        snprintf(buffer + offset, max_len - offset, "a|%s\n", state->bot_pass);
+    written = snprintf(buffer + offset, max_len - offset, "a|%s|%ld\n",
+                       state->bot_pass, (long)state->bot_pass_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
     }
   }
 
-  // Bot password (no operation field)
+  // Bot password (with timestamp for conflict resolution)
   if (state->bot_comm_pass[0] != '\0') {
-    written = snprintf(buffer + offset, max_len - offset, "p|%s\n",
-                       state->bot_comm_pass);
+    written = snprintf(buffer + offset, max_len - offset, "p|%s|%ld\n",
+                       state->bot_comm_pass, (long)state->bot_comm_pass_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
     }
