@@ -372,6 +372,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
         if (i < state->server_count)
           strncpy(server_part, state->server_list[i], sizeof(server_part) - 1);
+
+        // Skip to next active (is_managed) channel
+        while (current_chan && !current_chan->is_managed) {
+          current_chan = current_chan->next;
+        }
+
         if (current_chan) {
           bool am_i_opped = false;
           for (int j = 0; j < current_chan->roster_count; j++) {
@@ -385,21 +391,23 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           const char *op_prefix = am_i_opped ? "@" : "";
           const char *status_str =
               (current_chan->status == C_IN) ? "IN" : "OUT";
-          const char *managed_str = current_chan->is_managed ? " [M]" : "";
 
           if (current_chan->key[0] != '\0') {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s)%s",
+            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s) [M]",
                      op_prefix, current_chan->name, current_chan->key,
-                     status_str, managed_str);
+                     status_str);
           } else {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (%s)%s", op_prefix,
-                     current_chan->name, status_str, managed_str);
+            snprintf(chan_part, sizeof(chan_part), "%s%s (%s) [M]", op_prefix,
+                     current_chan->name, status_str);
           }
           current_chan = current_chan->next;
         }
-        snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
-                 server_part, chan_part);
-        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
+        // Only print if there's content
+        if (server_part[0] != '\0' || chan_part[0] != '\0') {
+          snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
+                   server_part, chan_part);
+          irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
+        }
       }
 
       snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
@@ -412,17 +420,20 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       for (int i = 0; i < max_rows; i++) {
         char admin_part[128] = "";
         char op_part[256] = "";
-        if (i < state->mask_count)
-          snprintf(admin_part, sizeof(admin_part), "%s%s",
-                   state->auth_masks[i].mask,
-                   (state->auth_masks[i].is_managed ? " [M]" : ""));
-        if (i < state->op_mask_count)
-          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s)%s", 50,
-                   state->op_masks[i].mask, 20, state->op_masks[i].password,
-                   (state->op_masks[i].is_managed ? " [M]" : ""));
-        snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
-                 admin_part, op_part);
-        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
+        // Only show active admin masks
+        if (i < state->mask_count && state->auth_masks[i].is_managed)
+          snprintf(admin_part, sizeof(admin_part), "%s [M]",
+                   state->auth_masks[i].mask);
+        // Only show active oper masks
+        if (i < state->op_mask_count && state->op_masks[i].is_managed)
+          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s) [M]", 50,
+                   state->op_masks[i].mask, 20, state->op_masks[i].password);
+        // Only print if at least one side has content
+        if (admin_part[0] != '\0' || op_part[0] != '\0') {
+          snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
+                   admin_part, op_part);
+          irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
+        }
       }
 
       irc_printf(state, "PRIVMSG %s :--- Trusted Bots (Botpass: %s) ---\r\n",

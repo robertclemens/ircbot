@@ -1,7 +1,7 @@
+#include <inttypes.h>
 #include <openssl/sha.h>
 #include <string.h>
 #include <strings.h>
-#include <inttypes.h>
 #include <time.h> // Ensure time() is available
 
 #include "bot.h"
@@ -47,10 +47,14 @@ bool auth_check_hostmask(const bot_state_t *state, const char *user_host) {
   }
 
   for (int i = 0; i < state->mask_count; i++) {
-    // [UPDATED] Check .mask field of struct
-    if (state->auth_masks[i].mask[0] == '\0') continue; 
+    // [UPDATED] Check .mask field of struct and skip deleted entries
+    if (state->auth_masks[i].mask[0] == '\0')
+      continue;
+    if (!state->auth_masks[i].is_managed)
+      continue; // Skip tombstoned entries
 
-    log_message(L_DEBUG, state, "[AUTH_CHECK] Comparing against: %s\n", state->auth_masks[i].mask);
+    log_message(L_DEBUG, state, "[AUTH_CHECK] Comparing against: %s\n",
+                state->auth_masks[i].mask);
 
     if (wildcard_match(state->auth_masks[i].mask, user_host)) {
       log_message(L_DEBUG, state, "[AUTH_CHECK] MATCH FOUND at index %d.\n", i);
@@ -59,8 +63,10 @@ bool auth_check_hostmask(const bot_state_t *state, const char *user_host) {
     }
   }
 
-  if (is_explicitly_allowed) return true;
-  if (is_explicitly_ignored) return false;
+  if (is_explicitly_allowed)
+    return true;
+  if (is_explicitly_ignored)
+    return false;
 
   log_message(L_DEBUG, state, "[AUTH_CHECK] No admin match found.\n");
   return false;
@@ -72,13 +78,19 @@ bool auth_verify_op_command(bot_state_t *state, const char *user_host,
               user_host, nonce_str);
 
   for (int i = 0; i < state->op_mask_count; i++) {
+    // Skip tombstoned entries
+    if (!state->op_masks[i].is_managed)
+      continue;
+
     log_message(L_DEBUG, state, "[OP_CHECK] Compare vs Mask: %s\n",
                 state->op_masks[i].mask);
 
     if (wildcard_match(state->op_masks[i].mask, user_host)) {
-      log_message(L_DEBUG, state, "[OP_CHECK] Mask MATCH! Verifying password...\n");
+      log_message(L_DEBUG, state,
+                  "[OP_CHECK] Mask MATCH! Verifying password...\n");
 
-      if (auth_verify_password(state, nonce_str, hash_attempt, state->op_masks[i].password)) {
+      if (auth_verify_password(state, nonce_str, hash_attempt,
+                               state->op_masks[i].password)) {
         log_message(L_DEBUG, state, "[OP_CHECK] Password MATCH. Authorized.\n");
         return true;
       } else {
@@ -95,32 +107,38 @@ bool auth_verify_op_command(bot_state_t *state, const char *user_host,
         SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
         int offset = 0;
         for (int j = 0; j < SHA256_DIGEST_LENGTH; j++)
-            offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[j]);
+          offset +=
+              snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[j]);
 
-        log_message(L_DEBUG, state, "[OP_CHECK] \n   EXPECTED: %s\n   RECEIVED: %s\n",
-                    hex, hash_attempt);
+        log_message(L_DEBUG, state,
+                    "[OP_CHECK] \n   EXPECTED: %s\n   RECEIVED: %s\n", hex,
+                    hash_attempt);
       }
     }
   }
 
-  log_message(L_DEBUG, state, "[OP_CHECK] No matching op masks found (or all failed).\n");
+  log_message(L_DEBUG, state,
+              "[OP_CHECK] No matching op masks found (or all failed).\n");
   return false;
 }
 
 bool auth_verify_password(bot_state_t *state, const char *nonce_str,
-                          const char *hash_attempt, const char *stored_password) {
+                          const char *hash_attempt,
+                          const char *stored_password) {
   if (!nonce_str || !hash_attempt || !stored_password) {
-      log_message(L_DEBUG, state, "[DEBUG_AUTH] FAIL: Null inputs.\n");
-      return false;
+    log_message(L_DEBUG, state, "[DEBUG_AUTH] FAIL: Null inputs.\n");
+    return false;
   }
 
   uint64_t nonce = strtoull(nonce_str, NULL, 10);
 
   for (int i = 0; i < MAX_SEEN_HASHES; i++) {
-      if (state->admin_nonces[i] == nonce) {
-          log_message(L_DEBUG, state, "[DEBUG_AUTH] FAIL: Replay detected (Nonce %" PRIu64 ").\n", nonce);
-          return false;
-      }
+    if (state->admin_nonces[i] == nonce) {
+      log_message(L_DEBUG, state,
+                  "[DEBUG_AUTH] FAIL: Replay detected (Nonce %" PRIu64 ").\n",
+                  nonce);
+      return false;
+    }
   }
 
   char to_hash[512];
@@ -130,48 +148,51 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   long min = (long)(time(NULL) / 60);
 
   // Time Window 1 (Current Minute)
-  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
-           stored_password, min, nonce);
+  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64, stored_password, min,
+           nonce);
   SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
 
   int offset = 0;
   for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-      offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
+    offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
   }
 
-  log_message(L_DEBUG, state, "[DEBUG_AUTH] Check 1 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
+  log_message(L_DEBUG, state,
+              "[DEBUG_AUTH] Check 1 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
               min, hex, hash_attempt);
 
   if (strcmp(hash_attempt, hex) == 0) {
-      state->admin_nonces[state->admin_nonce_idx] = nonce;
-      state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-      return true;
+    state->admin_nonces[state->admin_nonce_idx] = nonce;
+    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+    return true;
   }
 
   // Time Window 2 (Previous Minute - allowing clock skew/lag)
-  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
-           stored_password, (min - 1), nonce);
+  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64, stored_password,
+           (min - 1), nonce);
   SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
 
   offset = 0;
   for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-      offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
+    offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
   }
 
-  log_message(L_DEBUG, state, "[DEBUG_AUTH] Check 2 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
+  log_message(L_DEBUG, state,
+              "[DEBUG_AUTH] Check 2 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
               (min - 1), hex, hash_attempt);
 
   if (strcmp(hash_attempt, hex) == 0) {
-      state->admin_nonces[state->admin_nonce_idx] = nonce;
-      state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-      return true;
+    state->admin_nonces[state->admin_nonce_idx] = nonce;
+    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+    return true;
   }
 
   return false;
 }
 
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
-  if (state->trusted_bot_count == 0) return false;
+  if (state->trusted_bot_count == 0)
+    return false;
 
   for (int i = 0; i < state->trusted_bot_count; i++) {
     // Trusted bots list is still char*, so no struct access needed here

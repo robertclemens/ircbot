@@ -1,14 +1,16 @@
+#include "bot.h"
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
-#include "bot.h"
+
 
 chan_t *channel_add(bot_state_t *state, const char *name) {
   if (channel_find(state, name)) {
     return NULL;
   }
   chan_t *new_chan = calloc(1, sizeof(chan_t));
-  if (!new_chan) handle_fatal_error("calloc failed");
+  if (!new_chan)
+    handle_fatal_error("calloc failed");
 
   strncpy(new_chan->name, name, MAX_CHAN - 1);
   new_chan->status = C_OUT;
@@ -53,7 +55,8 @@ bool channel_remove(bot_state_t *state, const char *name) {
 
 chan_t *channel_find(const bot_state_t *state, const char *name) {
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    if (strcasecmp(c->name, name) == 0) return c;
+    if (strcasecmp(c->name, name) == 0)
+      return c;
   }
   return NULL;
 }
@@ -79,11 +82,16 @@ void channel_list_reset_status(bot_state_t *state) {
 }
 
 void channel_manager_check_joins(bot_state_t *state) {
-  if (!(state->status & S_AUTHED)) return;
+  if (!(state->status & S_AUTHED))
+    return;
 
   time_t now = time(NULL);
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+    // Skip tombstoned/deleted channels
+    if (!c->is_managed)
+      continue;
+
     if (c->status != C_IN && (now - c->last_join_attempt > JOIN_RETRY_TIME)) {
       if (c->key[0] != '\0') {
         irc_printf(state, "JOIN %s %s\r\n", c->name, c->key);
@@ -115,19 +123,16 @@ void channel_manager_check_joins(bot_state_t *state) {
       bool should_refresh = false;
       if (c->roster_count == 0 && (now - c->last_who_request > 30)) {
         log_message(L_DEBUG, state,
-                    "[DEBUG] No roster for %s. Requesting WHO.\n",
-                    c->name);
+                    "[DEBUG] No roster for %s. Requesting WHO.\n", c->name);
         should_refresh = true;
-      }
-      else if (now - c->last_who_request > ROSTER_REFRESH_INTERVAL) {
+      } else if (now - c->last_who_request > ROSTER_REFRESH_INTERVAL) {
         log_message(L_DEBUG, state,
                     "[DEBUG] Periodic roster refresh for %s (not opped).\n",
                     c->name);
         should_refresh = true;
-      }
-      else if (c->op_request_pending && 
-               (now - c->last_op_request_time > 60) &&
-               c->op_request_retry_count < 5) {
+      } else if (c->op_request_pending &&
+                 (now - c->last_op_request_time > 60) &&
+                 c->op_request_retry_count < 5) {
         log_message(L_DEBUG, state,
                     "[DEBUG] Op request timeout in %s. Refreshing to retry.\n",
                     c->name);
