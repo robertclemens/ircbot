@@ -50,10 +50,11 @@
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
 
 // Limits
-#define MAX_SERVERS 10  // Max number of servers to store
-#define MAX_MASKS 20    // Max number of admin masks to store
-#define MAX_CHAN 65     // Max length of channel name. Do not change
-#define MAX_BUFFER 4096 // Size of RAW IRC message. Do not change
+#define MAX_SERVERS 10 // Max number of servers to store
+#define MAX_MASKS 20   // Max number of admin masks to store
+#define MAX_CHAN 65    // Max length of channel name. Do not change
+#define MAX_BUFFER                                                             \
+  16384 // Size of RAW IRC message. Do not change (Matched to Hub size)
 #define MAX_NICK 10  // Max nick length 9 + NULL terminator = 10. Do not change
 #define MAX_PASS 128 // Max password length.
 #define MAX_KEY 31   // Max length for a channel key
