@@ -51,7 +51,8 @@ void hub_client_on_connect(bot_state_t *state) {
   }
 }
 
-static int rsa_decrypt_with_bot_privkey(const char *b64_priv_key,
+static int rsa_decrypt_with_bot_privkey(bot_state_t *state,
+                                        const char *b64_priv_key,
                                         const unsigned char *enc_data,
                                         int enc_len, unsigned char *out_plain) {
   if (!b64_priv_key || !enc_data)
@@ -61,7 +62,7 @@ static int rsa_decrypt_with_bot_privkey(const char *b64_priv_key,
   int pem_len = 0;
   unsigned char *pem_data = base64_decode(b64_priv_key, &pem_len);
   if (!pem_data) {
-    log_message(L_INFO, NULL, "[HUB] Base64 decode failed\n");
+    log_message(L_INFO, state, "[HUB] Base64 decode failed\n");
     return -1;
   }
 
@@ -72,8 +73,7 @@ static int rsa_decrypt_with_bot_privkey(const char *b64_priv_key,
   free(pem_data);
 
   if (!priv_key) {
-    log_message(L_INFO, NULL, "[HUB] Failed to load private key\n");
-    ERR_print_errors_fp(stderr);
+    log_message(L_INFO, state, "[HUB] Failed to load private key\n");
     return -1;
   }
 
@@ -93,8 +93,7 @@ static int rsa_decrypt_with_bot_privkey(const char *b64_priv_key,
                                (size_t)enc_len) > 0) {
             res = (int)out_len;
           } else {
-            log_message(L_INFO, NULL, "[HUB] Decryption failed\n");
-            ERR_print_errors_fp(stderr);
+            log_message(L_INFO, state, "[HUB] Decryption failed\n");
           }
         }
       }
@@ -106,7 +105,8 @@ static int rsa_decrypt_with_bot_privkey(const char *b64_priv_key,
   return res;
 }
 
-static int rsa_sign_with_bot_privkey(const char *b64_priv_key,
+static int rsa_sign_with_bot_privkey(bot_state_t *state,
+                                     const char *b64_priv_key,
                                      const unsigned char *data, int data_len,
                                      unsigned char *sig_out) {
   if (!b64_priv_key || !data || !sig_out)
@@ -557,45 +557,54 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
 
     case 'b': // Bot line: b|hostmask|uuid|timestamp
     {
-      // New format: b|hostmask|uuid|timestamp
-      // Legacy format: b|hostmask (no uuid/ts)
+      // Format: hostmask|uuid|timestamp
       char hostmask[MAX_MASK_LEN];
       char uuid[64];
       long ts = 0;
       hostmask[0] = '\0';
       uuid[0] = '\0';
 
-      // Try new format first: hostmask|uuid|timestamp
+      // Parse broadcast format: b|hostmask|uuid|timestamp
       int parsed = sscanf(data, "%127[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
       if (parsed < 1) {
-        // Legacy fallback: just hostmask
+        // Fallback: treat entire data as hostmask
         strncpy(hostmask, data, MAX_MASK_LEN - 1);
         hostmask[MAX_MASK_LEN - 1] = '\0';
       }
 
       if (hostmask[0] != '\0') {
         // Check if already exists (by hostmask only)
-        bool exists = false;
+        int existing_idx = -1;
         for (int i = 0; i < state->trusted_bot_count; i++) {
-          // Compare just the hostmask part
           char existing_mask[MAX_MASK_LEN];
-          sscanf(state->trusted_bots[i], "%127[^|]", existing_mask);
-          if (strcmp(existing_mask, hostmask) == 0) {
-            exists = true;
-            break;
+          if (sscanf(state->trusted_bots[i], "%127[^|]", existing_mask) >= 1) {
+            if (strcmp(existing_mask, hostmask) == 0) {
+              existing_idx = i;
+              break;
+            }
           }
         }
 
-        if (!exists && state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          // Store full format: hostmask|uuid|timestamp
-          char full_entry[256];
-          if (uuid[0] != '\0' && ts > 0) {
+        if (existing_idx != -1) {
+          // Check if update is newer
+          long old_ts = 0;
+          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%ld",
+                 &old_ts);
+          if (ts > old_ts) {
+            char full_entry[256];
             snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask,
                      uuid, ts);
-          } else {
-            strncpy(full_entry, hostmask, sizeof(full_entry) - 1);
-            full_entry[sizeof(full_entry) - 1] = '\0';
+            free(state->trusted_bots[existing_idx]);
+            state->trusted_bots[existing_idx] = strdup(full_entry);
+            updates++;
+            log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n",
+                        hostmask);
           }
+        } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
+          // New Add
+          char full_entry[256];
+          snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid,
+                   ts);
           state->trusted_bots[state->trusted_bot_count++] = strdup(full_entry);
           updates++;
           log_message(L_INFO, state, "[HUB] Added trusted bot: %s\n", hostmask);
@@ -640,6 +649,9 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 
 void hub_client_connect(bot_state_t *state) {
   if (state->hub_count == 0 || state->hub_fd != -1 || state->hub_connecting)
+    return;
+  // Safety: Ensure hub_count is positive before rand() % state->hub_count
+  if (state->hub_count <= 0)
     return;
   if (state->bot_uuid[0] == '\0') {
     log_message(L_INFO, state,
@@ -796,24 +808,29 @@ void hub_client_process(bot_state_t *state) {
             auth_state = HUB_AUTH_SENT_SIGNATURE;
             log_message(L_INFO, state, "[HUB] Signature sent.\n");
           } else {
+            log_message(L_INFO, state, "[HUB] Failed to send signature\n");
             free(packet_body);
             hub_client_disconnect(state);
             return;
           }
         } else {
+          log_message(L_INFO, state,
+                      "[HUB] Failed to sign challenge (Key mismatch?)\n");
           free(packet_body);
           hub_client_disconnect(state);
           return;
         }
       } else {
+        log_message(L_INFO, state,
+                    "[HUB] Failed to decrypt challenge (Incorrect Key?)\n");
         free(packet_body);
         hub_client_disconnect(state);
         return;
       }
     } else if (auth_state == HUB_AUTH_SENT_SIGNATURE) {
       unsigned char session_key[32];
-      if (rsa_decrypt_with_bot_privkey(state->hub_key, packet_body, packet_len,
-                                       session_key) == 32) {
+      if (rsa_decrypt_with_bot_privkey(state, state->hub_key, packet_body,
+                                       packet_len, session_key) == 32) {
         memcpy(state->hub_session_key, session_key, 32);
         state->hub_authenticated = true;
         auth_state = HUB_AUTH_COMPLETE;
