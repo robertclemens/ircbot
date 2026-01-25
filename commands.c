@@ -438,9 +438,16 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
       irc_printf(state, "PRIVMSG %s :--- Trusted Bots (Botpass: %s) ---\r\n",
                  nick, state->bot_comm_pass);
-      for (int i = 0; i < state->trusted_bot_count; i++)
-        irc_printf(state, "PRIVMSG %s : - %s\r\n", nick,
-                   state->trusted_bots[i]);
+      for (int i = 0; i < state->trusted_bot_count; i++) {
+        // Extract just the hostmask from format: hostmask|uuid|timestamp
+        char hostmask[128];
+        if (sscanf(state->trusted_bots[i], "%127[^|]", hostmask) == 1) {
+          irc_printf(state, "PRIVMSG %s : - %s\r\n", nick, hostmask);
+        } else {
+          irc_printf(state, "PRIVMSG %s : - %s\r\n", nick,
+                     state->trusted_bots[i]);
+        }
+      }
 
       irc_printf(state, "PRIVMSG %s :--- Configured Hubs ---\r\n", nick);
       for (int i = 0; i < state->hub_count; i++)

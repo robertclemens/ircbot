@@ -3,7 +3,6 @@
 #include <string.h>
 #include <strings.h>
 
-
 chan_t *channel_add(bot_state_t *state, const char *name) {
   if (channel_find(state, name)) {
     return NULL;
@@ -20,6 +19,8 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
   new_chan->op_request_pending = false;
   new_chan->last_op_request_time = 0;
   new_chan->op_request_retry_count = 0;
+  new_chan->is_managed = true;      // Default to managed (add)
+  new_chan->timestamp = time(NULL); // Default to current time
   new_chan->next = NULL;
 
   if (state->chanlist == NULL) {

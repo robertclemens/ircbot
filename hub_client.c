@@ -512,76 +512,93 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'a': // Admin password (no operation/timestamp in payload)
+    case 'a': // Admin password: a|password|timestamp
     {
-      // Hub sends: a|password
-      // We already have timestamps in local config
-      // Only update if we don't have one or it's different
-      if (state->bot_pass[0] == '\0' || strcmp(state->bot_pass, data) != 0) {
-        strncpy(state->bot_pass, data, MAX_PASS - 1);
+      // Hub sends: a|password|timestamp
+      char pass[MAX_PASS];
+      long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      if (parsed < 1) {
+        // Fallback: treat entire data as password
+        strncpy(pass, data, MAX_PASS - 1);
+        pass[MAX_PASS - 1] = '\0';
+        ts = 0;
+      }
+      // Only update if hub has newer timestamp
+      if (ts > state->bot_pass_ts || state->bot_pass[0] == '\0') {
+        strncpy(state->bot_pass, pass, MAX_PASS - 1);
         state->bot_pass[MAX_PASS - 1] = '\0';
+        state->bot_pass_ts = ts;
         updates++;
-        log_message(L_INFO, state, "[HUB] Updated admin password\n");
+        log_message(L_INFO, state, "[HUB] Updated admin password (ts=%ld)\n",
+                    ts);
       }
     } break;
 
-    case 'p': // Bot password
+    case 'p': // Bot password: p|password|timestamp
     {
-      if (state->bot_comm_pass[0] == '\0' ||
-          strcmp(state->bot_comm_pass, data) != 0) {
-        strncpy(state->bot_comm_pass, data, MAX_PASS - 1);
+      char pass[MAX_PASS];
+      long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      if (parsed < 1) {
+        strncpy(pass, data, MAX_PASS - 1);
+        pass[MAX_PASS - 1] = '\0';
+        ts = 0;
+      }
+      // Only update if hub has newer timestamp
+      if (ts > state->bot_comm_pass_ts || state->bot_comm_pass[0] == '\0') {
+        strncpy(state->bot_comm_pass, pass, MAX_PASS - 1);
         state->bot_comm_pass[MAX_PASS - 1] = '\0';
+        state->bot_comm_pass_ts = ts;
         updates++;
-        log_message(L_INFO, state, "[HUB] Updated bot password\n");
+        log_message(L_INFO, state, "[HUB] Updated bot password (ts=%ld)\n", ts);
       }
     } break;
 
-    case 'b': // Bot line. Handles 'b|uuid|h|hostmask|ts' OR 'b|hostmask'
-              // (legacy)
+    case 'b': // Bot line: b|hostmask|uuid|timestamp
     {
+      // New format: b|hostmask|uuid|timestamp
+      // Legacy format: b|hostmask (no uuid/ts)
       char hostmask[MAX_MASK_LEN];
+      char uuid[64];
+      long ts = 0;
       hostmask[0] = '\0';
+      uuid[0] = '\0';
 
-      char *p1 = strchr(data, '|');
-      if (p1) {
-        // Complex format: UUID|KEY|VALUE|TS
-        // Check if key is 'h'
-        char *p2 = strchr(p1 + 1, '|');
-        if (p2) {
-          size_t key_len = p2 - (p1 + 1);
-          if (key_len == 1 && *(p1 + 1) == 'h') {
-            // It is a hostmask update
-            char *p3 = strrchr(p2 + 1, '|'); // Find TS
-            if (p3) {
-              size_t val_len = p3 - (p2 + 1);
-              if (val_len < MAX_MASK_LEN) {
-                strncpy(hostmask, p2 + 1, val_len);
-                hostmask[val_len] = '\0';
-              }
-            }
-          }
-        }
-      } else {
-        // Legacy format: Just hostmask
+      // Try new format first: hostmask|uuid|timestamp
+      int parsed = sscanf(data, "%127[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
+      if (parsed < 1) {
+        // Legacy fallback: just hostmask
         strncpy(hostmask, data, MAX_MASK_LEN - 1);
         hostmask[MAX_MASK_LEN - 1] = '\0';
       }
 
       if (hostmask[0] != '\0') {
-        // Check if already exists
+        // Check if already exists (by hostmask only)
         bool exists = false;
         for (int i = 0; i < state->trusted_bot_count; i++) {
-          if (strcmp(state->trusted_bots[i], hostmask) == 0) {
+          // Compare just the hostmask part
+          char existing_mask[MAX_MASK_LEN];
+          sscanf(state->trusted_bots[i], "%127[^|]", existing_mask);
+          if (strcmp(existing_mask, hostmask) == 0) {
             exists = true;
             break;
           }
         }
 
         if (!exists && state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          state->trusted_bots[state->trusted_bot_count++] = strdup(hostmask);
+          // Store full format: hostmask|uuid|timestamp
+          char full_entry[256];
+          if (uuid[0] != '\0' && ts > 0) {
+            snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask,
+                     uuid, ts);
+          } else {
+            strncpy(full_entry, hostmask, sizeof(full_entry) - 1);
+            full_entry[sizeof(full_entry) - 1] = '\0';
+          }
+          state->trusted_bots[state->trusted_bot_count++] = strdup(full_entry);
           updates++;
-          log_message(L_INFO, state, "[HUB] Added trusted bot (synced): %s\n",
-                      hostmask);
+          log_message(L_INFO, state, "[HUB] Added trusted bot: %s\n", hostmask);
         }
       }
     } break;

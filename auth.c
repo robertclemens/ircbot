@@ -195,9 +195,13 @@ bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
     return false;
 
   for (int i = 0; i < state->trusted_bot_count; i++) {
-    // Trusted bots list is still char*, so no struct access needed here
-    if (wildcard_match(state->trusted_bots[i], user_host)) {
-      return true;
+    // Extract hostmask from format: hostmask|uuid|timestamp
+    // or just hostmask for legacy entries
+    char hostmask[128];
+    if (sscanf(state->trusted_bots[i], "%127[^|]", hostmask) == 1) {
+      if (wildcard_match(hostmask, user_host)) {
+        return true;
+      }
     }
   }
   return false;
