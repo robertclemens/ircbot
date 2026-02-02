@@ -548,6 +548,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           }
         }
 
+        log_message(L_DEBUG, state, "[HUB-SYNC] Oper %s: hub_ts=%ld local_ts=%ld op=%s idx=%d\n",
+                    mask, ts, idx >= 0 ? (long)state->op_masks[idx].timestamp : 0, op, idx);
+
         if (idx == -1 && is_add) {
           if (state->op_mask_count < MAX_OP_MASKS) {
             size_t mask_len = strlen(mask);
@@ -567,6 +570,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             state->op_mask_count++;
             updates++;
             log_message(L_INFO, state, "[HUB] Added oper mask: %s\n", mask);
+          } else {
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected oper %s: max masks reached\n", mask);
           }
         } else if (idx != -1) {
           if (ts > state->op_masks[idx].timestamp) {
@@ -580,7 +585,12 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             updates++;
             log_message(L_INFO, state, "[HUB] Updated oper mask: %s (%s)\n",
                         mask, op);
+          } else {
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected oper %s: hub_ts=%ld <= local_ts=%ld\n",
+                        mask, ts, (long)state->op_masks[idx].timestamp);
           }
+        } else if (idx == -1 && !is_add) {
+          log_message(L_DEBUG, state, "[HUB-SYNC] Skipped oper del for non-existent: %s\n", mask);
         }
       }
     } break;
@@ -625,6 +635,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         pass[MAX_PASS - 1] = '\0';
         ts = 0;
       }
+      log_message(L_DEBUG, state, "[HUB-SYNC] BotPass: hub_ts=%ld local_ts=%ld\n",
+                  ts, (long)state->bot_comm_pass_ts);
       // Only update if hub has newer timestamp
       if (ts > state->bot_comm_pass_ts || state->bot_comm_pass[0] == '\0') {
         strncpy(state->bot_comm_pass, pass, MAX_PASS - 1);
@@ -632,6 +644,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         state->bot_comm_pass_ts = ts;
         updates++;
         log_message(L_INFO, state, "[HUB] Updated bot password (ts=%ld)\n", ts);
+      } else {
+        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected bot password: hub_ts=%ld <= local_ts=%ld\n",
+                    ts, (long)state->bot_comm_pass_ts);
       }
     } break;
 
@@ -691,6 +706,10 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         }
       }
     } break;
+
+    default:
+      log_message(L_DEBUG, state, "[HUB-SYNC] Unrecognized line type '%c': %s\n", type, line);
+      break;
     }
 
     line = strtok_r(NULL, "\n", &saveptr);
