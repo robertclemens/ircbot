@@ -363,8 +363,9 @@ void hub_client_push_config(bot_state_t *state) {
     return;
   }
 
-  log_message(L_DEBUG, state, "[HUB] Pushing config to hub (%zu bytes)\n",
+  log_message(L_DEBUG, state, "[HUB-SYNC] Pushing config to hub (%zu bytes)\n",
               strlen(payload));
+  log_message(L_DEBUG, state, "[HUB-SYNC] Push payload:\n%s", payload);
 
   int pay_len = strlen(payload);
   unsigned char plain[MAX_BUFFER];
@@ -392,7 +393,8 @@ void hub_client_push_config(bot_state_t *state) {
 }
 
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
-  log_message(L_DEBUG, state, "[HUB] Processing config data from hub\n");
+  log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
+  log_message(L_DEBUG, state, "[HUB-SYNC] Received payload:\n%s", payload);
 
   char work_buf[MAX_BUFFER];
   strncpy(work_buf, payload, sizeof(work_buf) - 1);
@@ -436,6 +438,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         bool is_add = (strcmp(op, "add") == 0);
         chan_t *c = channel_find(state, chan);
 
+        log_message(L_DEBUG, state, "[HUB-SYNC] Channel %s: hub_ts=%ld local_ts=%ld op=%s\n",
+                    chan, ts, c ? (long)c->timestamp : 0, op);
+
         if (!c && is_add) {
           // New channel from hub
           c = channel_add(state, chan);
@@ -468,7 +473,12 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             updates++;
             log_message(L_INFO, state, "[HUB] Updated channel: %s (%s)\n", chan,
                         op);
+          } else {
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%ld <= local_ts=%ld\n",
+                        chan, ts, (long)c->timestamp);
           }
+        } else if (!c && !is_add) {
+          log_message(L_DEBUG, state, "[HUB-SYNC] Skipped del for non-existent channel: %s\n", chan);
         }
       }
     } break;
@@ -488,6 +498,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             break;
           }
         }
+
+        log_message(L_DEBUG, state, "[HUB-SYNC] Mask %s: hub_ts=%ld local_ts=%ld op=%s\n",
+                    mask, ts, idx >= 0 ? (long)state->auth_masks[idx].timestamp : 0, op);
 
         if (idx == -1 && is_add) {
           // New mask from hub
@@ -511,6 +524,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             updates++;
             log_message(L_INFO, state, "[HUB] Updated admin mask: %s (%s)\n",
                         mask, op);
+          } else {
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected mask %s: hub_ts=%ld <= local_ts=%ld\n",
+                        mask, ts, (long)state->auth_masks[idx].timestamp);
           }
         }
       }
@@ -581,6 +597,10 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         pass[MAX_PASS - 1] = '\0';
         ts = 0;
       }
+
+      log_message(L_DEBUG, state, "[HUB-SYNC] AdminPass: hub_ts=%ld local_ts=%ld\n",
+                  ts, (long)state->bot_pass_ts);
+
       // Only update if hub has newer timestamp
       if (ts > state->bot_pass_ts || state->bot_pass[0] == '\0') {
         strncpy(state->bot_pass, pass, MAX_PASS - 1);
@@ -589,6 +609,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         updates++;
         log_message(L_INFO, state, "[HUB] Updated admin password (ts=%ld)\n",
                     ts);
+      } else {
+        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected admin password: hub_ts=%ld <= local_ts=%ld\n",
+                    ts, (long)state->bot_pass_ts);
       }
     } break;
 
@@ -676,7 +699,10 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   if (updates > 0) {
     log_message(L_INFO, state, "[HUB] Applied %d config updates from hub\n",
                 updates);
+    log_message(L_DEBUG, state, "[HUB-SYNC] Saving config (will trigger push back to hub)\n");
     config_write(state, state->startup_password);
+  } else {
+    log_message(L_DEBUG, state, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
   }
 }
 
