@@ -256,6 +256,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       strncpy(state->bot_comm_pass, arg1, MAX_PASS - 1);
+      state->bot_comm_pass_ts = time(NULL);
       config_write(state, state->startup_password);
       irc_printf(state,
                  "PRIVMSG %s :Bot communication password set and saved.\r\n",
@@ -735,6 +736,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       if (strlen(arg1) > 0) {
         strncpy(state->bot_pass, arg1, MAX_PASS - 1);
+        state->bot_pass_ts = time(NULL);
         config_write(state, state->startup_password);
         irc_printf(state,
                    "PRIVMSG %s :Admin password has been changed and saved.\r\n",
