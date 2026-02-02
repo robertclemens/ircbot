@@ -430,6 +430,21 @@ void parser_handle_line(bot_state_t *state, char *line) {
         irc_printf(state, "WHO %s\r\n", c->name);
       }
     }
+  } else if (strcmp(command, "PART") == 0 && prefix) {
+    char *nick = strtok_r(prefix, "!", &saveptr_irc);
+    if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
+                 strcasecmp(nick, state->target_nick) == 0)) {
+      // Extract channel name (may have : prefix or trailing reason)
+      char *chan_name = (*params == ':') ? params + 1 : params;
+      char *space = strchr(chan_name, ' ');
+      if (space) *space = '\0';  // Remove part reason if present
+      chan_t *c = channel_find(state, chan_name);
+      if (c) {
+        c->status = C_OUT;
+        c->roster_count = 0;
+        log_message(L_DEBUG, state, "[IRC] Parted channel %s\n", chan_name);
+      }
+    }
   } else if (strcmp(command, "KICK") == 0 && params) {
     char params_copy[MAX_BUFFER];
     strncpy(params_copy, params, sizeof(params_copy) - 1);
