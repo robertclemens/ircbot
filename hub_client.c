@@ -679,8 +679,13 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       hostmask[0] = '\0';
       uuid[0] = '\0';
 
+      log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line: %s\n", data);
+
       // Parse broadcast format: b|hostmask|uuid|timestamp
       int parsed = sscanf(data, "%127[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
+      log_message(L_DEBUG, state,
+                  "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%ld\n",
+                  parsed, hostmask, uuid, ts);
       if (parsed < 1) {
         // Fallback: treat entire data as hostmask
         strncpy(hostmask, data, MAX_MASK_LEN - 1);

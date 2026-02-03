@@ -25,7 +25,18 @@ static char *base64_encode(const unsigned char *input, int length) {
 
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...) {
-  if (!target_nick || !format || state->bot_comm_pass[0] == '\0') return;
+  if (!target_nick || !format) {
+    log_message(L_DEBUG, state,
+                "[BOT-COMM] Cannot send: target_nick=%p format=%p\n",
+                (void *)target_nick, (void *)format);
+    return;
+  }
+  if (state->bot_comm_pass[0] == '\0') {
+    log_message(L_DEBUG, state,
+                "[BOT-COMM] Cannot send to %s: bot_comm_pass is empty\n",
+                target_nick);
+    return;
+  }
 
   char command_part[256];
   va_list args;
@@ -66,6 +77,9 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
     char *encoded_ciphertext = base64_encode(ciphertext, total_len);
     char *encoded_tag = base64_encode(tag, GCM_TAG_LEN);
 
+    log_message(L_DEBUG, state,
+                "[BOT-COMM] Sending encrypted PRIVMSG to %s: %s\n",
+                target_nick, command_part);
     irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick, encoded_ciphertext,
                encoded_tag);
 

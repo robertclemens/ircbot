@@ -303,6 +303,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
     log_message(L_INFO, state, "[INFO] Roster for %s updated with %d users.\n",
                 c->name, c->roster_count);
 
+    // Debug: Show trusted bot info
+    log_message(L_DEBUG, state, "[OP-REQ] trusted_bot_count=%d\n",
+                state->trusted_bot_count);
+    for (int i = 0; i < state->trusted_bot_count; i++) {
+      log_message(L_DEBUG, state, "[OP-REQ] trusted_bots[%d]: %s\n", i,
+                  state->trusted_bots[i]);
+    }
+
     bool am_i_opped = false;
     for (int i = 0; i < c->roster_count; i++) {
       if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
@@ -338,9 +346,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
     roster_entry_t *helpers[MAX_ROSTER_SIZE];
     int helper_count = 0;
 
+    log_message(L_DEBUG, state, "[OP-REQ] Scanning %d roster entries for trusted ops\n",
+                c->roster_count);
     for (int i = 0; i < c->roster_count; i++) {
       roster_entry_t *entry = &c->roster[i];
-      if (entry->is_op && auth_is_trusted_bot(state, entry->hostmask)) {
+      bool is_trusted = auth_is_trusted_bot(state, entry->hostmask);
+      log_message(L_DEBUG, state, "[OP-REQ] Roster[%d]: nick=%s hostmask=%s is_op=%d is_trusted=%d\n",
+                  i, entry->nick, entry->hostmask, entry->is_op, is_trusted);
+      if (entry->is_op && is_trusted) {
         if (helper_count < MAX_ROSTER_SIZE) {
           helpers[helper_count++] = entry;
         }
@@ -359,6 +372,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
       // Try hub first - look up UUID for this helper
       bool sent_via_hub = false;
+      log_message(L_DEBUG, state,
+                  "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
+                  chosen_helper->nick, chosen_helper->hostmask);
       for (int tb = 0; tb < state->trusted_bot_count && !sent_via_hub; tb++) {
         char mask[MAX_MASK_LEN];
         char uuid[64];
@@ -369,23 +385,39 @@ void parser_handle_line(bot_state_t *state, char *line) {
           char helper_check[MAX_MASK_LEN];
           snprintf(helper_check, sizeof(helper_check), "%s!",
                    chosen_helper->nick);
-          if (strncasecmp(state->trusted_bots[tb], helper_check,
-                          strlen(helper_check)) == 0 ||
-              strcasecmp(mask, chosen_helper->hostmask) == 0) {
+          bool nick_match = strncasecmp(state->trusted_bots[tb], helper_check,
+                                        strlen(helper_check)) == 0;
+          bool mask_match = strcasecmp(mask, chosen_helper->hostmask) == 0;
+          log_message(L_DEBUG, state,
+                      "[OP-REQ] Check trusted_bots[%d]: mask='%s' uuid='%s' nick_match=%d mask_match=%d\n",
+                      tb, mask, uuid, nick_match, mask_match);
+          if (nick_match || mask_match) {
             // Found matching UUID, try hub
+            log_message(L_DEBUG, state,
+                        "[OP-REQ] Found UUID match, trying hub request\n");
             sent_via_hub = hub_client_request_op(state, uuid, c->name);
+            log_message(L_DEBUG, state,
+                        "[OP-REQ] hub_client_request_op returned: %d\n",
+                        sent_via_hub);
           }
         }
       }
 
       // Fallback to PRIVMSG if hub unavailable
       if (!sent_via_hub) {
+        log_message(L_DEBUG, state,
+                    "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n");
         bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
       }
       c->last_op_request_time = now;
       c->op_request_pending = true;
       c->op_request_retry_count++;
     } else {
+      log_message(L_DEBUG, state,
+                  "[OP-REQ] No trusted ops found in roster. "
+                  "trusted_bot_count=%d, roster_count=%d (attempt %d)\n",
+                  state->trusted_bot_count, c->roster_count,
+                  c->op_request_retry_count + 1);
       c->last_op_request_time = now;
       c->op_request_retry_count++;
     }
