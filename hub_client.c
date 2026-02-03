@@ -472,11 +472,18 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               memcpy(c->key, key, len);
               c->key[len] = '\0';
             }
+            bool was_managed = c->is_managed;
             c->is_managed = is_add;
             c->timestamp = ts;
             updates++;
             log_message(L_INFO, state, "[HUB] Updated channel: %s (%s)\n", chan,
                         op);
+            // If channel changed from managed to unmanaged, PART the channel
+            if (was_managed && !is_add && c->status == C_IN) {
+              log_message(L_INFO, state, "[HUB] Parting channel %s (synced del)\n", chan);
+              irc_printf(state, "PART %s :Hub sync\r\n", chan);
+              c->status = C_OUT;
+            }
           } else {
             log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%ld <= local_ts=%ld\n",
                         chan, ts, (long)c->timestamp);
