@@ -484,6 +484,15 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               irc_printf(state, "PART %s :Hub sync\r\n", chan);
               c->status = C_OUT;
             }
+            // If channel changed from unmanaged to managed, JOIN the channel
+            if (!was_managed && is_add && c->status != C_IN) {
+              log_message(L_INFO, state, "[HUB] Joining channel %s (synced add)\n", chan);
+              if (c->key[0] != '\0') {
+                irc_printf(state, "JOIN %s %s\r\n", chan, c->key);
+              } else {
+                irc_printf(state, "JOIN %s\r\n", chan);
+              }
+            }
           } else {
             log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%ld <= local_ts=%ld\n",
                         chan, ts, (long)c->timestamp);

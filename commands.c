@@ -212,18 +212,23 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       channel_name[sizeof(channel_name) - 1] = '\0';
 
-      if (channel_find(state, channel_name)) {
+      chan_t *c = channel_find(state, channel_name);
+      if (c && c->is_managed) {
         irc_printf(state,
                    "PRIVMSG %s :Error: Channel %s is already in my list.\r\n",
                    nick, channel_name);
         return;
       }
-      chan_t *c = channel_add(state, channel_name);
+      if (!c) {
+        c = channel_add(state, channel_name);
+      }
       if (c) {
         if (arg2)
           strncpy(c->key, arg2, MAX_KEY - 1);
         c->is_managed = true;      // Mark as managed for syncing
         c->timestamp = time(NULL); // Set timestamp for sync
+        log_message(L_DEBUG, state, "[JOIN] Channel %s: re-enabled ts=%ld\n",
+                    channel_name, (long)c->timestamp);
       }
       config_write(state, state->startup_password);
       hub_client_push_config(state); // Sync to hub immediately
