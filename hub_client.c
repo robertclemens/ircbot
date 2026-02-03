@@ -219,6 +219,8 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   // Channels
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     const char *op = c->is_managed ? "add" : "del";
+    log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
+                c->name, c->is_managed, op, (long)c->timestamp);
     if (c->key[0] != '\0') {
       written = snprintf(buffer + offset, max_len - offset, "c|%s|%s|%s|%ld\n",
                          c->name, c->key, op, (long)c->timestamp);
@@ -352,6 +354,8 @@ void hub_client_promote_local_config(bot_state_t *state) {
 void hub_client_push_config(bot_state_t *state) {
   if (state->hub_count == 0 || state->hub_fd == -1 ||
       !state->hub_authenticated) {
+    log_message(L_DEBUG, state, "[HUB-PUSH] Skipped push: hub_count=%d hub_fd=%d auth=%d\n",
+                state->hub_count, state->hub_fd, state->hub_authenticated);
     return; // Not hub-managed or not connected
   }
 

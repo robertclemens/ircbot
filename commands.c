@@ -645,8 +645,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       chan_t *c = channel_find(state, channel_name);
       if (c) {
         // Soft delete
+        time_t old_ts = c->timestamp;
         c->is_managed = false;
         c->timestamp = time(NULL);
+        log_message(L_DEBUG, state, "[PART] Channel %s: is_managed=%d old_ts=%ld new_ts=%ld\n",
+                    channel_name, c->is_managed, (long)old_ts, (long)c->timestamp);
         irc_printf(state, "PART %s\r\n", channel_name);
         config_write(state, state->startup_password);
         irc_printf(state,
