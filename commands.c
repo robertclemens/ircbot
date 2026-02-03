@@ -240,7 +240,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       } else {
         snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
       }
-      if (channel_remove(state, arg1)) {
+      chan_t *c = channel_find(state, channel_name);
+      if (c) {
+        // Soft delete - mark as unmanaged instead of removing
+        c->is_managed = false;
+        c->timestamp = time(NULL);
+        log_message(L_DEBUG, state, "[PART-OP] Channel %s: soft delete ts=%ld\n",
+                    channel_name, (long)c->timestamp);
         irc_printf(state, "PART %s\r\n", channel_name);
         config_write(state, state->startup_password);
       }
@@ -629,37 +635,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                      channel_name);
           irc_printf(state, "JOIN %s %s\r\n", channel_name, (arg2 ? arg2 : ""));
         }
-      }
-    } else if (strcasecmp(command, "part") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: part <#channel>\r\n", nick);
-        return;
-      }
-      char channel_name[MAX_CHAN];
-      if (arg1[0] == '#') {
-        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
-      } else {
-        snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
-      }
-
-      chan_t *c = channel_find(state, channel_name);
-      if (c) {
-        // Soft delete
-        time_t old_ts = c->timestamp;
-        c->is_managed = false;
-        c->timestamp = time(NULL);
-        log_message(L_DEBUG, state, "[PART] Channel %s: is_managed=%d old_ts=%ld new_ts=%ld\n",
-                    channel_name, c->is_managed, (long)old_ts, (long)c->timestamp);
-        irc_printf(state, "PART %s\r\n", channel_name);
-        config_write(state, state->startup_password);
-        irc_printf(state,
-                   "PRIVMSG %s :Removed channel %s (Soft Delete) and saved "
-                   "config.\r\n",
-                   nick, channel_name);
-      } else {
-        irc_printf(state,
-                   "PRIVMSG %s :Error: Channel %s not found in list.\r\n", nick,
-                   channel_name);
       }
     } else if (strcasecmp(command, "+adminmask") == 0) {
       if (!arg1) {
