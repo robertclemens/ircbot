@@ -860,12 +860,34 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           break;
         }
       if (found != -1) {
+        // Check if this is the currently connected hub
+        bool is_current_hub = (state->hub_connected &&
+                               strcmp(state->current_hub, arg1) == 0);
+
+        // If removing the currently connected hub, disconnect first
+        if (is_current_hub) {
+          irc_printf(state, "PRIVMSG %s :Disconnecting from current hub: %s\r\n",
+                     nick, arg1);
+          hub_client_disconnect(state);
+        }
+
+        // Remove the hub from the list
         free(state->hub_list[found]);
         for (int i = found; i < state->hub_count - 1; i++)
           state->hub_list[i] = state->hub_list[i + 1];
         state->hub_count--;
         config_write(state, state->startup_password);
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
+
+        // If we disconnected and there are other hubs available, reconnect
+        if (is_current_hub && state->hub_count > 0) {
+          irc_printf(state, "PRIVMSG %s :Reconnecting to another hub...\r\n", nick);
+          state->last_hub_connect_attempt = 0; // Reset cooldown
+          hub_client_connect(state);
+        } else if (is_current_hub && state->hub_count == 0) {
+          irc_printf(state, "PRIVMSG %s :No other hubs available to connect to.\r\n",
+                     nick);
+        }
       }
     } else if (strcasecmp(command, "sethubkey") == 0) {
       if (!arg1) {

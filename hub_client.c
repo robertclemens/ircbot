@@ -160,6 +160,7 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_connecting = false;
   auth_state = HUB_AUTH_NONE;
   memset(state->hub_session_key, 0, 32);
+  state->current_hub[0] = '\0'; // Clear current hub tracking
   state->last_hub_connect_attempt = time(NULL);
   last_pong_sent = 0;
 }
@@ -927,12 +928,14 @@ void hub_client_connect(bot_state_t *state) {
   state->hub_connected = true;
   state->hub_authenticated = false;
   auth_state = HUB_AUTH_NONE;
+  // Store which hub we connected to
+  snprintf(state->current_hub, sizeof(state->current_hub), "%s:%d", hub_tmp, port);
   int uuid_len = strlen(state->bot_uuid);
   uint32_t net_len = htonl(uuid_len);
   if (send(state->hub_fd, &net_len, 4, 0) == 4 &&
       send(state->hub_fd, state->bot_uuid, uuid_len, 0) == uuid_len) {
     auth_state = HUB_AUTH_SENT_UUID;
-    log_message(L_INFO, state, "[HUB] Connected.\n");
+    log_message(L_INFO, state, "[HUB] Connected to %s.\n", state->current_hub);
   } else {
     hub_client_disconnect(state);
   }

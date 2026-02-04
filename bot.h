@@ -276,6 +276,7 @@ struct bot_state {
   uint16_t hub_key_parts_expected;
   int hub_count;
   int hub_fd;
+  char current_hub[256]; // Track currently connected hub (ip:port)
   bool hub_connecting;
   bool hub_connected;
   bool hub_authenticated;
