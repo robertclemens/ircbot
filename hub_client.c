@@ -898,8 +898,11 @@ void hub_client_connect(bot_state_t *state) {
   state->last_hub_connect_attempt = now;
   state->hub_connecting = true;
   char hub_tmp[256];
+  char hub_original[256]; // Save original hub string for later
   snprintf(hub_tmp, sizeof(hub_tmp), "%s",
            state->hub_list[rand() % state->hub_count]);
+  strncpy(hub_original, hub_tmp, sizeof(hub_original) - 1);
+  hub_original[sizeof(hub_original) - 1] = '\0';
   char *p = strchr(hub_tmp, ':');
   if (!p) {
     state->hub_connecting = false;
@@ -928,8 +931,9 @@ void hub_client_connect(bot_state_t *state) {
   state->hub_connected = true;
   state->hub_authenticated = false;
   auth_state = HUB_AUTH_NONE;
-  // Store which hub we connected to
-  snprintf(state->current_hub, sizeof(state->current_hub), "%s:%d", hub_tmp, port);
+  // Store which hub we connected to (after successful connection)
+  strncpy(state->current_hub, hub_original, sizeof(state->current_hub) - 1);
+  state->current_hub[sizeof(state->current_hub) - 1] = '\0';
   int uuid_len = strlen(state->bot_uuid);
   uint32_t net_len = htonl(uuid_len);
   if (send(state->hub_fd, &net_len, 4, 0) == 4 &&
