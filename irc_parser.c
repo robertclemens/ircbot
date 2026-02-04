@@ -335,6 +335,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (c->op_request_pending && (now - c->last_op_request_time < 60)) {
       return;
     }
+    // Reset retry counter after 5 minutes of no attempts
+    if (c->op_request_retry_count >= 5 &&
+        (now - c->last_op_request_time > 300)) {
+      log_message(L_INFO, state,
+                  "[INFO] Resetting retry counter for %s after timeout.\n",
+                  c->name);
+      c->op_request_retry_count = 0;
+    }
     if (c->op_request_retry_count >= 5) {
       log_message(L_INFO, state,
                   "[INFO] Gave up requesting ops in %s after %d attempts.\n",
