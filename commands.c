@@ -352,9 +352,14 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s : Uptime: %s\r\n", nick, uptime_str);
       irc_printf(state, "PRIVMSG %s : UUID: %s\r\n", nick,
                  (state->bot_uuid[0] ? state->bot_uuid : "None (Standalone)"));
-      irc_printf(state, "PRIVMSG %s : Hub Status: %s (FD: %d)\r\n", nick,
-                 (state->hub_connected ? "CONNECTED" : "DISCONNECTED"),
-                 state->hub_fd);
+      if (state->hub_connected && state->current_hub[0]) {
+        irc_printf(state, "PRIVMSG %s : Hub Status: CONNECTED TO %s (FD: %d)\r\n",
+                   nick, state->current_hub, state->hub_fd);
+      } else {
+        irc_printf(state, "PRIVMSG %s : Hub Status: %s (FD: %d)\r\n", nick,
+                   (state->hub_connected ? "CONNECTED" : "DISCONNECTED"),
+                   state->hub_fd);
+      }
 
       int max_width = 0;
       for (int i = 0; i < state->server_count; i++) {
