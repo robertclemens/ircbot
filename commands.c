@@ -392,11 +392,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         if (i < state->server_count)
           strncpy(server_part, state->server_list[i], sizeof(server_part) - 1);
 
-        // Skip to next active (is_managed) channel
-        while (current_chan && !current_chan->is_managed) {
-          current_chan = current_chan->next;
-        }
-
         if (current_chan) {
           bool am_i_opped = false;
           for (int j = 0; j < current_chan->roster_count; j++) {
@@ -410,14 +405,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           const char *op_prefix = am_i_opped ? "@" : "";
           const char *status_str =
               (current_chan->status == C_IN) ? "IN" : "OUT";
+          const char *managed_suffix = current_chan->is_managed ? " [M]" : "";
 
           if (current_chan->key[0] != '\0') {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s) [M]",
+            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s)%s",
                      op_prefix, current_chan->name, current_chan->key,
-                     status_str);
+                     status_str, managed_suffix);
           } else {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (%s) [M]", op_prefix,
-                     current_chan->name, status_str);
+            snprintf(chan_part, sizeof(chan_part), "%s%s (%s)%s", op_prefix,
+                     current_chan->name, status_str, managed_suffix);
           }
           current_chan = current_chan->next;
         }
@@ -433,42 +429,25 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                "--- Admin Masks", "Op Masks ---");
       irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
 
-      // Count managed masks for proper pairing
-      int managed_admin = 0, managed_op = 0;
-      for (int i = 0; i < state->mask_count; i++) {
-        if (state->auth_masks[i].is_managed) managed_admin++;
-      }
-      for (int i = 0; i < state->op_mask_count; i++) {
-        if (state->op_masks[i].is_managed) managed_op++;
-      }
-
-      max_rows = (managed_admin > managed_op) ? managed_admin : managed_op;
-      int admin_idx = 0, op_idx = 0;
+      max_rows = (state->mask_count > state->op_mask_count)
+                     ? state->mask_count
+                     : state->op_mask_count;
 
       for (int i = 0; i < max_rows; i++) {
         char admin_part[128] = "";
         char op_part[256] = "";
 
-        // Find next managed admin mask
-        while (admin_idx < state->mask_count &&
-               !state->auth_masks[admin_idx].is_managed) {
-          admin_idx++;
-        }
-        if (admin_idx < state->mask_count) {
-          snprintf(admin_part, sizeof(admin_part), "%s [M]",
-                   state->auth_masks[admin_idx].mask);
-          admin_idx++;
+        if (i < state->mask_count) {
+          const char *managed_suffix = state->auth_masks[i].is_managed ? " [M]" : "";
+          snprintf(admin_part, sizeof(admin_part), "%s%s",
+                   state->auth_masks[i].mask, managed_suffix);
         }
 
-        // Find next managed op mask
-        while (op_idx < state->op_mask_count &&
-               !state->op_masks[op_idx].is_managed) {
-          op_idx++;
-        }
-        if (op_idx < state->op_mask_count) {
-          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s) [M]", 50,
-                   state->op_masks[op_idx].mask, 20, state->op_masks[op_idx].password);
-          op_idx++;
+        if (i < state->op_mask_count) {
+          const char *managed_suffix = state->op_masks[i].is_managed ? " [M]" : "";
+          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s)%s", 50,
+                   state->op_masks[i].mask, 20, state->op_masks[i].password,
+                   managed_suffix);
         }
 
         snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
