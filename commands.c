@@ -433,34 +433,47 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                "--- Admin Masks", "Op Masks ---");
       irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
 
-      max_rows = (state->mask_count > state->op_mask_count)
-                     ? state->mask_count
-                     : state->op_mask_count;
+      // Count managed masks for proper pairing
+      int managed_admin = 0, managed_op = 0;
+      for (int i = 0; i < state->mask_count; i++) {
+        if (state->auth_masks[i].is_managed) managed_admin++;
+      }
+      for (int i = 0; i < state->op_mask_count; i++) {
+        if (state->op_masks[i].is_managed) managed_op++;
+      }
+
+      max_rows = (managed_admin > managed_op) ? managed_admin : managed_op;
+      int admin_idx = 0, op_idx = 0;
+
       for (int i = 0; i < max_rows; i++) {
         char admin_part[128] = "";
         char op_part[256] = "";
-        // Only show active admin masks
-        if (i < state->mask_count && state->auth_masks[i].is_managed) {
+
+        // Find next managed admin mask
+        while (admin_idx < state->mask_count &&
+               !state->auth_masks[admin_idx].is_managed) {
+          admin_idx++;
+        }
+        if (admin_idx < state->mask_count) {
           snprintf(admin_part, sizeof(admin_part), "%s [M]",
-                   state->auth_masks[i].mask);
-          // Truncate if too long to maintain column alignment
-          if ((int)strlen(admin_part) > max_width) {
-            admin_part[max_width - 3] = '.';
-            admin_part[max_width - 2] = '.';
-            admin_part[max_width - 1] = '.';
-            admin_part[max_width] = '\0';
-          }
+                   state->auth_masks[admin_idx].mask);
+          admin_idx++;
         }
-        // Only show active oper masks
-        if (i < state->op_mask_count && state->op_masks[i].is_managed)
+
+        // Find next managed op mask
+        while (op_idx < state->op_mask_count &&
+               !state->op_masks[op_idx].is_managed) {
+          op_idx++;
+        }
+        if (op_idx < state->op_mask_count) {
           snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s) [M]", 50,
-                   state->op_masks[i].mask, 20, state->op_masks[i].password);
-        // Only print if at least one side has content
-        if (admin_part[0] != '\0' || op_part[0] != '\0') {
-          snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
-                   admin_part, op_part);
-          irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
+                   state->op_masks[op_idx].mask, 20, state->op_masks[op_idx].password);
+          op_idx++;
         }
+
+        snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
+                 admin_part, op_part);
+        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
       }
 
       irc_printf(state, "PRIVMSG %s :--- Trusted Bots (Botpass: %s) ---\r\n",
