@@ -440,9 +440,17 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         char admin_part[128] = "";
         char op_part[256] = "";
         // Only show active admin masks
-        if (i < state->mask_count && state->auth_masks[i].is_managed)
+        if (i < state->mask_count && state->auth_masks[i].is_managed) {
           snprintf(admin_part, sizeof(admin_part), "%s [M]",
                    state->auth_masks[i].mask);
+          // Truncate if too long to maintain column alignment
+          if ((int)strlen(admin_part) > max_width) {
+            admin_part[max_width - 3] = '.';
+            admin_part[max_width - 2] = '.';
+            admin_part[max_width - 1] = '.';
+            admin_part[max_width] = '\0';
+          }
+        }
         // Only show active oper masks
         if (i < state->op_mask_count && state->op_masks[i].is_managed)
           snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s) [M]", 50,
