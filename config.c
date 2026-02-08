@@ -7,6 +7,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <unistd.h>
 
 #include "bot.h"
 
@@ -529,22 +530,66 @@ void config_write(const bot_state_t *state, const char *password) {
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
   EVP_CIPHER_CTX_free(ctx);
 
-  FILE *out_file = fopen(CONFIG_FILE, "wb");
+  // Use atomic write pattern: write to temp file, then rename
+  char temp_file[256];
+  snprintf(temp_file, sizeof(temp_file), "%s.tmp", CONFIG_FILE);
+
+  FILE *out_file = fopen(temp_file, "wb");
   if (!out_file) {
-    fprintf(stderr, "[CFG] Failed to open %s for writing: %s\n", CONFIG_FILE,
+    fprintf(stderr, "[CFG] Failed to open %s for writing: %s\n", temp_file,
             strerror(errno));
     free(ciphertext);
     return;
   }
 
-  fwrite(salt, 1, sizeof(salt), out_file);
-  fwrite(iv, 1, sizeof(iv), out_file);
-  fwrite(tag, 1, sizeof(tag), out_file);
-  fwrite(ciphertext, 1, ciphertext_len, out_file);
+  // Write all data with error checking
+  bool write_success = true;
+  if (fwrite(salt, 1, sizeof(salt), out_file) != sizeof(salt)) {
+    fprintf(stderr, "[CFG] Failed to write salt: %s\n", strerror(errno));
+    write_success = false;
+  } else if (fwrite(iv, 1, sizeof(iv), out_file) != sizeof(iv)) {
+    fprintf(stderr, "[CFG] Failed to write IV: %s\n", strerror(errno));
+    write_success = false;
+  } else if (fwrite(tag, 1, sizeof(tag), out_file) != sizeof(tag)) {
+    fprintf(stderr, "[CFG] Failed to write tag: %s\n", strerror(errno));
+    write_success = false;
+  } else if (fwrite(ciphertext, 1, ciphertext_len, out_file) !=
+             (size_t)ciphertext_len) {
+    fprintf(stderr, "[CFG] Failed to write ciphertext: %s\n", strerror(errno));
+    write_success = false;
+  }
+
+  // Ensure data is written to disk before closing
+  if (write_success) {
+    if (fflush(out_file) != 0) {
+      fprintf(stderr, "[CFG] Failed to flush file: %s\n", strerror(errno));
+      write_success = false;
+    } else if (fsync(fileno(out_file)) != 0) {
+      fprintf(stderr, "[CFG] Failed to sync file to disk: %s\n",
+              strerror(errno));
+      write_success = false;
+    }
+  }
 
   fclose(out_file);
   free(ciphertext);
-  chmod(CONFIG_FILE, S_IRUSR | S_IWUSR);
+
+  if (!write_success) {
+    fprintf(stderr, "[CFG] Failed to write config, keeping old config intact\n");
+    remove(temp_file);
+    return;
+  }
+
+  // Set permissions on temp file before rename
+  chmod(temp_file, S_IRUSR | S_IWUSR);
+
+  // Atomically replace old config with new one
+  if (rename(temp_file, CONFIG_FILE) != 0) {
+    fprintf(stderr, "[CFG] Failed to rename %s to %s: %s\n", temp_file,
+            CONFIG_FILE, strerror(errno));
+    remove(temp_file);
+    return;
+  }
   if (state->hub_count > 0 && state->hub_authenticated) {
     hub_client_push_config((bot_state_t *)state);
   }
