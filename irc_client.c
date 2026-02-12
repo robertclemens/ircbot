@@ -1,11 +1,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "bot.h"
@@ -71,9 +73,13 @@ void irc_connect(bot_state_t *state) {
     port_from_config++;
   }
 
-  const char *ports_to_try[] = {"6697", "6667", NULL};
+  // If port specified: only try that port. Otherwise try 6667, then 6697
+  const char *ports_to_try[3] = {NULL, NULL, NULL};
   if (port_from_config) {
     ports_to_try[0] = port_from_config;
+  } else {
+    ports_to_try[0] = "6667";
+    ports_to_try[1] = "6697";
   }
 
   struct sockaddr_storage vhost_addr;
@@ -130,8 +136,46 @@ void irc_connect(bot_state_t *state) {
             }
       }
 
-      if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) {
-        if (i == 0) {
+      // Set socket to non-blocking for connect timeout
+      int flags = fcntl(sockfd, F_GETFL, 0);
+      fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+      int conn_result = connect(sockfd, p->ai_addr, p->ai_addrlen);
+      bool connected = false;
+
+      if (conn_result == 0) {
+        // Connected immediately (rare)
+        connected = true;
+      } else if (errno == EINPROGRESS) {
+        // Connection in progress, wait with timeout
+        fd_set writefds;
+        struct timeval timeout;
+        FD_ZERO(&writefds);
+        FD_SET(sockfd, &writefds);
+        timeout.tv_sec = 10;  // 10 second timeout
+        timeout.tv_usec = 0;
+
+        int select_result = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+        if (select_result > 0) {
+          // Check if connection succeeded
+          int so_error;
+          socklen_t len = sizeof(so_error);
+          getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+          if (so_error == 0) {
+            connected = true;
+          }
+        } else if (select_result == 0) {
+          log_message(L_INFO, state,
+                      "[INFO] Connection timeout after 10 seconds.\n");
+        }
+      }
+
+      if (connected) {
+        // Set back to blocking mode
+        fcntl(sockfd, F_SETFL, flags);
+
+        // Try TLS if connecting to port 6697
+        if (strcmp(ports_to_try[i], "6697") == 0) {
           state->ssl_ctx = SSL_CTX_new(TLS_client_method());
           if (!state->ssl_ctx) {
             close(sockfd);

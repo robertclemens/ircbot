@@ -392,6 +392,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         if (i < state->server_count)
           strncpy(server_part, state->server_list[i], sizeof(server_part) - 1);
 
+        // Skip non-managed channels
+        while (current_chan && !current_chan->is_managed) {
+          current_chan = current_chan->next;
+        }
+
         if (current_chan) {
           bool am_i_opped = false;
           for (int j = 0; j < current_chan->roster_count; j++) {
@@ -405,15 +410,14 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           const char *op_prefix = am_i_opped ? "@" : "";
           const char *status_str =
               (current_chan->status == C_IN) ? "IN" : "OUT";
-          const char *managed_suffix = current_chan->is_managed ? " [M]" : "";
 
           if (current_chan->key[0] != '\0') {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s)%s",
+            snprintf(chan_part, sizeof(chan_part), "%s%s (Key: %s) (%s)",
                      op_prefix, current_chan->name, current_chan->key,
-                     status_str, managed_suffix);
+                     status_str);
           } else {
-            snprintf(chan_part, sizeof(chan_part), "%s%s (%s)%s", op_prefix,
-                     current_chan->name, status_str, managed_suffix);
+            snprintf(chan_part, sizeof(chan_part), "%s%s (%s)", op_prefix,
+                     current_chan->name, status_str);
           }
           current_chan = current_chan->next;
         }
@@ -438,16 +442,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         char op_part[256] = "";
 
         if (i < state->mask_count) {
-          const char *managed_suffix = state->auth_masks[i].is_managed ? " [M]" : "";
-          snprintf(admin_part, sizeof(admin_part), "%s%s",
-                   state->auth_masks[i].mask, managed_suffix);
+          snprintf(admin_part, sizeof(admin_part), "%s",
+                   state->auth_masks[i].mask);
         }
 
         if (i < state->op_mask_count) {
-          const char *managed_suffix = state->op_masks[i].is_managed ? " [M]" : "";
-          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s)%s", 50,
-                   state->op_masks[i].mask, 20, state->op_masks[i].password,
-                   managed_suffix);
+          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s)", 50,
+                   state->op_masks[i].mask, 20, state->op_masks[i].password);
         }
 
         snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
@@ -848,10 +849,21 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Syntax: +hub <ip:port>\r\n", nick);
         return;
       }
+      // Check for duplicates
+      for (int i = 0; i < state->hub_count; i++) {
+        if (strcmp(state->hub_list[i], arg1) == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Error: Hub '%s' already exists.\r\n",
+                     nick, arg1);
+          return;
+        }
+      }
       if (state->hub_count < MAX_SERVERS) {
         state->hub_list[state->hub_count++] = strdup(arg1);
         config_write(state, state->startup_password);
         irc_printf(state, "PRIVMSG %s :Added Hub: %s\r\n", nick, arg1);
+      } else {
+        irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
       }
     } else if (strcasecmp(command, "-hub") == 0) {
       if (!arg1) {
