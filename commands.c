@@ -273,6 +273,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                  "PRIVMSG %s :Bot communication password set and saved.\r\n",
                  nick);
     } else if (strcasecmp(command, "+bot") == 0) {
+      if (state->hub_count > 0) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: Bot management disabled when hub is configured. "
+                   "Bot additions/deletions must be performed on the hub.\r\n",
+                   nick);
+        return;
+      }
       if (!arg1) {
         irc_printf(state,
                    "PRIVMSG %s :Syntax: +bot <nick*!*user@hostmask.com>\r\n",
@@ -295,6 +302,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Added trusted bot: %s\r\n", nick, arg1);
       }
     } else if (strcasecmp(command, "-bot") == 0) {
+      if (state->hub_count > 0) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: Bot management disabled when hub is configured. "
+                   "Bot additions/deletions must be performed on the hub.\r\n",
+                   nick);
+        return;
+      }
       if (!arg1) {
         irc_printf(state,
                    "PRIVMSG %s :Syntax: -bot <nick*!*user@hostmask.com>\r\n",

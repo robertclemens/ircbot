@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#ifdef HAVE_CURL
 #include <curl/curl.h>
+#endif
 #include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -87,6 +89,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
   return realsize;
 }
 
+#ifdef HAVE_CURL
 static size_t write_file_callback(void *ptr, size_t size, size_t nmemb,
                                   FILE *stream) {
   return fwrite(ptr, size, nmemb, stream);
@@ -137,6 +140,7 @@ static bool download_file(const char *url, const char *outfile) {
 
   return (res == CURLE_OK);
 }
+#endif /* HAVE_CURL */
 
 static bool verify_sha256(const char *filepath, const char *expected_hash) {
   unsigned char hash[EVP_MAX_MD_SIZE];
@@ -251,6 +255,7 @@ static bool validate_url(const char *url) {
   return true;
 }
 
+#ifdef HAVE_CURL
 void updater_check_for_updates(bot_state_t *state, const char *nick) {
   log_message(L_DEBUG, state, "[DEBUG] updater_check_for_updates called.\n");
   http_response_t response;
@@ -539,3 +544,14 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   perror("execl failed");
   exit(1);
 }
+#else /* !HAVE_CURL */
+void updater_check_for_updates(bot_state_t *state, const char *nick) {
+  irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
+}
+
+void updater_perform_upgrade(bot_state_t *state, const char *nick,
+                             const char *version_to_install) {
+  (void)version_to_install;  /* Unused parameter */
+  irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
+}
+#endif /* HAVE_CURL */

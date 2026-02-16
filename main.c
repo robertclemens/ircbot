@@ -436,7 +436,9 @@ static void run_config_wizard(void) {
 }
 
 int main(int argc, char *argv[]) {
+#ifdef HAVE_CURL
   curl_global_init(CURL_GLOBAL_DEFAULT);
+#endif
   if (argc > 1 && strcmp(argv[1], "-setup") == 0) {
     if (access(CONFIG_FILE, F_OK) == 0) {
       fprintf(stderr, "Error: Config file '%s' already exists.\n", CONFIG_FILE);
@@ -551,7 +553,9 @@ int main(int argc, char *argv[]) {
   if (state.hub_fd != -1)
     close(state.hub_fd);
   state_destroy(&state);
+#ifdef HAVE_CURL
   curl_global_cleanup();
+#endif
   close(state.pid_fd);
   remove(PID_FILE);
   return 0;

@@ -1,7 +1,9 @@
 #ifndef BOT_H
 #define BOT_H
 
+#ifdef HAVE_CURL
 #include <curl/curl.h>
+#endif
 #include <limits.h>
 #include <netinet/in.h>
 #include <openssl/err.h>
