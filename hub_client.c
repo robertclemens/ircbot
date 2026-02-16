@@ -745,13 +745,14 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         int purged = 0;
 
         // Purge channels with is_managed=false and old timestamp
-        for (int i = 0; i < state->channel_count; i++) {
-          if (!state->channels[i].is_managed &&
-              (immediate || state->channels[i].timestamp < cutoff)) {
-            channel_remove(state, state->channels[i].name);
+        chan_t *c = state->chanlist;
+        while (c) {
+          chan_t *next = c->next;
+          if (!c->is_managed && (immediate || c->timestamp < cutoff)) {
+            channel_remove(state, c->name);
             purged++;
-            i--;
           }
+          c = next;
         }
 
         // Purge admin masks
@@ -759,7 +760,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           if (!state->auth_masks[i].is_managed &&
               (immediate || state->auth_masks[i].timestamp < cutoff)) {
             memmove(&state->auth_masks[i], &state->auth_masks[i+1],
-                    (state->mask_count - i - 1) * sizeof(auth_mask_t));
+                    (state->mask_count - i - 1) * sizeof(admin_entry_t));
             state->mask_count--;
             purged++;
             i--;
@@ -771,7 +772,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           if (!state->op_masks[i].is_managed &&
               (immediate || state->op_masks[i].timestamp < cutoff)) {
             memmove(&state->op_masks[i], &state->op_masks[i+1],
-                    (state->op_mask_count - i - 1) * sizeof(op_mask_t));
+                    (state->op_mask_count - i - 1) * sizeof(op_entry_t));
             state->op_mask_count--;
             purged++;
             i--;
