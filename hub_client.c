@@ -731,6 +731,60 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
+    case 'P': // PURGE command
+    {
+      // Format: PURGE|immediate|timestamp or PURGE|30|timestamp
+      char param[32];
+      long ts;
+      if (sscanf(data, "URGE|%31[^|]|%ld", param, &ts) == 2) {
+        bool immediate = (strcmp(param, "immediate") == 0);
+        int days = immediate ? 0 : atoi(param);
+        if (days < 0) days = 30;
+
+        time_t cutoff = ts - (days * 24 * 60 * 60);
+        int purged = 0;
+
+        // Purge channels with is_managed=false and old timestamp
+        for (int i = 0; i < state->channel_count; i++) {
+          if (!state->channels[i].is_managed &&
+              (immediate || state->channels[i].timestamp < cutoff)) {
+            channel_remove(state, state->channels[i].name);
+            purged++;
+            i--;
+          }
+        }
+
+        // Purge admin masks
+        for (int i = 0; i < state->mask_count; i++) {
+          if (!state->auth_masks[i].is_managed &&
+              (immediate || state->auth_masks[i].timestamp < cutoff)) {
+            memmove(&state->auth_masks[i], &state->auth_masks[i+1],
+                    (state->mask_count - i - 1) * sizeof(auth_mask_t));
+            state->mask_count--;
+            purged++;
+            i--;
+          }
+        }
+
+        // Purge oper masks
+        for (int i = 0; i < state->op_mask_count; i++) {
+          if (!state->op_masks[i].is_managed &&
+              (immediate || state->op_masks[i].timestamp < cutoff)) {
+            memmove(&state->op_masks[i], &state->op_masks[i+1],
+                    (state->op_mask_count - i - 1) * sizeof(op_mask_t));
+            state->op_mask_count--;
+            purged++;
+            i--;
+          }
+        }
+
+        if (purged > 0) {
+          log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
+          config_write(state, state->startup_password);
+        }
+      }
+    } break;
+
     default:
       log_message(L_DEBUG, state, "[HUB-SYNC] Unrecognized line type '%c': %s\n", type, line);
       break;
