@@ -769,7 +769,42 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     break;
 
   case CMD_UPDATE_PUBKEY:
-    // Existing handler...
+    // Existing handler for hub-to-hub key updates (not used for bots)
+    break;
+
+  case CMD_BOT_KEY_UPDATE:
+    // Hub sent us a new private key during rekey operation
+    if (payload && payload_len > 0) {
+      log_message(L_INFO, state,
+                  "[HUB] Received new private key from hub (%d bytes)\n",
+                  payload_len);
+
+      // Update the hub_key in memory
+      if (payload_len < MAX_HUB_KEY_SIZE) {
+        memset(state->hub_key, 0, sizeof(state->hub_key));
+        memcpy(state->hub_key, payload, payload_len);
+        state->hub_key[payload_len] = '\0';
+
+        log_message(L_INFO, state, "[HUB] Updated hub private key in memory\n");
+
+        // Save the new key to config file immediately
+        if (strlen(state->startup_password) > 0) {
+          config_write(state, state->startup_password);
+          log_message(L_INFO, state,
+                      "[HUB] Saved new private key to config file\n");
+          log_message(L_INFO, state,
+                      "[HUB] Key update complete - waiting for hub to disconnect\n");
+        } else {
+          log_message(L_INFO, state,
+                      "[HUB] WARNING: Cannot save config (no password), key update "
+                      "will be lost on restart\n");
+        }
+      } else {
+        log_message(L_INFO, state,
+                    "[HUB] ERROR: New key too large (%d bytes, max %d)\n",
+                    payload_len, MAX_HUB_KEY_SIZE);
+      }
+    }
     break;
 
   case CMD_OP_GRANT: {
