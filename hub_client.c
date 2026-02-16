@@ -370,7 +370,6 @@ void hub_client_push_config(bot_state_t *state) {
 
   log_message(L_DEBUG, state, "[HUB-SYNC] Pushing config to hub (%zu bytes)\n",
               strlen(payload));
-  log_message(L_DEBUG, state, "[HUB-SYNC] Push payload:\n%s", payload);
 
   int pay_len = strlen(payload);
   unsigned char plain[MAX_BUFFER];
@@ -399,7 +398,6 @@ void hub_client_push_config(bot_state_t *state) {
 
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
-  log_message(L_DEBUG, state, "[HUB-SYNC] Received payload:\n%s", payload);
 
   char work_buf[MAX_BUFFER];
   strncpy(work_buf, payload, sizeof(work_buf) - 1);
@@ -680,7 +678,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       hostmask[0] = '\0';
       uuid[0] = '\0';
 
-      log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line: %s\n", data);
+      log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line\n");
 
       // Parse broadcast format: b|hostmask|uuid|timestamp
       int parsed = sscanf(data, "%127[^|]|%63[^|]|%ld", hostmask, uuid, &ts);

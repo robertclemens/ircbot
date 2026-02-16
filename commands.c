@@ -447,8 +447,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
 
         if (i < state->op_mask_count) {
-          snprintf(op_part, sizeof(op_part), "%.*s (Pass: %.*s)", 50,
-                   state->op_masks[i].mask, 20, state->op_masks[i].password);
+          snprintf(op_part, sizeof(op_part), "%.*s", 50,
+                   state->op_masks[i].mask);
         }
 
         snprintf(line_buffer, sizeof(line_buffer), "%-*s | %s", max_width,
@@ -456,8 +456,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
       }
 
-      irc_printf(state, "PRIVMSG %s :--- Trusted Bots (Botpass: %s) ---\r\n",
-                 nick, state->bot_comm_pass);
+      irc_printf(state, "PRIVMSG %s :--- Trusted Bots ---\r\n", nick);
       for (int i = 0; i < state->trusted_bot_count; i++) {
         // Extract just the hostmask from format: hostmask|uuid|timestamp
         char hostmask[128];

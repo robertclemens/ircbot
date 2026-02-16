@@ -62,7 +62,6 @@ int main(int argc, char *argv[]) {
   printf("--- Test Parameters ---\n");
   printf("Bot's Current Nick: %s\n", state.current_nick);
   printf("Testing Hostmask:   %s\n", full_host);
-  printf("Input Password:     %s\n", password);
   printf("Input Command:      %s\n", command_str);
   printf("Generated Hash:     %s\n", hex_hash);
   printf("Full Simulated Msg: \"%s\"\n", incoming_message);

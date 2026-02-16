@@ -158,8 +158,7 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   }
 
   log_message(L_DEBUG, state,
-              "[DEBUG_AUTH] Check 1 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
-              min, hex, hash_attempt);
+              "[DEBUG_AUTH] Check 1 (Min %ld)\n", min);
 
   if (strcmp(hash_attempt, hex) == 0) {
     state->admin_nonces[state->admin_nonce_idx] = nonce;
@@ -178,8 +177,7 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   }
 
   log_message(L_DEBUG, state,
-              "[DEBUG_AUTH] Check 2 (Min %ld):\n   Calc: %s\n   Recv: %s\n",
-              (min - 1), hex, hash_attempt);
+              "[DEBUG_AUTH] Check 2 (Min %ld)\n", (min - 1));
 
   if (strcmp(hash_attempt, hex) == 0) {
     state->admin_nonces[state->admin_nonce_idx] = nonce;

@@ -432,12 +432,12 @@ static void run_config_wizard(void) {
   config_write(&state, config_pass);
   printf("\nConfiguration saved to %s.\n", CONFIG_FILE);
   printf("You can now start the bot using:\n");
-  printf("**%s=\"%s\" ./ircbot**\n", CONFIG_PASS_ENV_VAR, config_pass);
+  printf("**%s=\"<your_password>\" ./ircbot**\n", CONFIG_PASS_ENV_VAR);
 }
 
 int main(int argc, char *argv[]) {
   curl_global_init(CURL_GLOBAL_DEFAULT);
-  if (argc > 1 && strcmp(argv[1], "-c") == 0) {
+  if (argc > 1 && strcmp(argv[1], "-setup") == 0) {
     if (access(CONFIG_FILE, F_OK) == 0) {
       fprintf(stderr, "Error: Config file '%s' already exists.\n", CONFIG_FILE);
       return 1;
