@@ -731,34 +731,30 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'P': // PURGE command
+    case 'P': // PURGE command — format: PURGE|<cutoff_epoch>
     {
-      // Format: PURGE|immediate|timestamp or PURGE|30|timestamp
-      char param[32];
-      long ts;
-      if (sscanf(data, "URGE|%31[^|]|%ld", param, &ts) == 2) {
-        bool immediate = (strcmp(param, "immediate") == 0);
-        int days = immediate ? 0 : atoi(param);
-        if (days < 0) days = 30;
-
-        time_t cutoff = ts - (days * 24 * 60 * 60);
+      // cutoff == 0: purge all tombstones
+      // cutoff  > 0: purge tombstones older than cutoff
+      long cutoff_val;
+      if (sscanf(data, "URGE|%ld", &cutoff_val) == 1) {
+        time_t cutoff = (time_t)cutoff_val;
         int purged = 0;
 
-        // Purge channels with is_managed=false and old timestamp
+        // Purge tombstoned channels (is_managed=false)
         chan_t *c = state->chanlist;
         while (c) {
           chan_t *next = c->next;
-          if (!c->is_managed && (immediate || c->timestamp < cutoff)) {
+          if (!c->is_managed && (cutoff == 0 || c->timestamp < cutoff)) {
             channel_remove(state, c->name);
             purged++;
           }
           c = next;
         }
 
-        // Purge admin masks
+        // Purge tombstoned admin masks
         for (int i = 0; i < state->mask_count; i++) {
           if (!state->auth_masks[i].is_managed &&
-              (immediate || state->auth_masks[i].timestamp < cutoff)) {
+              (cutoff == 0 || state->auth_masks[i].timestamp < cutoff)) {
             memmove(&state->auth_masks[i], &state->auth_masks[i+1],
                     (state->mask_count - i - 1) * sizeof(admin_entry_t));
             state->mask_count--;
@@ -767,10 +763,10 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           }
         }
 
-        // Purge oper masks
+        // Purge tombstoned oper masks
         for (int i = 0; i < state->op_mask_count; i++) {
           if (!state->op_masks[i].is_managed &&
-              (immediate || state->op_masks[i].timestamp < cutoff)) {
+              (cutoff == 0 || state->op_masks[i].timestamp < cutoff)) {
             memmove(&state->op_masks[i], &state->op_masks[i+1],
                     (state->op_mask_count - i - 1) * sizeof(op_entry_t));
             state->op_mask_count--;
