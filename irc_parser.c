@@ -144,6 +144,18 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
     }
     // --- Modes that CONDITIONALLY take an argument ---
     else if (mode == 'k') {
+      if (adding && current_arg) {
+        /* Store key and set M_K flag */
+        size_t klen = strlen(current_arg);
+        if (klen >= MAX_KEY) klen = MAX_KEY - 1;
+        memcpy(c->key, current_arg, klen);
+        c->key[klen] = '\0';
+        c->modes |= M_K;
+      } else if (!adding) {
+        /* -k clears the key regardless of arg */
+        c->key[0] = '\0';
+        c->modes &= ~(chan_mode_t)M_K;
+      }
       if (current_arg)
         current_arg = strtok_r(NULL, " ", &saveptr);
     } else if (mode == 'l') {
@@ -151,8 +163,13 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
       if (adding && current_arg) {
         current_arg = strtok_r(NULL, " ", &saveptr);
       }
+    } else if (mode == 'i') {
+      if (adding)
+        c->modes |= M_I;
+      else
+        c->modes &= ~(chan_mode_t)M_I;
     }
-    // --- Modes that NEVER take an argument (t, s, i, n, m, p, etc) ---
+    // --- Modes that NEVER take an argument (t, s, n, m, p, etc) ---
   }
 }
 
@@ -238,12 +255,34 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
       }
     }
+  } else if (strcmp(command, "473") == 0) {
+    /* ERR_INVITEONLYCHAN: need invite to join managed channel */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name) {
+      chan_t *c = channel_find(state, chan_name);
+      if (c && c->is_managed) {
+        log_message(L_INFO, state,
+                    "[473] Channel %s is invite-only, requesting invite\n",
+                    chan_name);
+        if (!hub_client_send_invite_request(state, state->current_nick,
+                                            chan_name)) {
+          for (int tb = 0; tb < state->trusted_bot_count; tb++) {
+            char tb_nick[MAX_NICK];
+            if (sscanf(state->trusted_bots[tb], "%63[^!]", tb_nick) == 1) {
+              bot_comms_send_command(state, tb_nick,
+                                     "INVITE %s %s",
+                                     chan_name, state->current_nick);
+            }
+          }
+        }
+      }
+    }
   }
   // [MODIFIED] Robust MODE Parsing + Immediate Op Recovery
   else if (strcmp(command, "MODE") == 0 && params) {
     char params_copy[MAX_BUFFER];
-    strncpy(params_copy, params, sizeof(params_copy) - 1);
-    params_copy[sizeof(params_copy) - 1] = '\0';
+    snprintf(params_copy, sizeof(params_copy), "%s", params);
 
     char *target = strtok_r(params_copy, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
@@ -251,6 +290,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     if (target && modes && (target[0] == '#' || target[0] == '&')) {
       channel_handle_mode_change(state, target, modes, args);
+      /* Push key/invite-only changes to hub */
+      if (strchr(modes, 'k') || strchr(modes, 'i')) {
+        chan_t *mc = channel_find(state, target);
+        if (mc && mc->is_managed) {
+          mc->timestamp = time(NULL);
+          hub_client_push_channel(state, mc);
+        }
+      }
     }
   } else if (strcmp(command, "352") == 0) {
     strtok_r(params, " ", &saveptr_irc);

@@ -223,11 +223,15 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
                 c->name, c->is_managed, op, (long)c->timestamp);
     if (c->key[0] != '\0') {
-      written = snprintf(buffer + offset, max_len - offset, "c|%s|%s|%s|%ld\n",
-                         c->name, c->key, op, (long)c->timestamp);
+      written = snprintf(buffer + offset, max_len - offset,
+                         "c|%s|%s|%d|%s|%ld\n",
+                         c->name, c->key, (int)c->modes, op,
+                         (long)c->timestamp);
     } else {
-      written = snprintf(buffer + offset, max_len - offset, "c|%s||%s|%ld\n",
-                         c->name, op, (long)c->timestamp);
+      written = snprintf(buffer + offset, max_len - offset,
+                         "c|%s||%d|%s|%ld\n",
+                         c->name, (int)c->modes, op,
+                         (long)c->timestamp);
     }
     if (written < 0 || written >= max_len - offset)
       break;
@@ -343,6 +347,42 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
   return false; // Failed to send, use PRIVMSG fallback
 }
 
+/* Send CMD_INVITE_REQUEST to hub: hub will broadcast to all bots */
+bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
+                                    const char *channel) {
+  if (!state->hub_connected || !state->hub_authenticated ||
+      state->hub_fd == -1)
+    return false;
+
+  char payload[256];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s", nick, channel);
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
+    return false;
+
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_INVITE_REQUEST;
+  uint32_t inner_len = htonl(pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    memcpy(cipher, &net_len, 4);
+    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+      log_message(L_INFO, state,
+                  "[HUB] Sent INVITE_REQUEST for %s in %s\n", nick, channel);
+      return true;
+    }
+    hub_client_disconnect(state);
+  }
+  return false;
+}
+
 // Alias for promoting local config to hub (e.g. on connect)
 void hub_client_promote_local_config(bot_state_t *state) {
   hub_client_push_config(state);
@@ -396,6 +436,53 @@ void hub_client_push_config(bot_state_t *state) {
   }
 }
 
+/* Push a single channel entry to hub after a live MODE change */
+void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
+  if (state->hub_count == 0 || state->hub_fd == -1 ||
+      !state->hub_authenticated)
+    return;
+
+  const char *op = chan->is_managed ? "add" : "del";
+  char payload[MAX_BUFFER];
+  int pay_len;
+
+  if (chan->key[0] != '\0') {
+    pay_len = snprintf(payload, sizeof(payload), "c|%s|%s|%d|%s|%ld\n",
+                       chan->name, chan->key, (int)chan->modes, op,
+                       (long)chan->timestamp);
+  } else {
+    pay_len = snprintf(payload, sizeof(payload), "c|%s||%d|%s|%ld\n",
+                       chan->name, (int)chan->modes, op,
+                       (long)chan->timestamp);
+  }
+
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
+    return;
+
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_CONFIG_PUSH;
+  uint32_t inner_len = htonl(pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    memcpy(cipher, &net_len, 4);
+    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+      log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
+                  chan->name, (int)chan->modes);
+    } else {
+      log_message(L_INFO, state, "[HUB] Failed to push channel %s\n", chan->name);
+      hub_client_disconnect(state);
+    }
+  }
+}
+
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
 
@@ -428,13 +515,29 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       char chan[MAX_CHAN], key[MAX_KEY], op[8];
       long ts;
       int parsed;
+      int modes_val = 0;
 
-      // Try with key
-      parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld", chan, key, op, &ts);
-      if (parsed < 3) {
-        // Try without key
-        parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
-        key[0] = '\0';
+      /* Try new 5-field format: chan|key|modes|op|ts */
+      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%ld",
+                      chan, key, &modes_val, op, &ts);
+      if (parsed < 5) {
+        /* Try new 5-field without key: chan||modes|op|ts */
+        modes_val = 0;
+        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%ld",
+                        chan, &modes_val, op, &ts);
+        if (parsed >= 4) {
+          key[0] = '\0';
+        } else {
+          /* Fall back to old 4-field: chan|key|op|ts */
+          modes_val = 0;
+          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld",
+                          chan, key, op, &ts);
+          if (parsed < 3) {
+            /* Old 4-field without key: chan||op|ts */
+            parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
+            key[0] = '\0';
+          }
+        }
       }
 
       if (parsed >= 3) {
@@ -455,6 +558,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               memcpy(c->key, key, len);
               c->key[len] = '\0';
             }
+            c->modes = (chan_mode_t)modes_val;
             c->is_managed = true;
             c->timestamp = ts;
             updates++;
@@ -471,6 +575,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               memcpy(c->key, key, len);
               c->key[len] = '\0';
             }
+            c->modes = (chan_mode_t)modes_val;
             bool was_managed = c->is_managed;
             c->is_managed = is_add;
             c->timestamp = ts;
@@ -914,6 +1019,31 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     log_message(L_INFO, state, "[HUB] Op request failed: %s\n", payload);
     // Trigger fallback to PRIVMSG method
     // The channel manager will retry via PRIVMSG on next cycle
+    break;
+
+  case CMD_INVITE_REQUEST:
+    if (payload && payload_len > 0) {
+      char inv_nick[MAX_NICK], inv_chan[MAX_CHAN];
+      if (sscanf(payload, "%63[^|]|%64s", inv_nick, inv_chan) == 2) {
+        chan_t *ic = channel_find(state, inv_chan);
+        if (ic && ic->status == C_IN) {
+          bool have_ops = false;
+          for (int i = 0; i < ic->roster_count; i++) {
+            if (strcasecmp(ic->roster[i].nick, state->current_nick) == 0 &&
+                ic->roster[i].is_op) {
+              have_ops = true;
+              break;
+            }
+          }
+          if (have_ops) {
+            log_message(L_INFO, state,
+                        "[INVITE] Inviting %s into %s (hub request)\n",
+                        inv_nick, inv_chan);
+            irc_printf(state, "INVITE %s %s\r\n", inv_nick, inv_chan);
+          }
+        }
+      }
+    }
     break;
   }
 }

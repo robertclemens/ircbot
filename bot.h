@@ -92,6 +92,7 @@
 #define CMD_UPDATE_PUBKEY 0x05
 #define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
+#define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
 
 #define CMD_ADMIN_AUTH 0x10
 #define CMD_ADMIN_LIST_FULL 0x11
@@ -161,7 +162,7 @@ typedef enum {
 } hub_auth_state_t;
 
 typedef enum { C_NONE = 0, C_OUT = 1 << 0, C_IN = 1 << 1 } chan_status_t;
-typedef enum { M_NONE = 0, M_K = 64 } chan_mode_t;
+typedef enum { M_NONE = 0, M_K = 64, M_I = 128 } chan_mode_t;
 typedef enum { LS_NONE = 0, LS_LISTEN = 1, LS_CONNECTED = 2 } listen_status_t;
 
 // Struct Forward Declarations
@@ -346,11 +347,14 @@ void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
 void hub_client_promote_local_config(bot_state_t *state);
 void hub_client_push_config(bot_state_t *state);
+void hub_client_push_channel(bot_state_t *state, chan_t *chan);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
 void hub_client_disconnect(bot_state_t *state);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
+bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
+                                    const char *channel);
 static inline void debug_hex_dump(const char *label, const unsigned char *data,
                                   int len) {
   printf("[DEBUG] %s (%d bytes): ", label, len);

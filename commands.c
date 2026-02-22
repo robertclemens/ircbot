@@ -129,6 +129,32 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                   if (bot_command && strcasecmp(bot_command, "OPME") == 0 &&
                       bot_arg1) {
                     irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, nick);
+                  } else if (bot_command &&
+                             strcasecmp(bot_command, "INVITE") == 0 &&
+                             bot_arg1) {
+                    /* arg1 = #channel, arg2 = nick_to_invite */
+                    char *bot_arg2 = strtok_r(NULL, " ", &saveptr_cmd);
+                    if (bot_arg2) {
+                      chan_t *ic = channel_find(state, bot_arg1);
+                      if (ic && ic->status == C_IN) {
+                        bool have_ops = false;
+                        for (int r = 0; r < ic->roster_count; r++) {
+                          if (strcasecmp(ic->roster[r].nick,
+                                         state->current_nick) == 0 &&
+                              ic->roster[r].is_op) {
+                            have_ops = true;
+                            break;
+                          }
+                        }
+                        if (have_ops) {
+                          log_message(L_INFO, state,
+                                      "[BOT-COMMS] Inviting %s to %s (bot req)\n",
+                                      bot_arg2, bot_arg1);
+                          irc_printf(state, "INVITE %s %s\r\n",
+                                     bot_arg2, bot_arg1);
+                        }
+                      }
+                    }
                   }
                 }
               }
@@ -261,6 +287,44 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       irc_printf(state, "MODE %s +o %s\r\n", arg1, nick);
+    } else if (strcasecmp(command, "invite") == 0) {
+      if (!arg1) {
+        irc_printf(state, "PRIVMSG %s :Syntax: invite <#channel>\r\n", nick);
+        return;
+      }
+      char inv_channel[MAX_CHAN];
+      if (arg1[0] == '#' || arg1[0] == '&') {
+        snprintf(inv_channel, sizeof(inv_channel), "%s", arg1);
+      } else {
+        snprintf(inv_channel, sizeof(inv_channel), "#%s", arg1);
+      }
+      chan_t *ic = channel_find(state, inv_channel);
+      if (ic && ic->status == C_IN) {
+        bool have_ops = false;
+        for (int r = 0; r < ic->roster_count; r++) {
+          if (strcasecmp(ic->roster[r].nick, state->current_nick) == 0 &&
+              ic->roster[r].is_op) {
+            have_ops = true;
+            break;
+          }
+        }
+        if (have_ops) {
+          irc_printf(state, "INVITE %s %s\r\n", nick, inv_channel);
+          irc_printf(state, "PRIVMSG %s :Inviting you to %s\r\n",
+                     nick, inv_channel);
+          return;
+        }
+      }
+      /* Escalate: hub or encrypted PRIVMSG to trusted bots */
+      if (!hub_client_send_invite_request(state, nick, inv_channel)) {
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          char tb_nick[MAX_NICK];
+          if (sscanf(state->trusted_bots[i], "%63[^!]", tb_nick) == 1) {
+            bot_comms_send_command(state, tb_nick,
+                                   "INVITE %s %s", inv_channel, nick);
+          }
+        }
+      }
     } else if (strcasecmp(command, "botpass") == 0) {
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s :Syntax: botpass <password>\r\n", nick);
