@@ -32,7 +32,7 @@ void get_local_ip(bot_state_t *state) {
   freeaddrinfo(info);
 }
 
-int strverscmp(const char *s1, const char *s2) {
+static int strverscmp(const char *s1, const char *s2) {
   const unsigned char *p1 = (const unsigned char *)s1;
   const unsigned char *p2 = (const unsigned char *)s2;
   int state;

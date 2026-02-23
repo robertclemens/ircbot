@@ -7,22 +7,6 @@
 
 #include "bot.h"
 
-static char *base64_encode(const unsigned char *input, int length) {
-  BIO *b64 = BIO_new(BIO_f_base64());
-  BIO *bio = BIO_new(BIO_s_mem());
-  bio = BIO_push(b64, bio);
-  BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-  BIO_write(bio, input, length);
-  BIO_flush(bio);
-  BUF_MEM *bufferPtr;
-  BIO_get_mem_ptr(bio, &bufferPtr);
-  char *buff = (char *)malloc(bufferPtr->length + 1);
-  memcpy(buff, bufferPtr->data, bufferPtr->length);
-  buff[bufferPtr->length] = 0;
-  BIO_free_all(bio);
-  return buff;
-}
-
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...) {
   if (!target_nick || !format) {

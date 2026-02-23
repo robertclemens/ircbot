@@ -342,6 +342,8 @@ int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
 int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
                            const unsigned char *key, unsigned char *plaintext,
                            unsigned char *tag);
+char *base64_encode(const unsigned char *input, int length);
+unsigned char *base64_decode(const char *input, int *out_len);
 void hub_client_init(bot_state_t *state);
 void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
@@ -351,6 +353,7 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
 void hub_client_disconnect(bot_state_t *state);
+void hub_client_on_connect(bot_state_t *state);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,

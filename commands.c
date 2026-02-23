@@ -10,7 +10,6 @@
 
 #include "bot.h"
 
-unsigned char *base64_decode(const char *input, int *out_len);
 // static int base64_decode(const char *input, unsigned char **output) {
 //   BIO *b64 = BIO_new(BIO_f_base64());
 //   BIO *bio = BIO_new_mem_buf((void *)input, -1);

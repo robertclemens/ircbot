@@ -11,7 +11,7 @@
 
 #include "bot.h"
 
-void handle_crypto_errors_silent() { ERR_clear_error(); }
+static void handle_crypto_errors_silent() { ERR_clear_error(); }
 
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {

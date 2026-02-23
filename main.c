@@ -535,8 +535,6 @@ int main(int argc, char *argv[]) {
       if (state.hub_fd != -1 && !state.hub_connected &&
           FD_ISSET(state.hub_fd, &write_fds)) {
         state.hub_connected = true;
-        // Note: hub_client_on_connect is likely defined in hub_client.c
-        extern void hub_client_on_connect(bot_state_t * state);
         hub_client_on_connect(&state);
       }
 

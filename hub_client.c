@@ -17,18 +17,6 @@
 #include <time.h>
 #include <unistd.h>
 
-extern char *base64_encode(const unsigned char *input, int length);
-extern unsigned char *base64_decode(const char *input, int *out_len);
-extern int crypto_aes_gcm_encrypt(const unsigned char *plain, int plain_len,
-                                  const unsigned char *key,
-                                  unsigned char *output, unsigned char *tag);
-extern int crypto_aes_gcm_decrypt(const unsigned char *input, int input_len,
-                                  const unsigned char *key,
-                                  unsigned char *output, unsigned char *tag);
-
-void hub_client_connect(bot_state_t *state);
-void hub_client_disconnect(bot_state_t *state);
-
 static hub_auth_state_t auth_state = HUB_AUTH_NONE;
 static unsigned char challenge_received[32];
 static time_t last_pong_sent = 0; // RATE LIMIT PONGS
