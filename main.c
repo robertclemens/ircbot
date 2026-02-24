@@ -518,8 +518,7 @@ int main(int argc, char *argv[]) {
 
     struct timeval tv = {1, 0}; // 1 second timeout
     if (max_fd == -1) {
-      struct timeval tv_wait = {0, 100000}; // 100ms
-      select(0, NULL, NULL, NULL, &tv_wait);
+      select(0, NULL, NULL, NULL, &tv);
       continue;
     }
 
