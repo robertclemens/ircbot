@@ -971,7 +971,10 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         memcpy(nick, hostmask, nick_len);
         nick[nick_len] = '\0';
       } else {
-        snprintf(nick, sizeof(nick), "%s", hostmask);
+        size_t nick_len = strlen(hostmask);
+        if (nick_len >= sizeof(nick)) nick_len = sizeof(nick) - 1;
+        memcpy(nick, hostmask, nick_len);
+        nick[nick_len] = '\0';
       }
 
       // Check if we're in that channel and have ops

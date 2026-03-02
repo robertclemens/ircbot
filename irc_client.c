@@ -370,7 +370,10 @@ void irc_generate_new_nick(bot_state_t *state) {
   int attempt = state->nick_generation_attempt;
 
   char base_nick[9];
-  snprintf(base_nick, sizeof(base_nick), "%s", state->target_nick);
+  size_t base_len = strlen(state->target_nick);
+  if (base_len >= sizeof(base_nick)) base_len = sizeof(base_nick) - 1;
+  memcpy(base_nick, state->target_nick, base_len);
+  base_nick[base_len] = '\0';
 
   if (attempt < num_special_chars) {
     snprintf(new_nick, MAX_NICK, "%s%c", base_nick, nick_append_chars[attempt]);

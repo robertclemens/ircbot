@@ -127,17 +127,17 @@ bool config_load(bot_state_t *state, const char *password,
 
       case 'c': // Channel (global, with timestamp)
       {
-        char chan[MAX_CHAN], key[MAX_KEY], op[16];
+        char chan[MAX_CHAN], chan_key[MAX_KEY], op[16];
         time_t ts = 0;
 
         // Parse: channel|key|add/del|timestamp
         int parsed =
-            sscanf(data, "%64[^|]|%30[^|]|%15[^|]|%ld", chan, key, op, &ts);
+            sscanf(data, "%64[^|]|%30[^|]|%15[^|]|%ld", chan, chan_key, op, &ts);
 
         // Fallback for empty key: channel||add/del|timestamp
         if (parsed < 3) {
           parsed = sscanf(data, "%64[^|]||%15[^|]|%ld", chan, op, &ts);
-          key[0] = '\0';
+          chan_key[0] = '\0';
         }
 
         if (parsed >= 2) { // Need at least chan, op (key can be empty)
@@ -147,13 +147,13 @@ bool config_load(bot_state_t *state, const char *password,
 
           chan_t *c = channel_add(state, chan);
           if (c) {
-            if (strlen(key) > 0) {
-              snprintf(c->key, MAX_KEY, "%s", key);
+            if (strlen(chan_key) > 0) {
+              snprintf(c->key, MAX_KEY, "%s", chan_key);
             }
             c->is_managed = (strcmp(op, "del") != 0);
             c->timestamp = (ts > 0) ? ts : time(NULL);
 
-            if (strlen(key) > 0)
+            if (strlen(chan_key) > 0)
               state->chan_count++;
 
             // Don't join deleted channels
