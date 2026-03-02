@@ -182,8 +182,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
   }
 
   char line_copy[MAX_BUFFER];
-  strncpy(line_copy, line, sizeof(line_copy) - 1);
-  line_copy[sizeof(line_copy) - 1] = '\0';
+  snprintf(line_copy, sizeof(line_copy), "%s", line);
 
   char *prefix = NULL, *command = NULL, *params = NULL;
   char *p = line_copy;
@@ -216,8 +215,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *server_name = strtok_r(params, " ", &saveptr_irc);
     server_name = strtok_r(NULL, " ", &saveptr_irc);
     if (server_name) {
-      strncpy(state->actual_server_name, server_name,
-              sizeof(state->actual_server_name) - 1);
+      snprintf(state->actual_server_name, sizeof(state->actual_server_name),
+               "%s", server_name);
     }
   }
   if (strcmp(command, "001") == 0) {
@@ -229,9 +228,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (last_token) {
       last_token++; // Skip space
       if (strchr(last_token, '!') && strchr(last_token, '@')) {
-        strncpy(state->actual_hostname, last_token,
-                sizeof(state->actual_hostname) - 1);
-        state->actual_hostname[sizeof(state->actual_hostname) - 1] = '\0';
+        snprintf(state->actual_hostname, sizeof(state->actual_hostname),
+                 "%s", last_token);
         log_message(L_INFO, state, "[INFO] Discovered my hostmask: %s\n",
                     state->actual_hostname);
 
@@ -315,8 +313,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     if (nick && ident && host && modes) {
       roster_entry_t *entry = &c->roster[c->roster_count];
-      strncpy(entry->nick, nick, MAX_NICK - 1);
-      snprintf(entry->hostmask, MAX_MASK_LEN, "%s!%s@%s", nick, ident, host);
+      snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
+      snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
       entry->is_op = (strstr(modes, "@") != NULL);
       c->roster_count++;
     }
@@ -486,10 +484,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
       message++;
 
     if (nick && dest && message) {
-      if (message[0] == '\001' && message[strlen(message) - 1] == '\001') {
+      size_t msg_len = strlen(message);
+      if (msg_len >= 2 && message[0] == '\001' && message[msg_len - 1] == '\001') {
         log_message(L_CTCP, state, "[CTCP] (%s) %s\n", nick, message);
 
-        message[strlen(message) - 1] = '\0';
+        message[msg_len - 1] = '\0';
         char *ctcp_command = message + 1;
 
         if (strcasecmp(ctcp_command, "VERSION") == 0) {
@@ -511,8 +510,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
       if (c) {
         c->status = C_IN;
         c->roster_count = 0;
-        strncpy(state->who_request_channel, c->name, MAX_CHAN - 1);
-        state->who_request_channel[MAX_CHAN - 1] = '\0';
+        snprintf(state->who_request_channel, sizeof(state->who_request_channel),
+                 "%s", c->name);
         c->last_who_request = time(NULL);
         irc_printf(state, "WHO %s\r\n", c->name);
       }
@@ -534,8 +533,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     }
   } else if (strcmp(command, "KICK") == 0 && params) {
     char params_copy[MAX_BUFFER];
-    strncpy(params_copy, params, sizeof(params_copy) - 1);
-    params_copy[sizeof(params_copy) - 1] = '\0';
+    snprintf(params_copy, sizeof(params_copy), "%s", params);
 
     char *chan_name = strtok_r(params_copy, " ", &saveptr_irc);
     char *kicked_nick = strtok_r(NULL, " ", &saveptr_irc);
@@ -551,20 +549,12 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *new_nick = (*params == ':') ? params + 1 : params;
     if (old_nick && new_nick &&
         strcasecmp(old_nick, state->current_nick) == 0) {
-      strncpy(state->current_nick, new_nick, MAX_NICK - 1);
+      snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);
 
-      // [NEW] Update hostmask on nick change
-      // Hostmask format: nick!user@host
-      // We need to parse existing actual_hostname to get user@host?
-      // Or just use state->user?
-      // Parsing existing is safer if user changed, but state->user should be
-      // source of truth for own user. However host part might have changed
-      // (e.g. vhost). Let's try to extract @host from current actual_hostname
       char *at = strchr(state->actual_hostname, '@');
       if (at) {
         char host[128];
-        strncpy(host, at + 1, sizeof(host) - 1);
-        host[sizeof(host) - 1] = '\0';
+        snprintf(host, sizeof(host), "%s", at + 1);
 
         snprintf(state->actual_hostname, sizeof(state->actual_hostname),
                  "%s!%s@%s", state->current_nick, state->user, host);

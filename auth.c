@@ -1,4 +1,5 @@
 #include <inttypes.h>
+#include <openssl/crypto.h>
 #include <openssl/sha.h>
 #include <string.h>
 #include <strings.h>
@@ -113,6 +114,7 @@ bool auth_verify_op_command(bot_state_t *state, const char *user_host,
         log_message(L_DEBUG, state,
                     "[OP_CHECK] \n   EXPECTED: %s\n   RECEIVED: %s\n", hex,
                     hash_attempt);
+        OPENSSL_cleanse(to_hash, sizeof(to_hash));
       }
     }
   }
@@ -160,9 +162,11 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   log_message(L_DEBUG, state,
               "[DEBUG_AUTH] Check 1 (Min %ld)\n", min);
 
-  if (strcmp(hash_attempt, hex) == 0) {
+  if (strlen(hash_attempt) == 64 &&
+      CRYPTO_memcmp(hash_attempt, hex, 64) == 0) {
     state->admin_nonces[state->admin_nonce_idx] = nonce;
     state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+    OPENSSL_cleanse(to_hash, sizeof(to_hash));
     return true;
   }
 
@@ -179,12 +183,15 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   log_message(L_DEBUG, state,
               "[DEBUG_AUTH] Check 2 (Min %ld)\n", (min - 1));
 
-  if (strcmp(hash_attempt, hex) == 0) {
+  if (strlen(hash_attempt) == 64 &&
+      CRYPTO_memcmp(hash_attempt, hex, 64) == 0) {
     state->admin_nonces[state->admin_nonce_idx] = nonce;
     state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+    OPENSSL_cleanse(to_hash, sizeof(to_hash));
     return true;
   }
 
+  OPENSSL_cleanse(to_hash, sizeof(to_hash));
   return false;
 }
 

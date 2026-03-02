@@ -70,8 +70,19 @@ bool config_load(bot_state_t *state, const char *password,
   int plaintext_len;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-  EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext, ciphertext_len);
+  if (!ctx) {
+    free(ciphertext);
+    free(plaintext);
+    return false;
+  }
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+      EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
+                        ciphertext_len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    free(ciphertext);
+    free(plaintext);
+    return false;
+  }
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
 
   if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) > 0) {
@@ -84,9 +95,9 @@ bool config_load(bot_state_t *state, const char *password,
 
     while (line) {
 
-      size_t len = strlen(line);
-      if (len > 0 && line[len - 1] == '\r')
-        line[len - 1] = '\0';
+      size_t line_sz = strlen(line);
+      if (line_sz > 0 && line[line_sz - 1] == '\r')
+        line[line_sz - 1] = '\0';
 
       if (strlen(line) < 2 || line[0] == '#') {
         line = strtok_r(NULL, "\n", &saveptr1);
@@ -105,8 +116,7 @@ bool config_load(bot_state_t *state, const char *password,
 
       switch (type) {
       case 'n': // Nickname (bot-specific)
-        strncpy(state->target_nick, data, MAX_NICK - 1);
-        state->target_nick[MAX_NICK - 1] = '\0';
+        snprintf(state->target_nick, MAX_NICK, "%s", data);
         break;
 
       case 's': // Server (bot-specific)
@@ -138,8 +148,7 @@ bool config_load(bot_state_t *state, const char *password,
           chan_t *c = channel_add(state, chan);
           if (c) {
             if (strlen(key) > 0) {
-              strncpy(c->key, key, MAX_KEY - 1);
-              c->key[MAX_KEY - 1] = '\0';
+              snprintf(c->key, MAX_KEY, "%s", key);
             }
             c->is_managed = (strcmp(op, "del") != 0);
             c->timestamp = (ts > 0) ? ts : time(NULL);
@@ -217,13 +226,11 @@ bool config_load(bot_state_t *state, const char *password,
         char pass[MAX_PASS];
         time_t ts = 0;
         if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
-          strncpy(state->bot_pass, pass, MAX_PASS - 1);
-          state->bot_pass[MAX_PASS - 1] = '\0';
+          snprintf(state->bot_pass, MAX_PASS, "%s", pass);
           state->bot_pass_ts = (ts > 0) ? ts : time(NULL);
         } else {
           // Legacy fallback
-          strncpy(state->bot_pass, data, MAX_PASS - 1);
-          state->bot_pass[MAX_PASS - 1] = '\0';
+          snprintf(state->bot_pass, MAX_PASS, "%s", data);
           state->bot_pass_ts = time(NULL);
         }
       } break;
@@ -233,12 +240,10 @@ bool config_load(bot_state_t *state, const char *password,
         char pass[MAX_PASS];
         time_t ts = 0;
         if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
-          strncpy(state->bot_comm_pass, pass, MAX_PASS - 1);
-          state->bot_comm_pass[MAX_PASS - 1] = '\0';
+          snprintf(state->bot_comm_pass, MAX_PASS, "%s", pass);
           state->bot_comm_pass_ts = (ts > 0) ? ts : time(NULL);
         } else {
-          strncpy(state->bot_comm_pass, data, MAX_PASS - 1);
-          state->bot_comm_pass[MAX_PASS - 1] = '\0';
+          snprintf(state->bot_comm_pass, MAX_PASS, "%s", data);
           state->bot_comm_pass_ts = time(NULL);
         }
       } break;
@@ -254,18 +259,15 @@ bool config_load(bot_state_t *state, const char *password,
         break;
 
       case 'u': // User/ident (bot-specific)
-        strncpy(state->user, data, sizeof(state->user) - 1);
-        state->user[sizeof(state->user) - 1] = '\0';
+        snprintf(state->user, sizeof(state->user), "%s", data);
         break;
 
       case 'g': // Gecos (bot-specific)
-        strncpy(state->gecos, data, sizeof(state->gecos) - 1);
-        state->gecos[sizeof(state->gecos) - 1] = '\0';
+        snprintf(state->gecos, sizeof(state->gecos), "%s", data);
         break;
 
       case 'v': // Vhost (bot-specific)
-        strncpy(state->vhost, data, sizeof(state->vhost) - 1);
-        state->vhost[sizeof(state->vhost) - 1] = '\0';
+        snprintf(state->vhost, sizeof(state->vhost), "%s", data);
         break;
 
       case 'h': // Hub list (bot-specific)
@@ -275,13 +277,11 @@ bool config_load(bot_state_t *state, const char *password,
         break;
 
       case 'k': // Hub public key (bot-specific)
-        strncpy(state->hub_key, data, sizeof(state->hub_key) - 1);
-        state->hub_key[sizeof(state->hub_key) - 1] = '\0';
+        snprintf(state->hub_key, sizeof(state->hub_key), "%s", data);
         break;
 
       case 'i': // Bot UUID (bot-specific)
-        strncpy(state->bot_uuid, data, sizeof(state->bot_uuid) - 1);
-        state->bot_uuid[sizeof(state->bot_uuid) - 1] = '\0';
+        snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", data);
         break;
       }
 
@@ -320,7 +320,7 @@ bool config_load(bot_state_t *state, const char *password,
 }
 
 void config_write(const bot_state_t *state, const char *password) {
-  if (strlen(password) > MAX_PASS) {
+  if (strlen(password) >= MAX_PASS) {
     return;
   }
 
@@ -520,10 +520,19 @@ void config_write(const bot_state_t *state, const char *password) {
   int len, ciphertext_len;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-  EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len,
-                    (unsigned char *)plaintext_overrides, plaintext_len);
-  EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len);
+  if (!ctx) {
+    free(ciphertext);
+    return;
+  }
+  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+      EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len,
+                        (unsigned char *)plaintext_overrides,
+                        plaintext_len) != 1 ||
+      EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1) {
+    EVP_CIPHER_CTX_free(ctx);
+    free(ciphertext);
+    return;
+  }
   ciphertext_len += len;
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
   EVP_CIPHER_CTX_free(ctx);

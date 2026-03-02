@@ -291,7 +291,7 @@ struct bot_state {
 };
 
 // ... [Function Prototypes same as before] ...
-void ssl_init_openssl();
+void ssl_init_openssl(void);
 bool auth_verify_password(bot_state_t *state, const char *nonce_str,
                           const char *hash_attempt,
                           const char *stored_password);
@@ -358,6 +358,7 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
                                     const char *channel);
+#ifdef DEBUG
 static inline void debug_hex_dump(const char *label, const unsigned char *data,
                                   int len) {
   printf("[DEBUG] %s (%d bytes): ", label, len);
@@ -365,4 +366,5 @@ static inline void debug_hex_dump(const char *label, const unsigned char *data,
     printf("%02x", data[i]);
   printf("\n");
 }
+#endif
 #endif

@@ -39,21 +39,34 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
   int len = vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
   if (len < 0) return -1;
+  if (len >= (int)sizeof(buffer)) len = (int)sizeof(buffer) - 1;
   log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
-  ssize_t sent;
   if (state->is_ssl) {
-    sent = SSL_write(state->ssl, buffer, len);
+    int sent = SSL_write(state->ssl, buffer, len);
+    if (sent <= 0) {
+      ERR_print_errors_fp(stderr);
+      log_message(L_INFO, state,
+                  "[INFO] Lost connection to server (SSL write error).\n");
+      irc_disconnect(state);
+      return -1;
+    }
+    return sent;
   } else {
-    sent = write(state->server_fd, buffer, len);
+    int total_sent = 0;
+    while (total_sent < len) {
+      ssize_t sent = write(state->server_fd, buffer + total_sent,
+                           len - total_sent);
+      if (sent <= 0) {
+        if (errno == EINTR) continue;
+        log_message(L_INFO, state,
+                    "[INFO] Lost connection to server (write error).\n");
+        irc_disconnect(state);
+        return -1;
+      }
+      total_sent += (int)sent;
+    }
+    return total_sent;
   }
-  if (sent <= 0) {
-    if (state->is_ssl) ERR_print_errors_fp(stderr);
-    log_message(L_INFO, state,
-                "[INFO] Lost connection to server (write error).\n");
-    irc_disconnect(state);
-    return -1;
-  }
-  return sent;
 }
 
 void irc_connect(bot_state_t *state) {
@@ -62,9 +75,8 @@ void irc_connect(bot_state_t *state) {
     state->current_server_index = 0;
 
   char server_str[256];
-  strncpy(server_str, state->server_list[state->current_server_index],
-          sizeof(server_str) - 1);
-  server_str[sizeof(server_str) - 1] = '\0';
+  snprintf(server_str, sizeof(server_str), "%s",
+           state->server_list[state->current_server_index]);
 
   char *port_from_config = strrchr(server_str, ':');
   char *host = server_str;
@@ -216,8 +228,8 @@ void irc_connect(bot_state_t *state) {
     state->status = S_CONNECTED;
     state->last_pong_time = time(NULL);
     state->connection_time = time(NULL);
-    strncpy(state->current_nick, state->target_nick, MAX_NICK - 1);
-    state->current_nick[MAX_NICK - 1] = '\0';
+    snprintf(state->current_nick, sizeof(state->current_nick), "%s",
+             state->target_nick);
     irc_printf(state, "NICK %s\r\n", state->current_nick);
     irc_printf(state, "USER %s 0 * :%s\r\n", state->user, state->gecos);
   }
@@ -236,25 +248,30 @@ void irc_handle_read(bot_state_t *state) {
   ssize_t bytes_read;
   if (state->is_ssl) {
     bytes_read = SSL_read(state->ssl, read_buffer + buffer_len,
-                          sizeof(read_buffer) - buffer_len - 1);
-  } else {
-    bytes_read = read(state->server_fd, read_buffer + buffer_len,
-                      sizeof(read_buffer) - buffer_len - 1);
-  }
-
-  if (bytes_read <= 0) {
-    if (state->is_ssl &&
-        SSL_get_error(state->ssl, bytes_read) != SSL_ERROR_ZERO_RETURN) {
-      ERR_print_errors_fp(stderr);
-    }
-    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                          sizeof(read_buffer) - (size_t)buffer_len - 1);
+    if (bytes_read <= 0) {
+      int ssl_err = SSL_get_error(state->ssl, (int)bytes_read);
+      if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
+        if (ssl_err != SSL_ERROR_ZERO_RETURN) ERR_print_errors_fp(stderr);
         irc_disconnect(state);
         buffer_len = 0;
+      }
+      return;
     }
-    return;
+  } else {
+    bytes_read = read(state->server_fd, read_buffer + buffer_len,
+                      sizeof(read_buffer) - (size_t)buffer_len - 1);
+    if (bytes_read <= 0) {
+      if (bytes_read == 0 || (errno != EWOULDBLOCK && errno != EAGAIN &&
+                               errno != EINTR)) {
+        irc_disconnect(state);
+        buffer_len = 0;
+      }
+      return;
+    }
   }
 
-  buffer_len += bytes_read;
+  buffer_len += (int)bytes_read;
   read_buffer[buffer_len] = '\0';
 
   char *line_start = read_buffer;
@@ -267,7 +284,8 @@ void irc_handle_read(bot_state_t *state) {
     line_start = line_end + 2;
   }
 
-  int remaining = buffer_len - (line_start - read_buffer);
+  int remaining = buffer_len - (int)(line_start - read_buffer);
+  if (remaining < 0) remaining = 0;
   if (remaining > 0 && line_start != read_buffer) {
       memmove(read_buffer, line_start, remaining);
   }
@@ -333,15 +351,8 @@ void irc_check_status(bot_state_t *state) {
         }
       }
     } else {
-      // Logic for skipped reclaim logs
-      if (state->nick_change_pending) {
-        log_message(L_INFO, state,
-                    "[INFO] Nick reclaim skipped: nick change pending.\n");
-      } else {
-        log_message(
-            L_INFO, state,
-            "[INFO] Nick reclaim skipped: bot not authenticated yet.\n");
-      }
+      log_message(L_INFO, state,
+                  "[INFO] Nick reclaim skipped: nick change pending.\n");
     }
   }
 }
@@ -359,8 +370,7 @@ void irc_generate_new_nick(bot_state_t *state) {
   int attempt = state->nick_generation_attempt;
 
   char base_nick[9];
-  strncpy(base_nick, state->target_nick, 8);
-  base_nick[8] = '\0';
+  snprintf(base_nick, sizeof(base_nick), "%s", state->target_nick);
 
   if (attempt < num_special_chars) {
     snprintf(new_nick, MAX_NICK, "%s%c", base_nick, nick_append_chars[attempt]);
@@ -373,8 +383,7 @@ void irc_generate_new_nick(bot_state_t *state) {
       return;
     }
   }
-  strncpy(state->current_nick, new_nick, MAX_NICK - 1);
-  state->current_nick[MAX_NICK - 1] = '\0';
+  snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);
   state->nick_generation_attempt++;
   irc_attempt_nick_change(state, new_nick);
 }

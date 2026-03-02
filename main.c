@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
@@ -11,7 +12,7 @@
 
 #include "bot.h"
 
-void ssl_init_openssl() {
+void ssl_init_openssl(void) {
   SSL_load_error_strings();
   OpenSSL_add_ssl_algorithms();
 }
@@ -159,8 +160,7 @@ static void run_config_wizard(void) {
       get_input("Enter bot nick", state.target_nick, MAX_NICK);
       if (strlen(state.target_nick) > 0 &&
           strlen(state.target_nick) < MAX_NICK) {
-        strncpy(state.current_nick, state.target_nick, MAX_NICK - 1);
-        state.current_nick[MAX_NICK - 1] = '\0';
+        snprintf(state.current_nick, MAX_NICK, "%s", state.target_nick);
         break;
       }
       printf("🚨 ERROR: Invalid nick length.\n");
@@ -293,8 +293,9 @@ static void run_config_wizard(void) {
           int line_len = strlen(line);
           //            if (total_len + line_len < sizeof(privkey_input) - 1) {
           if ((size_t)(total_len + line_len) < sizeof(privkey_input) - 1) {
-            strcat(privkey_input, line);
+            memcpy(privkey_input + total_len, line, line_len);
             total_len += line_len;
+            privkey_input[total_len] = '\0';
           } else {
             printf("🚨 ERROR: Key too long (max %zu chars).\n",
                    sizeof(privkey_input) - 1);
@@ -377,13 +378,10 @@ static void run_config_wizard(void) {
       }
 
       // Store in state
-      strncpy(state.bot_uuid, uuid_input, sizeof(state.bot_uuid) - 1);
-      state.bot_uuid[sizeof(state.bot_uuid) - 1] = '\0';
+      snprintf(state.bot_uuid, sizeof(state.bot_uuid), "%s", uuid_input);
+      snprintf(state.hub_key, sizeof(state.hub_key), "%s", privkey_input);
 
-      strncpy(state.hub_key, privkey_input, sizeof(state.hub_key) - 1);
-      state.hub_key[sizeof(state.hub_key) - 1] = '\0';
-
-      if (state.hub_count < 10) {
+      if (state.hub_count < MAX_SERVERS) {
         state.hub_list[state.hub_count++] = strdup(hub_addr);
       }
 
@@ -456,27 +454,36 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   char pid_str[16];
-  sprintf(pid_str, "%d\n", getpid());
+  snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
   if (write(pid_fd, pid_str, strlen(pid_str)) < 0) {
-  };
+    close(pid_fd);
+    return 1;
+  }
 
   ssl_init_openssl();
   const char *startup_password = getenv(CONFIG_PASS_ENV_VAR);
-  if (!startup_password)
+  if (!startup_password) {
+    close(pid_fd);
+    remove(PID_FILE);
     return 1;
+  }
 
   printf("%s %s\n", BOT_NAME, BOT_VERSION);
   bot_state_t state;
   state_init(&state);
   state.pid_fd = pid_fd;
-  if (!realpath(argv[0], state.executable_path))
+  if (!realpath(argv[0], state.executable_path)) {
+    close(pid_fd);
+    remove(PID_FILE);
     return 1;
-  strncpy(state.startup_password, startup_password,
-          sizeof(state.startup_password) - 1);
+  }
+  snprintf(state.startup_password, sizeof(state.startup_password), "%s",
+           startup_password);
   get_local_ip(&state);
   setup_signals();
 
   if (!config_load(&state, state.startup_password, CONFIG_FILE)) {
+    close(pid_fd);
     remove(PID_FILE);
     return 1;
   }

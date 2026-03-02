@@ -60,8 +60,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   if (auth_is_trusted_bot(state, user_host)) {
     char message_copy_bot[MAX_BUFFER];
-    strncpy(message_copy_bot, message, sizeof(message_copy_bot) - 1);
-    message_copy_bot[sizeof(message_copy_bot) - 1] = '\0';
+    snprintf(message_copy_bot, sizeof(message_copy_bot), "%s", message);
 
     char *saveptr_enc;
     char *encoded_ciphertext = strtok_r(message_copy_bot, ":", &saveptr_enc);
@@ -172,8 +171,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   }
   /* --- Block 2: Admin/Op Logic --- */
   char message_copy[MAX_BUFFER];
-  strncpy(message_copy, message, sizeof(message_copy) - 1);
-  message_copy[sizeof(message_copy) - 1] = '\0';
+  snprintf(message_copy, sizeof(message_copy), "%s", message);
 
   char *saveptr_adm;
   char *auth_token = strtok_r(message_copy, " ", &saveptr_adm);
@@ -231,11 +229,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       if (arg1[0] == '#') {
-        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
+        snprintf(channel_name, sizeof(channel_name), "%s", arg1);
       } else {
         snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
       }
-      channel_name[sizeof(channel_name) - 1] = '\0';
 
       chan_t *c = channel_find(state, channel_name);
       if (c && c->is_managed) {
@@ -249,7 +246,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       if (c) {
         if (arg2)
-          strncpy(c->key, arg2, MAX_KEY - 1);
+          snprintf(c->key, MAX_KEY, "%s", arg2);
         c->is_managed = true;      // Mark as managed for syncing
         c->timestamp = time(NULL); // Set timestamp for sync
         log_message(L_DEBUG, state, "[JOIN] Channel %s: re-enabled ts=%ld\n",
@@ -266,7 +263,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       char channel_name[MAX_CHAN];
       if (arg1[0] == '#') {
-        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
+        snprintf(channel_name, sizeof(channel_name), "%s", arg1);
       } else {
         snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
       }
@@ -318,7 +315,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (!hub_client_send_invite_request(state, nick, inv_channel)) {
         for (int i = 0; i < state->trusted_bot_count; i++) {
           char tb_nick[MAX_NICK];
-          if (sscanf(state->trusted_bots[i], "%63[^!]", tb_nick) == 1) {
+          if (sscanf(state->trusted_bots[i], "%9[^!]", tb_nick) == 1) {
             bot_comms_send_command(state, tb_nick,
                                    "INVITE %s %s", inv_channel, nick);
           }
@@ -329,7 +326,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Syntax: botpass <password>\r\n", nick);
         return;
       }
-      strncpy(state->bot_comm_pass, arg1, MAX_PASS - 1);
+      snprintf(state->bot_comm_pass, MAX_PASS, "%s", arg1);
       state->bot_comm_pass_ts = time(NULL);
       config_write(state, state->startup_password);
       irc_printf(state,
@@ -359,7 +356,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
       }
       if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-        state->trusted_bots[state->trusted_bot_count++] = strdup(arg1);
+        char *dup = strdup(arg1);
+        if (!dup) return;
+        state->trusted_bots[state->trusted_bot_count++] = dup;
         state->trusted_bots[state->trusted_bot_count] = NULL;
         config_write(state, state->startup_password);
         irc_printf(state, "PRIVMSG %s :Added trusted bot: %s\r\n", nick, arg1);
@@ -415,8 +414,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                  uptime_seconds / 86400, (uptime_seconds % 86400) / 3600,
                  (uptime_seconds % 3600) / 60, uptime_seconds % 60);
       } else {
-        strncpy(uptime_str, "N/A", sizeof(uptime_str) - 1);
-        uptime_str[sizeof(uptime_str) - 1] = '\0';
+        snprintf(uptime_str, sizeof(uptime_str), "%s", "N/A");
       }
 
       irc_printf(state, "PRIVMSG %s :--- Bot Status :: %s %s ---\r\n", nick,
@@ -467,7 +465,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         char chan_part[128] = "";
 
         if (i < state->server_count)
-          strncpy(server_part, state->server_list[i], sizeof(server_part) - 1);
+          snprintf(server_part, sizeof(server_part), "%s", state->server_list[i]);
 
         // Skip non-managed channels
         while (current_chan && !current_chan->is_managed) {
@@ -572,8 +570,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             "PRIVMSG %s :Error: Nickname is too long (max %d chars).\r\n", nick,
             MAX_NICK - 1);
       } else {
-        strncpy(state->target_nick, arg1, MAX_NICK - 1);
-        state->target_nick[MAX_NICK - 1] = '\0';
+        snprintf(state->target_nick, MAX_NICK, "%s", arg1);
         config_write(state, state->startup_password);
         irc_printf(state,
                    "PRIVMSG %s :Target nickname changed to '%s' and saved.\r\n",
@@ -674,55 +671,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         nanosleep(&delay, NULL);
       }
       irc_printf(state, "PRIVMSG %s :--- End of Log (%s) --- \r\n", nick, arg1);
-    } else if (strcasecmp(command, "join") == 0) {
-      char channel_name[MAX_CHAN];
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: join <#channel>\r\n", nick);
-        return;
-      }
-      if (arg1[0] == '#') {
-        strncpy(channel_name, arg1, sizeof(channel_name) - 1);
-      } else {
-        snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
-      }
-      channel_name[sizeof(channel_name) - 1] = '\0';
-
-      chan_t *existing = channel_find(state, channel_name);
-      if (existing) {
-        if (!existing->is_managed) {
-          // Reactivate
-          existing->is_managed = true;
-          existing->timestamp = time(NULL);
-          if (arg2)
-            strncpy(existing->key, arg2, MAX_KEY - 1);
-          config_write(state, state->startup_password);
-          irc_printf(state,
-                     "PRIVMSG %s :Re-enabled management for channel %s and "
-                     "saved config.\r\n",
-                     nick, channel_name);
-          irc_printf(state, "JOIN %s %s\r\n", channel_name, (arg2 ? arg2 : ""));
-        } else {
-          // Already managed
-          irc_printf(
-              state,
-              "PRIVMSG %s :Error: Channel %s is already in my active list.\r\n",
-              nick, channel_name);
-        }
-      } else {
-        // New Add
-        chan_t *c = channel_add(state, channel_name);
-        if (c) {
-          if (arg2)
-            strncpy(c->key, arg2, MAX_KEY - 1);
-          c->is_managed = true; // Mark as managed
-          c->timestamp = time(NULL);
-          config_write(state, state->startup_password);
-          irc_printf(state,
-                     "PRIVMSG %s :Added channel %s and saved config.\r\n", nick,
-                     channel_name);
-          irc_printf(state, "JOIN %s %s\r\n", channel_name, (arg2 ? arg2 : ""));
-        }
-      }
     } else if (strcasecmp(command, "+adminmask") == 0) {
       if (!arg1) {
         irc_printf(
@@ -756,9 +704,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
       } else {
         if (state->mask_count < MAX_MASKS) {
-          strncpy(state->auth_masks[state->mask_count].mask, arg1,
-                  MAX_MASK_LEN - 1);
-          state->auth_masks[state->mask_count].mask[MAX_MASK_LEN - 1] = '\0';
+          snprintf(state->auth_masks[state->mask_count].mask, MAX_MASK_LEN,
+                   "%s", arg1);
           state->auth_masks[state->mask_count].is_managed = true;
           state->auth_masks[state->mask_count].timestamp = time(NULL);
           state->mask_count++;
@@ -800,7 +747,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       if (strlen(arg1) > 0) {
-        strncpy(state->bot_pass, arg1, MAX_PASS - 1);
+        snprintf(state->bot_pass, MAX_PASS, "%s", arg1);
         state->bot_pass_ts = time(NULL);
         config_write(state, state->startup_password);
         irc_printf(state,
@@ -829,7 +776,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           // Reactivate
           state->op_masks[found_idx].is_managed = true;
           state->op_masks[found_idx].timestamp = time(NULL);
-          strncpy(state->op_masks[found_idx].password, arg2, MAX_PASS - 1);
+          snprintf(state->op_masks[found_idx].password, MAX_PASS, "%s", arg2);
           config_write(state, state->startup_password);
           irc_printf(state, "PRIVMSG %s :Re-enabled op mask for %s.\r\n", nick,
                      arg1);
@@ -841,10 +788,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
       } else {
         if (state->op_mask_count < MAX_OP_MASKS) {
-          strncpy(state->op_masks[state->op_mask_count].mask, arg1,
-                  MAX_MASK_LEN - 1);
-          strncpy(state->op_masks[state->op_mask_count].password, arg2,
-                  MAX_PASS - 1);
+          snprintf(state->op_masks[state->op_mask_count].mask, MAX_MASK_LEN,
+                   "%s", arg1);
+          snprintf(state->op_masks[state->op_mask_count].password, MAX_PASS,
+                   "%s", arg2);
           state->op_masks[state->op_mask_count].is_managed = true;
           state->op_masks[state->op_mask_count].timestamp = time(NULL);
           state->op_mask_count++;
@@ -886,7 +833,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         return;
       }
       if (state->server_count < MAX_SERVERS) {
-        state->server_list[state->server_count++] = strdup(arg1);
+        char *dup = strdup(arg1);
+        if (!dup) return;
+        state->server_list[state->server_count++] = dup;
         state->server_list[state->server_count] = NULL;
         config_write(state, state->startup_password);
         irc_printf(state, "PRIVMSG %s :Added server '%s' and saved config.\r\n",
@@ -935,7 +884,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
       }
       if (state->hub_count < MAX_SERVERS) {
-        state->hub_list[state->hub_count++] = strdup(arg1);
+        char *dup = strdup(arg1);
+        if (!dup) return;
+        state->hub_list[state->hub_count++] = dup;
         config_write(state, state->startup_password);
         irc_printf(state, "PRIVMSG %s :Added Hub: %s\r\n", nick, arg1);
       } else {
@@ -1010,8 +961,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             }
 
             int idx = part_num - 1;
-            strncpy(state->hub_key_parts[idx], data, 255);
-            state->hub_key_parts[idx][255] = '\0';
+            snprintf(state->hub_key_parts[idx], sizeof(state->hub_key_parts[idx]),
+                     "%s", data);
             state->hub_key_parts_received |= (1 << idx);
 
             uint16_t expected_mask = (1 << total_parts) - 1;
@@ -1104,8 +1055,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                         31) != NULL);
 
             if (valid_pem) {
-              strncpy(state->hub_key, arg1, sizeof(state->hub_key) - 1);
-              state->hub_key[sizeof(state->hub_key) - 1] = '\0';
+              snprintf(state->hub_key, sizeof(state->hub_key), "%s", arg1);
 
               memset(state->hub_key_parts, 0, sizeof(state->hub_key_parts));
               state->hub_key_parts_received = 0;
@@ -1172,8 +1122,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
 
       // Store UUID
-      strncpy(state->bot_uuid, sanitized, sizeof(state->bot_uuid) - 1);
-      state->bot_uuid[sizeof(state->bot_uuid) - 1] = 0;
+      snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", sanitized);
       config_write(state, state->startup_password);
       irc_printf(state,
                  "PRIVMSG %s :UUID set to: %s. Reconnecting to hub...\r\n",

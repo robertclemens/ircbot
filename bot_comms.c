@@ -3,6 +3,7 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "bot.h"
@@ -25,13 +26,14 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   char command_part[256];
   va_list args;
   va_start(args, format);
-  vsnprintf(command_part, sizeof(command_part), format, args);
+  int vn = vsnprintf(command_part, sizeof(command_part), format, args);
   va_end(args);
+  if (vn < 0) return;
 
   char plaintext_message[512];
   time_t current_time = time(NULL);
   uint64_t nonce;
-  RAND_bytes((unsigned char *)&nonce, sizeof(nonce));
+  if (RAND_bytes((unsigned char *)&nonce, sizeof(nonce)) != 1) return;
 
   snprintf(plaintext_message, sizeof(plaintext_message), "%ld:%llu:%s",
            current_time, (unsigned long long)nonce, command_part);
@@ -61,11 +63,13 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
     char *encoded_ciphertext = base64_encode(ciphertext, total_len);
     char *encoded_tag = base64_encode(tag, GCM_TAG_LEN);
 
-    log_message(L_DEBUG, state,
-                "[BOT-COMM] Sending encrypted PRIVMSG to %s: %s\n",
-                target_nick, command_part);
-    irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick, encoded_ciphertext,
-               encoded_tag);
+    if (encoded_ciphertext && encoded_tag) {
+      log_message(L_DEBUG, state,
+                  "[BOT-COMM] Sending encrypted PRIVMSG to %s: %s\n",
+                  target_nick, command_part);
+      irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick,
+                 encoded_ciphertext, encoded_tag);
+    }
 
     free(encoded_ciphertext);
     free(encoded_tag);

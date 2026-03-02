@@ -11,7 +11,7 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
   if (!new_chan)
     handle_fatal_error("calloc failed");
 
-  strncpy(new_chan->name, name, MAX_CHAN - 1);
+  snprintf(new_chan->name, MAX_CHAN, "%s", name);
   new_chan->status = C_OUT;
   new_chan->last_join_attempt = 0;
   new_chan->key[0] = '\0';

@@ -2,6 +2,7 @@
 #include "bot.h"
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
@@ -13,6 +14,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 #include <unistd.h>
@@ -171,7 +173,8 @@ void hub_client_heartbeat(bot_state_t *state) {
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
     uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
     memcpy(buffer, &net_len, 4);
-    if (send(state->hub_fd, buffer, 4 + enc_len + GCM_TAG_LEN, 0) <= 0) {
+    if (send(state->hub_fd, buffer, 4 + enc_len + GCM_TAG_LEN, 0) !=
+        (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
       hub_client_disconnect(state);
     }
   }
@@ -326,13 +329,14 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
     uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
     memcpy(cipher, &net_len, 4);
-
-    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
-      return true; // Request sent successfully
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
+      return true;
     }
+    hub_client_disconnect(state);
   }
 
-  return false; // Failed to send, use PRIVMSG fallback
+  return false;
 }
 
 /* Send CMD_INVITE_REQUEST to hub: hub will broadcast to all bots */
@@ -361,7 +365,8 @@ bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
     uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
     memcpy(cipher, &net_len, 4);
-    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
       log_message(L_INFO, state,
                   "[HUB] Sent INVITE_REQUEST for %s in %s\n", nick, channel);
       return true;
@@ -415,7 +420,8 @@ void hub_client_push_config(bot_state_t *state) {
     uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
     memcpy(cipher, &net_len, 4);
 
-    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
       log_message(L_INFO, state, "[HUB] Config pushed to hub\n");
     } else {
       log_message(L_INFO, state, "[HUB] Failed to push config\n");
@@ -461,7 +467,8 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
     uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
     memcpy(cipher, &net_len, 4);
-    if (send(state->hub_fd, cipher, 4 + cipher_len + GCM_TAG_LEN, 0) > 0) {
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
       log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
                   chan->name, (int)chan->modes);
     } else {
@@ -475,8 +482,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
 
   char work_buf[MAX_BUFFER];
-  strncpy(work_buf, payload, sizeof(work_buf) - 1);
-  work_buf[sizeof(work_buf) - 1] = '\0';
+  snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
   char *saveptr;
   char *line = strtok_r(work_buf, "\n", &saveptr);
@@ -599,7 +605,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     {
       char mask[MAX_MASK_LEN], op[8];
       long ts;
-      if (sscanf(data, "%127[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
+      if (sscanf(data, "%255[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
         bool is_add = (strcmp(op, "add") == 0);
 
         // Find existing
@@ -648,7 +654,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     {
       char mask[MAX_MASK_LEN], pass[MAX_PASS], op[8];
       long ts;
-      if (sscanf(data, "%127[^|]|%127[^|]|%7[^|]|%ld", mask, pass, op, &ts) ==
+      if (sscanf(data, "%255[^|]|%127[^|]|%7[^|]|%ld", mask, pass, op, &ts) ==
           4) {
         bool is_add = (strcmp(op, "add") == 0);
 
@@ -714,9 +720,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       long ts = 0;
       int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
       if (parsed < 1) {
-        // Fallback: treat entire data as password
-        strncpy(pass, data, MAX_PASS - 1);
-        pass[MAX_PASS - 1] = '\0';
+        snprintf(pass, sizeof(pass), "%s", data);
         ts = 0;
       }
 
@@ -725,8 +729,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
 
       // Only update if hub has newer timestamp
       if (ts > state->bot_pass_ts || state->bot_pass[0] == '\0') {
-        strncpy(state->bot_pass, pass, MAX_PASS - 1);
-        state->bot_pass[MAX_PASS - 1] = '\0';
+        snprintf(state->bot_pass, sizeof(state->bot_pass), "%s", pass);
         state->bot_pass_ts = ts;
         updates++;
         log_message(L_INFO, state, "[HUB] Updated admin password (ts=%ld)\n",
@@ -743,16 +746,14 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       long ts = 0;
       int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
       if (parsed < 1) {
-        strncpy(pass, data, MAX_PASS - 1);
-        pass[MAX_PASS - 1] = '\0';
+        snprintf(pass, sizeof(pass), "%s", data);
         ts = 0;
       }
       log_message(L_DEBUG, state, "[HUB-SYNC] BotPass: hub_ts=%ld local_ts=%ld\n",
                   ts, (long)state->bot_comm_pass_ts);
       // Only update if hub has newer timestamp
       if (ts > state->bot_comm_pass_ts || state->bot_comm_pass[0] == '\0') {
-        strncpy(state->bot_comm_pass, pass, MAX_PASS - 1);
-        state->bot_comm_pass[MAX_PASS - 1] = '\0';
+        snprintf(state->bot_comm_pass, sizeof(state->bot_comm_pass), "%s", pass);
         state->bot_comm_pass_ts = ts;
         updates++;
         log_message(L_INFO, state, "[HUB] Updated bot password (ts=%ld)\n", ts);
@@ -779,9 +780,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
                   "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%ld\n",
                   parsed, hostmask, uuid, ts);
       if (parsed < 1) {
-        // Fallback: treat entire data as hostmask
-        strncpy(hostmask, data, MAX_MASK_LEN - 1);
-        hostmask[MAX_MASK_LEN - 1] = '\0';
+        snprintf(hostmask, sizeof(hostmask), "%s", data);
       }
 
       if (hostmask[0] != '\0') {
@@ -806,8 +805,10 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             char full_entry[256];
             snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask,
                      uuid, ts);
+            char *new_entry = strdup(full_entry);
+            if (!new_entry) break;
             free(state->trusted_bots[existing_idx]);
-            state->trusted_bots[existing_idx] = strdup(full_entry);
+            state->trusted_bots[existing_idx] = new_entry;
             updates++;
             log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n",
                         hostmask);
@@ -817,7 +818,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           char full_entry[256];
           snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid,
                    ts);
-          state->trusted_bots[state->trusted_bot_count++] = strdup(full_entry);
+          char *new_entry = strdup(full_entry);
+          if (!new_entry) break;
+          state->trusted_bots[state->trusted_bot_count++] = new_entry;
           updates++;
           log_message(L_INFO, state, "[HUB] Added trusted bot: %s\n", hostmask);
         }
@@ -968,8 +971,7 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         memcpy(nick, hostmask, nick_len);
         nick[nick_len] = '\0';
       } else {
-        strncpy(nick, hostmask, MAX_NICK - 1);
-        nick[MAX_NICK - 1] = '\0';
+        snprintf(nick, sizeof(nick), "%s", hostmask);
       }
 
       // Check if we're in that channel and have ops
@@ -1012,7 +1014,7 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
   case CMD_INVITE_REQUEST:
     if (payload && payload_len > 0) {
       char inv_nick[MAX_NICK], inv_chan[MAX_CHAN];
-      if (sscanf(payload, "%63[^|]|%64s", inv_nick, inv_chan) == 2) {
+      if (sscanf(payload, "%9[^|]|%64[^\n]", inv_nick, inv_chan) == 2) {
         chan_t *ic = channel_find(state, inv_chan);
         if (ic && ic->status == C_IN) {
           bool have_ops = false;
@@ -1103,8 +1105,7 @@ void hub_client_connect(bot_state_t *state) {
   char hub_original[256]; // Save original hub string for later
   snprintf(hub_tmp, sizeof(hub_tmp), "%s",
            state->hub_list[rand() % state->hub_count]);
-  strncpy(hub_original, hub_tmp, sizeof(hub_original) - 1);
-  hub_original[sizeof(hub_original) - 1] = '\0';
+  snprintf(hub_original, sizeof(hub_original), "%s", hub_tmp);
   char *p = strchr(hub_tmp, ':');
   if (!p) {
     state->hub_connecting = false;
@@ -1119,27 +1120,62 @@ void hub_client_connect(bot_state_t *state) {
     __sync_lock_release(&lock);
     return;
   }
-  struct sockaddr_in addr = {0};
+  struct sockaddr_in addr;
+  memset(&addr, 0, sizeof(addr));
   addr.sin_family = AF_INET;
   addr.sin_port = htons(port);
-  inet_pton(AF_INET, hub_tmp, &addr.sin_addr);
-  if (connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) < 0) {
+  if (inet_pton(AF_INET, hub_tmp, &addr.sin_addr) != 1) {
+    log_message(L_INFO, state, "[HUB] Invalid hub IP address: %s\n", hub_tmp);
     close(sockfd);
     state->hub_connecting = false;
     __sync_lock_release(&lock);
     return;
   }
+
+  int flags = fcntl(sockfd, F_GETFL, 0);
+  fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+  int conn_result = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+  bool connected = false;
+  if (conn_result == 0) {
+    connected = true;
+  } else if (errno == EINPROGRESS) {
+    fd_set writefds;
+    struct timeval timeout;
+    FD_ZERO(&writefds);
+    FD_SET(sockfd, &writefds);
+    timeout.tv_sec = 10;
+    timeout.tv_usec = 0;
+    int sel = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+    if (sel > 0) {
+      int so_error;
+      socklen_t solen = sizeof(so_error);
+      getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &solen);
+      if (so_error == 0) connected = true;
+    }
+  }
+
+  if (!connected) {
+    close(sockfd);
+    state->hub_connecting = false;
+    __sync_lock_release(&lock);
+    return;
+  }
+
+  fcntl(sockfd, F_SETFL, flags);
+
   state->hub_fd = sockfd;
   state->hub_connected = true;
   state->hub_authenticated = false;
   auth_state = HUB_AUTH_NONE;
-  // Store which hub we connected to (after successful connection)
-  strncpy(state->current_hub, hub_original, sizeof(state->current_hub) - 1);
-  state->current_hub[sizeof(state->current_hub) - 1] = '\0';
+  snprintf(state->current_hub, sizeof(state->current_hub), "%s", hub_original);
+
   int uuid_len = strlen(state->bot_uuid);
   uint32_t net_len = htonl(uuid_len);
-  if (send(state->hub_fd, &net_len, 4, 0) == 4 &&
-      send(state->hub_fd, state->bot_uuid, uuid_len, 0) == uuid_len) {
+  unsigned char uuid_frame[4 + 36];
+  memcpy(uuid_frame, &net_len, 4);
+  memcpy(uuid_frame + 4, state->bot_uuid, uuid_len);
+  if (send(state->hub_fd, uuid_frame, 4 + uuid_len, 0) == 4 + uuid_len) {
     auth_state = HUB_AUTH_SENT_UUID;
     log_message(L_INFO, state, "[HUB] Connected to %s.\n", state->current_hub);
   } else {
@@ -1154,15 +1190,16 @@ void hub_client_process(bot_state_t *state) {
     return;
 
   unsigned char header[4];
-  int n = recv(state->hub_fd, header, 4, 0);
-
-  if (n <= 0) {
-    hub_client_disconnect(state);
-    return;
-  }
-  if (n != 4) {
-    hub_client_disconnect(state);
-    return;
+  int header_read = 0;
+  while (header_read < 4) {
+    int n = recv(state->hub_fd, header + header_read, 4 - header_read, 0);
+    if (n <= 0) {
+      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+        return;
+      hub_client_disconnect(state);
+      return;
+    }
+    header_read += n;
   }
   uint32_t net_len;
   memcpy(&net_len, header, 4);
@@ -1181,6 +1218,7 @@ void hub_client_process(bot_state_t *state) {
     int r = recv(state->hub_fd, packet_body + total_read,
                  packet_len - total_read, 0);
     if (r <= 0) {
+      if (r < 0 && errno == EINTR) continue;
       free(packet_body);
       hub_client_disconnect(state);
       return;
@@ -1196,10 +1234,12 @@ void hub_client_process(bot_state_t *state) {
         unsigned char signature[512];
         int sig_len = rsa_sign_with_bot_privkey(state, state->hub_key,
                                                 challenge, 32, signature);
-        if (sig_len > 0) {
+        if (sig_len > 0 && sig_len <= 512) {
+          unsigned char sig_frame[4 + 512];
           uint32_t sig_net_len = htonl(sig_len);
-          if (send(state->hub_fd, &sig_net_len, 4, 0) == 4 &&
-              send(state->hub_fd, signature, sig_len, 0) == sig_len) {
+          memcpy(sig_frame, &sig_net_len, 4);
+          memcpy(sig_frame + 4, signature, sig_len);
+          if (send(state->hub_fd, sig_frame, 4 + sig_len, 0) == 4 + sig_len) {
             auth_state = HUB_AUTH_SENT_SIGNATURE;
             log_message(L_INFO, state, "[HUB] Signature sent.\n");
           } else {
@@ -1266,7 +1306,11 @@ void hub_client_process(bot_state_t *state) {
             memcpy(pong_buf + 4 + pong_enc, pong_tag, GCM_TAG_LEN);
             uint32_t pong_len = htonl(pong_enc + GCM_TAG_LEN);
             memcpy(pong_buf, &pong_len, 4);
-            send(state->hub_fd, pong_buf, 4 + pong_enc + GCM_TAG_LEN, 0);
+            if (send(state->hub_fd, pong_buf, 4 + pong_enc + GCM_TAG_LEN, 0) <= 0) {
+              hub_client_disconnect(state);
+              free(packet_body);
+              return;
+            }
             last_pong_sent = now;
           }
         }

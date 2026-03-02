@@ -7,7 +7,7 @@ USE_CURL ?= 1
 #FOR DEV
 #CFLAGS = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -std=c11 -g
 #FOR RELEASE
-CFLAGS = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -std=c11 -O2
+CFLAGS = -D_POSIX_C_SOURCE=200809L -D_XOPEN_SOURCE=700 -Wall -Wextra -Wpedantic -Wshadow -std=c11 -O2
 
 # Add HAVE_CURL flag if curl support is enabled
 ifeq ($(USE_CURL),1)
