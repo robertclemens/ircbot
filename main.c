@@ -482,6 +482,13 @@ int main(int argc, char *argv[]) {
   get_local_ip(&state);
   setup_signals();
 
+  if (access(CONFIG_FILE, F_OK) != 0) {
+    fprintf(stderr, "No config file found. Run './ircbot -setup' to create one.\n");
+    close(pid_fd);
+    remove(PID_FILE);
+    return 1;
+  }
+
   if (!config_load(&state, state.startup_password, CONFIG_FILE)) {
     close(pid_fd);
     remove(PID_FILE);

@@ -28,7 +28,7 @@
 #define CONFIG_FILE ".ircbot.cnf" // Config file name
 #define PID_FILE ".ircbot.pid"    // PID file name
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
-#define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
+#define DEFAULT_LOG_LEVEL 0  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
 #define BOT_UPDATE_URL                                                         \
   "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
