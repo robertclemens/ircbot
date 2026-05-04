@@ -1,6 +1,8 @@
 #include <arpa/inet.h>
 #include <ctype.h>
+#ifdef HAVE_CURL
 #include <curl/curl.h>
+#endif
 #include <netdb.h>
 #include <openssl/evp.h>
 #include <openssl/sha.h>
@@ -30,7 +32,9 @@ void get_local_ip(bot_state_t *state) {
   freeaddrinfo(info);
 }
 
-int strverscmp(const char *s1, const char *s2) {
+#ifdef HAVE_CURL
+
+static int strverscmp(const char *s1, const char *s2) {
   const unsigned char *p1 = (const unsigned char *)s1;
   const unsigned char *p2 = (const unsigned char *)s2;
   int state;
@@ -86,7 +90,6 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
 
   return realsize;
 }
-
 static size_t write_file_callback(void *ptr, size_t size, size_t nmemb,
                                   FILE *stream) {
   return fwrite(ptr, size, nmemb, stream);
@@ -161,8 +164,8 @@ static bool verify_sha256(const char *filepath, const char *expected_hash) {
     return false;
   }
   unsigned char buffer[4096];
-  int bytes_read = 0;
-  while ((bytes_read = fread(buffer, 1, sizeof(buffer), f))) {
+  size_t bytes_read = 0;
+  while ((bytes_read = fread(buffer, 1, sizeof(buffer), f)) > 0) {
     if (1 != EVP_DigestUpdate(ctx, buffer, bytes_read)) {
       EVP_MD_CTX_free(ctx);
       fclose(f);
@@ -180,7 +183,11 @@ static bool verify_sha256(const char *filepath, const char *expected_hash) {
   char hex_hash[EVP_MAX_MD_SIZE * 2 + 1];
   int offset = 0;
   for (unsigned int i = 0; i < hash_len; i++) {
-    offset += sprintf(hex_hash + offset, "%02x", hash[i]);
+    int written = snprintf(hex_hash + offset,
+                           sizeof(hex_hash) - (size_t)offset,
+                           "%02x", hash[i]);
+    if (written > 0)
+      offset += written;
   }
   hex_hash[offset] = '\0';
 
@@ -282,8 +289,7 @@ void updater_check_for_updates(bot_state_t *state, const char *nick) {
         bool all_deps_ok = true;
 
         char deps_copy[256];
-        strncpy(deps_copy, deps, sizeof(deps_copy) - 1);
-        deps_copy[sizeof(deps_copy) - 1] = '\0';
+        snprintf(deps_copy, sizeof(deps_copy), "%s", deps);
         char *saveptr_dep;
         char *dep = strtok_r(deps_copy, ",", &saveptr_dep);
 
@@ -440,8 +446,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   free(expected_hash);
 
   char dir_name[256];
-  strncpy(dir_name, safe_filename, sizeof(dir_name) - 1);
-  dir_name[sizeof(dir_name) - 1] = '\0';
+  snprintf(dir_name, sizeof(dir_name), "%s", safe_filename);
   char *tar_gz = strstr(dir_name, ".tar.gz");
   if (tar_gz) {
     *tar_gz = '\0';
@@ -539,3 +544,14 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   perror("execl failed");
   exit(1);
 }
+#else /* !HAVE_CURL */
+void updater_check_for_updates(bot_state_t *state, const char *nick) {
+  irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
+}
+
+void updater_perform_upgrade(bot_state_t *state, const char *nick,
+                             const char *version_to_install) {
+  (void)version_to_install;  /* Unused parameter */
+  irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
+}
+#endif /* HAVE_CURL */

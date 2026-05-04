@@ -1,11 +1,13 @@
 #include <arpa/inet.h>
 #include <errno.h>
+#include <fcntl.h>
 #include <netdb.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/select.h>
 #include <unistd.h>
 
 #include "bot.h"
@@ -37,21 +39,34 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
   int len = vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
   if (len < 0) return -1;
+  if (len >= (int)sizeof(buffer)) len = (int)sizeof(buffer) - 1;
   log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
-  ssize_t sent;
   if (state->is_ssl) {
-    sent = SSL_write(state->ssl, buffer, len);
+    int sent = SSL_write(state->ssl, buffer, len);
+    if (sent <= 0) {
+      ERR_print_errors_fp(stderr);
+      log_message(L_INFO, state,
+                  "[INFO] Lost connection to server (SSL write error).\n");
+      irc_disconnect(state);
+      return -1;
+    }
+    return sent;
   } else {
-    sent = write(state->server_fd, buffer, len);
+    int total_sent = 0;
+    while (total_sent < len) {
+      ssize_t sent = write(state->server_fd, buffer + total_sent,
+                           len - total_sent);
+      if (sent <= 0) {
+        if (errno == EINTR) continue;
+        log_message(L_INFO, state,
+                    "[INFO] Lost connection to server (write error).\n");
+        irc_disconnect(state);
+        return -1;
+      }
+      total_sent += (int)sent;
+    }
+    return total_sent;
   }
-  if (sent <= 0) {
-    if (state->is_ssl) ERR_print_errors_fp(stderr);
-    log_message(L_INFO, state,
-                "[INFO] Lost connection to server (write error).\n");
-    irc_disconnect(state);
-    return -1;
-  }
-  return sent;
 }
 
 void irc_connect(bot_state_t *state) {
@@ -60,9 +75,8 @@ void irc_connect(bot_state_t *state) {
     state->current_server_index = 0;
 
   char server_str[256];
-  strncpy(server_str, state->server_list[state->current_server_index],
-          sizeof(server_str) - 1);
-  server_str[sizeof(server_str) - 1] = '\0';
+  snprintf(server_str, sizeof(server_str), "%s",
+           state->server_list[state->current_server_index]);
 
   char *port_from_config = strrchr(server_str, ':');
   char *host = server_str;
@@ -71,9 +85,13 @@ void irc_connect(bot_state_t *state) {
     port_from_config++;
   }
 
-  const char *ports_to_try[] = {"6697", "6667", NULL};
+  // If port specified: only try that port. Otherwise try 6667, then 6697
+  const char *ports_to_try[3] = {NULL, NULL, NULL};
   if (port_from_config) {
     ports_to_try[0] = port_from_config;
+  } else {
+    ports_to_try[0] = "6667";
+    ports_to_try[1] = "6697";
   }
 
   struct sockaddr_storage vhost_addr;
@@ -130,8 +148,46 @@ void irc_connect(bot_state_t *state) {
             }
       }
 
-      if (connect(sockfd, p->ai_addr, p->ai_addrlen) == 0) {
-        if (i == 0) {
+      // Set socket to non-blocking for connect timeout
+      int flags = fcntl(sockfd, F_GETFL, 0);
+      fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+      int conn_result = connect(sockfd, p->ai_addr, p->ai_addrlen);
+      bool connected = false;
+
+      if (conn_result == 0) {
+        // Connected immediately (rare)
+        connected = true;
+      } else if (errno == EINPROGRESS) {
+        // Connection in progress, wait with timeout
+        fd_set writefds;
+        struct timeval timeout;
+        FD_ZERO(&writefds);
+        FD_SET(sockfd, &writefds);
+        timeout.tv_sec = 10;  // 10 second timeout
+        timeout.tv_usec = 0;
+
+        int select_result = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+        if (select_result > 0) {
+          // Check if connection succeeded
+          int so_error;
+          socklen_t len = sizeof(so_error);
+          getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
+          if (so_error == 0) {
+            connected = true;
+          }
+        } else if (select_result == 0) {
+          log_message(L_INFO, state,
+                      "[INFO] Connection timeout after 10 seconds.\n");
+        }
+      }
+
+      if (connected) {
+        // Set back to blocking mode
+        fcntl(sockfd, F_SETFL, flags);
+
+        // Try TLS if connecting to port 6697
+        if (strcmp(ports_to_try[i], "6697") == 0) {
           state->ssl_ctx = SSL_CTX_new(TLS_client_method());
           if (!state->ssl_ctx) {
             close(sockfd);
@@ -172,8 +228,8 @@ void irc_connect(bot_state_t *state) {
     state->status = S_CONNECTED;
     state->last_pong_time = time(NULL);
     state->connection_time = time(NULL);
-    strncpy(state->current_nick, state->target_nick, MAX_NICK - 1);
-    state->current_nick[MAX_NICK - 1] = '\0';
+    snprintf(state->current_nick, sizeof(state->current_nick), "%s",
+             state->target_nick);
     irc_printf(state, "NICK %s\r\n", state->current_nick);
     irc_printf(state, "USER %s 0 * :%s\r\n", state->user, state->gecos);
   }
@@ -192,25 +248,30 @@ void irc_handle_read(bot_state_t *state) {
   ssize_t bytes_read;
   if (state->is_ssl) {
     bytes_read = SSL_read(state->ssl, read_buffer + buffer_len,
-                          sizeof(read_buffer) - buffer_len - 1);
-  } else {
-    bytes_read = read(state->server_fd, read_buffer + buffer_len,
-                      sizeof(read_buffer) - buffer_len - 1);
-  }
-
-  if (bytes_read <= 0) {
-    if (state->is_ssl &&
-        SSL_get_error(state->ssl, bytes_read) != SSL_ERROR_ZERO_RETURN) {
-      ERR_print_errors_fp(stderr);
-    }
-    if (errno != EWOULDBLOCK && errno != EAGAIN) {
+                          sizeof(read_buffer) - (size_t)buffer_len - 1);
+    if (bytes_read <= 0) {
+      int ssl_err = SSL_get_error(state->ssl, (int)bytes_read);
+      if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
+        if (ssl_err != SSL_ERROR_ZERO_RETURN) ERR_print_errors_fp(stderr);
         irc_disconnect(state);
         buffer_len = 0;
+      }
+      return;
     }
-    return;
+  } else {
+    bytes_read = read(state->server_fd, read_buffer + buffer_len,
+                      sizeof(read_buffer) - (size_t)buffer_len - 1);
+    if (bytes_read <= 0) {
+      if (bytes_read == 0 || (errno != EWOULDBLOCK && errno != EAGAIN &&
+                               errno != EINTR)) {
+        irc_disconnect(state);
+        buffer_len = 0;
+      }
+      return;
+    }
   }
 
-  buffer_len += bytes_read;
+  buffer_len += (int)bytes_read;
   read_buffer[buffer_len] = '\0';
 
   char *line_start = read_buffer;
@@ -223,7 +284,8 @@ void irc_handle_read(bot_state_t *state) {
     line_start = line_end + 2;
   }
 
-  int remaining = buffer_len - (line_start - read_buffer);
+  int remaining = buffer_len - (int)(line_start - read_buffer);
+  if (remaining < 0) remaining = 0;
   if (remaining > 0 && line_start != read_buffer) {
       memmove(read_buffer, line_start, remaining);
   }
@@ -289,15 +351,8 @@ void irc_check_status(bot_state_t *state) {
         }
       }
     } else {
-      // Logic for skipped reclaim logs
-      if (state->nick_change_pending) {
-        log_message(L_INFO, state,
-                    "[INFO] Nick reclaim skipped: nick change pending.\n");
-      } else {
-        log_message(
-            L_INFO, state,
-            "[INFO] Nick reclaim skipped: bot not authenticated yet.\n");
-      }
+      log_message(L_INFO, state,
+                  "[INFO] Nick reclaim skipped: nick change pending.\n");
     }
   }
 }
@@ -315,8 +370,10 @@ void irc_generate_new_nick(bot_state_t *state) {
   int attempt = state->nick_generation_attempt;
 
   char base_nick[9];
-  strncpy(base_nick, state->target_nick, 8);
-  base_nick[8] = '\0';
+  size_t base_len = strlen(state->target_nick);
+  if (base_len >= sizeof(base_nick)) base_len = sizeof(base_nick) - 1;
+  memcpy(base_nick, state->target_nick, base_len);
+  base_nick[base_len] = '\0';
 
   if (attempt < num_special_chars) {
     snprintf(new_nick, MAX_NICK, "%s%c", base_nick, nick_append_chars[attempt]);
@@ -329,8 +386,7 @@ void irc_generate_new_nick(bot_state_t *state) {
       return;
     }
   }
-  strncpy(state->current_nick, new_nick, MAX_NICK - 1);
-  state->current_nick[MAX_NICK - 1] = '\0';
+  snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);
   state->nick_generation_attempt++;
   irc_attempt_nick_change(state, new_nick);
 }

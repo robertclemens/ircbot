@@ -35,8 +35,8 @@ int main(int argc, char *argv[]) {
   // --- Setup a fake bot state ---
   bot_state_t state;
   memset(&state, 0, sizeof(state));
-  strncpy(state.current_nick, "trojanc_", MAX_NICK - 1);
-  strncpy(state.bot_pass, "test1", MAX_PASS - 1);
+  snprintf(state.current_nick, sizeof(state.current_nick), "%s", "trojanc_");
+  snprintf(state.bot_pass, sizeof(state.bot_pass), "%s", "test1");
 
   // Add a permissive hostmask for the test
   state.mask_count = 1;
@@ -52,7 +52,7 @@ int main(int argc, char *argv[]) {
   snprintf(to_hash, sizeof(to_hash), "%s:%ld", password, min);
   SHA256((unsigned char *)to_hash, strlen(to_hash), raw_hash);
   for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-    sprintf(hex_hash + (i * 2), "%02x", raw_hash[i]);
+    snprintf(hex_hash + (i * 2), sizeof(hex_hash) - (size_t)(i * 2), "%02x", raw_hash[i]);
   }
 
   // Construct the full command string as it would be received on IRC
@@ -62,7 +62,6 @@ int main(int argc, char *argv[]) {
   printf("--- Test Parameters ---\n");
   printf("Bot's Current Nick: %s\n", state.current_nick);
   printf("Testing Hostmask:   %s\n", full_host);
-  printf("Input Password:     %s\n", password);
   printf("Input Command:      %s\n", command_str);
   printf("Generated Hash:     %s\n", hex_hash);
   printf("Full Simulated Msg: \"%s\"\n", incoming_message);

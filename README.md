@@ -20,7 +20,7 @@ I'm open to any suggestions if by chance someone stumbles upon this repository.
     * "make" creates the binary
     * "make install" cleans the directory of all config and compiler objects.
 
-3) Run `"./ircbot -c"`
+3) Run `"./ircbot -setup"`
     * This loads the config wizard to create your initial config file. 
 
 4) Start ircbot. Choose config password and use run_bot.sh in utils/ to start the bot. Config password must be set in run_bot.sh before running. 

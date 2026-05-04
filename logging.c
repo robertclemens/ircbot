@@ -62,7 +62,7 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   printf("%s", full_log_line);
 #endif
 
-  FILE *stream = fopen(LOGFILE, "a+");
+  FILE *stream = fopen(LOGFILE, "a");
   if (!stream) {
     perror("Failed to open log file");
   } else {

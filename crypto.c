@@ -130,6 +130,10 @@ char *base64_encode(const unsigned char *input, int length) {
     BIO_get_mem_ptr(bio, &bufferPtr);
 
     char *b64_text = (char *)malloc(bufferPtr->length + 1);
+    if (!b64_text) {
+        BIO_free_all(bio);
+        return NULL;
+    }
     memcpy(b64_text, bufferPtr->data, bufferPtr->length);
     b64_text[bufferPtr->length] = '\0';
 

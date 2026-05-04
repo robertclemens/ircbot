@@ -3,40 +3,37 @@
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <stdarg.h>
 #include <string.h>
 
 #include "bot.h"
 
-static char *base64_encode(const unsigned char *input, int length) {
-  BIO *b64 = BIO_new(BIO_f_base64());
-  BIO *bio = BIO_new(BIO_s_mem());
-  bio = BIO_push(b64, bio);
-  BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-  BIO_write(bio, input, length);
-  BIO_flush(bio);
-  BUF_MEM *bufferPtr;
-  BIO_get_mem_ptr(bio, &bufferPtr);
-  char *buff = (char *)malloc(bufferPtr->length + 1);
-  memcpy(buff, bufferPtr->data, bufferPtr->length);
-  buff[bufferPtr->length] = 0;
-  BIO_free_all(bio);
-  return buff;
-}
-
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...) {
-  if (!target_nick || !format || state->bot_comm_pass[0] == '\0') return;
+  if (!target_nick || !format) {
+    log_message(L_DEBUG, state,
+                "[BOT-COMM] Cannot send: target_nick=%p format=%p\n",
+                (void *)target_nick, (void *)format);
+    return;
+  }
+  if (state->bot_comm_pass[0] == '\0') {
+    log_message(L_DEBUG, state,
+                "[BOT-COMM] Cannot send to %s: bot_comm_pass is empty\n",
+                target_nick);
+    return;
+  }
 
   char command_part[256];
   va_list args;
   va_start(args, format);
-  vsnprintf(command_part, sizeof(command_part), format, args);
+  int vn = vsnprintf(command_part, sizeof(command_part), format, args);
   va_end(args);
+  if (vn < 0) return;
 
   char plaintext_message[512];
   time_t current_time = time(NULL);
   uint64_t nonce;
-  RAND_bytes((unsigned char *)&nonce, sizeof(nonce));
+  if (RAND_bytes((unsigned char *)&nonce, sizeof(nonce)) != 1) return;
 
   snprintf(plaintext_message, sizeof(plaintext_message), "%ld:%llu:%s",
            current_time, (unsigned long long)nonce, command_part);
@@ -66,8 +63,13 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
     char *encoded_ciphertext = base64_encode(ciphertext, total_len);
     char *encoded_tag = base64_encode(tag, GCM_TAG_LEN);
 
-    irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick, encoded_ciphertext,
-               encoded_tag);
+    if (encoded_ciphertext && encoded_tag) {
+      log_message(L_DEBUG, state,
+                  "[BOT-COMM] Sending encrypted PRIVMSG to %s: %s\n",
+                  target_nick, command_part);
+      irc_printf(state, "PRIVMSG %s :%s:%s\r\n", target_nick,
+                 encoded_ciphertext, encoded_tag);
+    }
 
     free(encoded_ciphertext);
     free(encoded_tag);
