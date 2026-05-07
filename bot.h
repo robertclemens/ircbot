@@ -19,7 +19,8 @@
 // Only edit this section
 // #define DEFAULT_USER "ircbot"         // Default bot user
 #define VHOST "NULL" // NULL for default host, set for alternate
-#define CONFIG_PASS_ENV_VAR "BOT_PASS" // ENV variable for config password
+#define PASS_FILE ".ircbot.pass"        // Machine-bound password file
+#define PBKDF2_ITERATIONS 100000        // PBKDF2 iterations for pass file key derivation
 #define VERSION_RESPONSE                                                       \
   "A robot may not injure a human being" // This is the response to a CTCP
                                          // Version

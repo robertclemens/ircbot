@@ -1,14 +1,18 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/evp.h>
+#include <openssl/rand.h>
+#include <pwd.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
 #include <sys/file.h>
+#include <sys/mman.h>
 #include <sys/select.h>
 #include <sys/stat.h>
+#include <sys/utsname.h>
 #include <termios.h>
 #include <unistd.h>
-
 
 #include "bot.h"
 
@@ -93,39 +97,168 @@ static bool get_confirmed_password(const char *prompt, char *buffer,
   }
 }
 
-// [NEW] Helper to read file content safely and strip newlines for config
-// compatibility
-// static bool read_key_from_file(const char *filepath, char *dest, size_t
-// max_len) {
-//    FILE *f = fopen(filepath, "r");
-//    if (!f) return false;
-//
-// Read the file
-//    size_t n = fread(dest, 1, max_len - 1, f);
-//    dest[n] = 0;
-//    fclose(f);
-//
-//    if (n == 0) return false;
 
-// Strip newlines to create a single long string (Base64 Safe)
-// char *src = dest;
-// char *dst = dest;
-// while (*src) {
-//    if (*src != '\r' && *src != '\n') {
-//        *dst++ = *src;
-//    }
-//    src++;
-//}
-// *dst = 0;
-//
-// Basic validation: Check for PEM header OR Base64 start char
-// 'L' is the Base64 char for the start of "-----"
-//    if (strstr(dest, "-----BEGIN") == NULL && strncmp(dest, "LS0t", 4) != 0) {
-//        printf("🚨 Warning: File does not appear to contain a PEM key or
-//        Base64-encoded PEM.\n"); return false;
-//    }
-//    return true;
-//}
+void daemonize(void) {
+  pid_t pid;
+
+  pid = fork();
+  if (pid < 0) { perror("fork"); exit(1); }
+  if (pid > 0) exit(0);
+
+  if (setsid() < 0) { perror("setsid"); exit(1); }
+
+  pid = fork();
+  if (pid < 0) { perror("fork"); exit(1); }
+  if (pid > 0) exit(0);
+
+  umask(0027);
+
+  int devnull = open("/dev/null", O_RDWR);
+  if (devnull < 0) exit(1);
+  dup2(devnull, STDIN_FILENO);
+  dup2(devnull, STDOUT_FILENO);
+  dup2(devnull, STDERR_FILENO);
+  if (devnull > STDERR_FILENO) close(devnull);
+}
+
+static void passfile_build_context(char *buf, size_t len) {
+  struct stat home_st;
+  struct utsname uts;
+  struct passwd *pw = getpwuid(getuid());
+
+  memset(&home_st, 0, sizeof(home_st));
+  memset(&uts, 0, sizeof(uts));
+  if (pw && pw->pw_dir)
+    stat(pw->pw_dir, &home_st);
+  uname(&uts);
+
+  snprintf(buf, len, "%lu:%lu:%u:%u:%s",
+           (unsigned long)home_st.st_ino,
+           (unsigned long)home_st.st_dev,
+           (unsigned int)getuid(),
+           (unsigned int)getgid(),
+           uts.machine);
+}
+
+static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
+                                unsigned char *key) {
+  return PKCS5_PBKDF2_HMAC(ctx, (int)strlen(ctx), salt, SALT_SIZE,
+                            PBKDF2_ITERATIONS, EVP_sha256(), 32, key) == 1;
+}
+
+static bool passfile_create(const char *path, const char *password) {
+  unsigned char salt[SALT_SIZE];
+  unsigned char key[32];
+  unsigned char tag[GCM_TAG_LEN];
+  char ctx[256];
+  bool ok = false;
+
+  if (RAND_bytes(salt, sizeof(salt)) != 1) {
+    fprintf(stderr, "RNG failure.\n");
+    goto done;
+  }
+
+  passfile_build_context(ctx, sizeof(ctx));
+  if (!passfile_derive_key(ctx, salt, key)) {
+    fprintf(stderr, "Key derivation failed.\n");
+    goto done;
+  }
+
+  int pass_len = (int)strlen(password);
+  unsigned char *enc_buf = malloc((size_t)(GCM_IV_LEN + pass_len));
+  if (!enc_buf) goto done;
+
+  int enc_len = crypto_aes_gcm_encrypt((const unsigned char *)password,
+                                       pass_len, key, enc_buf, tag);
+  if (enc_len <= 0) {
+    fprintf(stderr, "Encryption failed.\n");
+    free(enc_buf);
+    goto done;
+  }
+
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  if (fd < 0) { perror("open"); free(enc_buf); goto done; }
+  if (fchmod(fd, 0600) != 0) { perror("fchmod"); close(fd); free(enc_buf); goto done; }
+
+  ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
+        write(fd, enc_buf, enc_len)     == enc_len   &&
+        write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
+
+  if (!ok) perror("write " PASS_FILE);
+  close(fd);
+  free(enc_buf);
+
+done:
+  memset(key, 0, sizeof(key));
+  memset(ctx, 0, sizeof(ctx));
+  return ok;
+}
+
+static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
+  struct stat st;
+  bool ok = false;
+
+  if (stat(path, &st) != 0) return false;
+
+  if (st.st_uid != getuid()) {
+    fprintf(stderr, "[WARN] %s: wrong owner, ignoring.\n", path);
+    return false;
+  }
+  if ((st.st_mode & 0777) != 0600) {
+    fprintf(stderr, "[WARN] %s: must be 0600, ignoring.\n", path);
+    return false;
+  }
+
+  int min_size = SALT_SIZE + GCM_IV_LEN + 1 + GCM_TAG_LEN;
+  if (st.st_size < min_size) return false;
+
+  int fd = open(path, O_RDONLY);
+  if (fd < 0) return false;
+
+  size_t total = (size_t)st.st_size;
+  unsigned char *buf = malloc(total);
+  if (!buf) { close(fd); return false; }
+
+  if (read(fd, buf, total) != (ssize_t)total) {
+    close(fd); free(buf); return false;
+  }
+  close(fd);
+
+  unsigned char *salt    = buf;
+  unsigned char *enc_blk = buf + SALT_SIZE;
+  int enc_len            = (int)(total - SALT_SIZE - GCM_TAG_LEN);
+  unsigned char *tag     = buf + SALT_SIZE + enc_len;
+
+  unsigned char key[32];
+  char ctx[256];
+  passfile_build_context(ctx, sizeof(ctx));
+  if (!passfile_derive_key(ctx, salt, key)) goto done;
+
+  mlock(out_pass, out_len);
+  unsigned char *plain = malloc((size_t)enc_len);
+  if (!plain) goto done;
+  mlock(plain, (size_t)enc_len);
+
+  int dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+  if (dec_len > 0 && (size_t)dec_len < out_len) {
+    plain[dec_len] = 0;
+    memcpy(out_pass, plain, (size_t)dec_len + 1);
+    ok = true;
+  } else {
+    fprintf(stderr, "[WARN] %s: decryption failed (wrong machine or tampered file).\n", path);
+  }
+
+  memset(plain, 0, (size_t)enc_len);
+  munlock(plain, (size_t)enc_len);
+  free(plain);
+
+done:
+  memset(key, 0, sizeof(key));
+  memset(ctx, 0, sizeof(ctx));
+  munlock(out_pass, out_len);
+  free(buf);
+  return ok;
+}
 
 static void run_config_wizard(void) {
   bot_state_t state;
@@ -150,9 +283,8 @@ static void run_config_wizard(void) {
     printf("==========================================\n");
 
     printf("\n--- Setup Config Master Password ---\n");
-    while (!get_confirmed_password(
-        "Enter new config password (for BOT_PASS env var)", config_pass,
-        MAX_PASS))
+    while (!get_confirmed_password("Enter new config password", config_pass,
+                                   MAX_PASS))
       ;
 
     printf("\n--- Setup Bot Nickname ---\n");
@@ -429,15 +561,24 @@ static void run_config_wizard(void) {
   printf("\n--- Finalizing Configuration ---\n");
   config_write(&state, config_pass);
   printf("\nConfiguration saved to %s.\n", CONFIG_FILE);
-  printf("You can now start the bot using:\n");
-  printf("**%s=\"<your_password>\" ./ircbot**\n", CONFIG_PASS_ENV_VAR);
+  printf("You can now start the bot:\n");
+  printf("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'\n");
+  printf("  Or run './ircbot' directly and enter the password when prompted.\n");
 }
 
 int main(int argc, char *argv[]) {
 #ifdef HAVE_CURL
   curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
-  if (argc > 1 && strcmp(argv[1], "-setup") == 0) {
+
+  bool do_setup = false;
+  bool do_passfile = false;
+  for (int i = 1; i < argc; i++) {
+    if (strcmp(argv[i], "-setup") == 0) do_setup = true;
+    if (strcmp(argv[i], "-p")     == 0) do_passfile = true;
+  }
+
+  if (do_setup) {
     if (access(CONFIG_FILE, F_OK) == 0) {
       fprintf(stderr, "Error: Config file '%s' already exists.\n", CONFIG_FILE);
       return 1;
@@ -446,48 +587,84 @@ int main(int argc, char *argv[]) {
     return 0;
   }
 
-  int pid_fd = open(PID_FILE, O_CREAT | O_RDWR, 0600);
-  if (pid_fd == -1)
+  if (do_passfile) {
+    char pass1[MAX_PASS], pass2[MAX_PASS];
+    do {
+      get_password("Config Password", pass1, sizeof(pass1));
+      if (!pass1[0]) {
+        fprintf(stderr, "Password cannot be empty.\n");
+        return 1;
+      }
+      get_password("Confirm Config Password", pass2, sizeof(pass2));
+      if (strcmp(pass1, pass2) != 0)
+        printf("Passwords do not match. Try again.\n");
+    } while (strcmp(pass1, pass2) != 0);
+
+    bool ok = passfile_create(PASS_FILE, pass1);
+    memset(pass1, 0, sizeof(pass1));
+    memset(pass2, 0, sizeof(pass2));
+    if (ok) {
+      printf("Saved: %s (0600, machine-bound)\n", PASS_FILE);
+      return 0;
+    }
+    fprintf(stderr, "Failed to create %s.\n", PASS_FILE);
     return 1;
+  }
+
+  if (access(CONFIG_FILE, F_OK) != 0) {
+    fprintf(stderr, "No config file found. First run: ./ircbot -setup\n");
+    return 1;
+  }
+
+  /* Password resolution: .ircbot.pass → stdin prompt */
+  char startup_password[MAX_PASS];
+  memset(startup_password, 0, sizeof(startup_password));
+
+  if (!passfile_load(PASS_FILE, startup_password, sizeof(startup_password))) {
+    get_password("Config Password", startup_password, sizeof(startup_password));
+    if (!startup_password[0]) {
+      fprintf(stderr, "No password provided.\n");
+      return 1;
+    }
+  }
+
+  printf("%s %s\n", BOT_NAME, BOT_VERSION);
+  daemonize();
+
+  ssl_init_openssl();
+
+  int pid_fd = open(PID_FILE, O_CREAT | O_RDWR, 0600);
+  if (pid_fd == -1) {
+    memset(startup_password, 0, sizeof(startup_password));
+    return 1;
+  }
   if (flock(pid_fd, LOCK_EX | LOCK_NB) == -1) {
     close(pid_fd);
+    memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
   char pid_str[16];
   snprintf(pid_str, sizeof(pid_str), "%d\n", getpid());
   if (write(pid_fd, pid_str, strlen(pid_str)) < 0) {
     close(pid_fd);
+    memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
 
-  ssl_init_openssl();
-  const char *startup_password = getenv(CONFIG_PASS_ENV_VAR);
-  if (!startup_password) {
-    close(pid_fd);
-    remove(PID_FILE);
-    return 1;
-  }
-
-  printf("%s %s\n", BOT_NAME, BOT_VERSION);
   bot_state_t state;
   state_init(&state);
   state.pid_fd = pid_fd;
   if (!realpath(argv[0], state.executable_path)) {
     close(pid_fd);
     remove(PID_FILE);
+    memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
   snprintf(state.startup_password, sizeof(state.startup_password), "%s",
            startup_password);
+  memset(startup_password, 0, sizeof(startup_password));
   get_local_ip(&state);
   setup_signals();
-
-  if (access(CONFIG_FILE, F_OK) != 0) {
-    fprintf(stderr, "No config file found. Run './ircbot -setup' to create one.\n");
-    close(pid_fd);
-    remove(PID_FILE);
-    return 1;
-  }
 
   if (!config_load(&state, state.startup_password, CONFIG_FILE)) {
     close(pid_fd);

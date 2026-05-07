@@ -10,3 +10,6 @@ decrypt_tool
 .ircbot.cnf
 .ircbot.log
 .ircbot.pid
+.ircbot.pass
+
+.claude
