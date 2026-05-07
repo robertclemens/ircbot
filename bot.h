@@ -14,7 +14,7 @@
 #include <time.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "2.2.0-managed"
+#define BOT_VERSION "2.2.0"
 
 // Only edit this section
 // #define DEFAULT_USER "ircbot"         // Default bot user
@@ -83,8 +83,9 @@
   20 // Max number of lines to cap getlog request to help prevent flooding
 #define MAX_CONFIG_SIZE                                                        \
   (1024 * 1024) // Limit config file size to 1MB to provent OOM
-#define MAX_HUB_KEY_SIZE                                                       \
-  2400 // [NEW] Increased to allow Base64 encoding of PEM keys
+#define MAX_HUB_KEY_SIZE  128  // 88 chars base64 + null + headroom (Curve25519)
+#define HUB_KEY_RAW_LEN   64  // 32-byte Ed25519 + 32-byte X25519
+#define COMBINED_KEY_B64  88  // base64 of 64-byte combined key
 
 #define CMD_PING 0x01
 #define CMD_CONFIG_PUSH 0x02
@@ -274,11 +275,8 @@ struct bot_state {
 
   // Hub Management
   char bot_uuid[64];
-  char hub_key[MAX_HUB_KEY_SIZE]; // [UPDATED] Size 8192
+  char hub_key[MAX_HUB_KEY_SIZE]; // 88-char base64 of 64-byte Curve25519 combined key
   char *hub_list[MAX_SERVERS];
-  char hub_key_parts[16][256];     // 16 slots × 256 bytes each
-  uint16_t hub_key_parts_received; // Bitmask
-  uint16_t hub_key_parts_expected;
   int hub_count;
   int hub_fd;
   char current_hub[256]; // Track currently connected hub (ip:port)
@@ -343,6 +341,10 @@ int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
 int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
                            const unsigned char *key, unsigned char *plaintext,
                            unsigned char *tag);
+int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
+                       const unsigned char *salt, size_t salt_len,
+                       const unsigned char *info, size_t info_len,
+                       unsigned char *out, size_t out_len);
 char *base64_encode(const unsigned char *input, int length);
 unsigned char *base64_decode(const char *input, int *out_len);
 void hub_client_init(bot_state_t *state);

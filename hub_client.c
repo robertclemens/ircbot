@@ -4,11 +4,8 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
-#include <openssl/pem.h>
 #include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -20,8 +17,7 @@
 #include <unistd.h>
 
 static hub_auth_state_t auth_state = HUB_AUTH_NONE;
-static unsigned char challenge_received[32];
-static time_t last_pong_sent = 0; // RATE LIMIT PONGS
+static time_t last_pong_sent = 0;
 
 void hub_client_init(bot_state_t *state) {
   state->hub_fd = -1;
@@ -42,101 +38,96 @@ void hub_client_on_connect(bot_state_t *state) {
   }
 }
 
-static int rsa_decrypt_with_bot_privkey(bot_state_t *state,
-                                        const char *b64_priv_key,
-                                        const unsigned char *enc_data,
-                                        int enc_len, unsigned char *out_plain) {
-  if (!b64_priv_key || !enc_data)
-    return -1;
-
-  // Decode BASE64 to get full PEM (with headers)
-  int pem_len = 0;
-  unsigned char *pem_data = base64_decode(b64_priv_key, &pem_len);
-  if (!pem_data) {
-    log_message(L_INFO, state, "[HUB] Base64 decode failed\n");
-    return -1;
+// Decode the 88-char base64 combined key (64 bytes) into separate halves
+static bool hub_key_decode(bot_state_t *state, unsigned char ed_priv[32],
+                           unsigned char x_priv[32]) {
+  int dec_len = 0;
+  unsigned char *dec = base64_decode(state->hub_key, &dec_len);
+  if (!dec || dec_len != HUB_KEY_RAW_LEN) {
+    log_message(L_INFO, state, "[HUB] hub_key is not a valid 64-byte Curve25519 key\n");
+    if (dec) free(dec);
+    return false;
   }
-
-  // Load PEM directly (includes headers)
-  BIO *bio = BIO_new_mem_buf(pem_data, pem_len);
-  EVP_PKEY *priv_key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-  BIO_free(bio);
-  free(pem_data);
-
-  if (!priv_key) {
-    log_message(L_INFO, state, "[HUB] Failed to load private key\n");
-    return -1;
-  }
-
-  // Perform RSA decryption
-  int res = -1;
-  EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv_key, NULL);
-
-  if (ctx) {
-    if (EVP_PKEY_decrypt_init(ctx) > 0) {
-      EVP_PKEY_CTX_set_rsa_padding(ctx, RSA_PKCS1_OAEP_PADDING);
-
-      size_t out_len;
-      if (EVP_PKEY_decrypt(ctx, NULL, &out_len, enc_data, (size_t)enc_len) >
-          0) {
-        if (out_len <= 256) {
-          if (EVP_PKEY_decrypt(ctx, out_plain, &out_len, enc_data,
-                               (size_t)enc_len) > 0) {
-            res = (int)out_len;
-          } else {
-            log_message(L_INFO, state, "[HUB] Decryption failed\n");
-          }
-        }
-      }
-    }
-    EVP_PKEY_CTX_free(ctx);
-  }
-
-  EVP_PKEY_free(priv_key);
-  return res;
+  memcpy(ed_priv, dec,      32);
+  memcpy(x_priv,  dec + 32, 32);
+  memset(dec, 0, 64);
+  free(dec);
+  return true;
 }
 
-static int rsa_sign_with_bot_privkey(bot_state_t *state,
-                                     const char *b64_priv_key,
-                                     const unsigned char *data, int data_len,
-                                     unsigned char *sig_out) {
-  if (!b64_priv_key || !data || !sig_out)
-    return -1;
-  int pem_len = 0;
-  unsigned char *pem_data = base64_decode(b64_priv_key, &pem_len);
-  if (!pem_data) {
-    log_message(L_INFO, state, "[HUB] Base64 decode failed in signing\n");
-    return -1;
+// Sign a 32-byte challenge with the Ed25519 private key; sig_out is 64 bytes
+static bool ed25519_sign_challenge(bot_state_t *state,
+                                   const unsigned char *challenge,
+                                   unsigned char sig_out[64]) {
+  unsigned char ed_priv[32], x_priv[32];
+  if (!hub_key_decode(state, ed_priv, x_priv)) return false;
+  memset(x_priv, 0, 32);
+
+  EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, ed_priv, 32);
+  memset(ed_priv, 0, 32);
+  if (!pk) {
+    log_message(L_INFO, state, "[HUB] Failed to load Ed25519 private key\n");
+    return false;
   }
-  BIO *bio = BIO_new_mem_buf(pem_data, pem_len);
-  EVP_PKEY *priv_key = PEM_read_bio_PrivateKey(bio, NULL, NULL, NULL);
-  BIO_free(bio);
-  free(pem_data);
-  if (!priv_key) {
-    log_message(L_INFO, state,
-                "[HUB] Failed to load private key for signing\n");
-    return -1;
+  EVP_MD_CTX *md = EVP_MD_CTX_new();
+  bool ok = false;
+  size_t siglen = 64;
+  if (md && EVP_DigestSignInit(md, NULL, NULL, NULL, pk) == 1
+         && EVP_DigestSign(md, sig_out, &siglen, challenge, 32) == 1
+         && siglen == 64)
+    ok = true;
+  if (md) EVP_MD_CTX_free(md);
+  EVP_PKEY_free(pk);
+  if (!ok) log_message(L_INFO, state, "[HUB] Ed25519 signing failed\n");
+  return ok;
+}
+
+// Derive session key: X25519(bot_x_priv, hub_eph_pub) → HKDF → session_key
+static bool x25519_derive_session_key(bot_state_t *state,
+                                      const unsigned char hub_eph_pub[32],
+                                      const unsigned char challenge[32],
+                                      unsigned char session_key_out[32]) {
+  unsigned char ed_priv[32], x_priv[32];
+  if (!hub_key_decode(state, ed_priv, x_priv)) return false;
+  memset(ed_priv, 0, 32);
+
+  // X25519 ECDH
+  EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, x_priv, 32);
+  EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, hub_eph_pub, 32);
+  memset(x_priv, 0, 32);
+  bool ok = false;
+  unsigned char shared[32];
+
+  if (priv && peer) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv, NULL);
+    size_t len = 32;
+    if (ctx && EVP_PKEY_derive_init(ctx) == 1
+            && EVP_PKEY_derive_set_peer(ctx, peer) == 1
+            && EVP_PKEY_derive(ctx, shared, &len) == 1
+            && len == 32)
+      ok = true;
+    if (ctx) EVP_PKEY_CTX_free(ctx);
   }
-  EVP_MD_CTX *ctx = EVP_MD_CTX_new();
-  if (!ctx) {
-    EVP_PKEY_free(priv_key);
-    return -1;
+  if (priv) EVP_PKEY_free(priv);
+  if (peer) EVP_PKEY_free(peer);
+  if (!ok) {
+    log_message(L_INFO, state, "[HUB] X25519 derive failed\n");
+    return false;
   }
-  size_t sig_len = 512;
-  int res = -1;
-  if (EVP_DigestSignInit(ctx, NULL, EVP_sha256(), NULL, priv_key) > 0) {
-    if (EVP_DigestSignUpdate(ctx, data, data_len) > 0) {
-      if (EVP_DigestSignFinal(ctx, sig_out, &sig_len) > 0) {
-        res = (int)sig_len;
-      }
-    }
+
+  // HKDF-SHA256: ikm=shared, salt=challenge, info="irchub-bot-session-v1|UUID"
+  unsigned char info[96];
+  int info_len = snprintf((char *)info, sizeof(info),
+                          "irchub-bot-session-v1|%s", state->bot_uuid);
+  int rc = crypto_hkdf_sha256(shared, 32, challenge, 32,
+                               info, (size_t)info_len,
+                               session_key_out, 32);
+  memset(shared, 0, 32);
+  if (rc != 0) {
+    log_message(L_INFO, state, "[HUB] HKDF failed\n");
+    return false;
   }
-  EVP_MD_CTX_free(ctx);
-  EVP_PKEY_free(priv_key);
-  if (res < 0) {
-    log_message(L_INFO, state, "[HUB] Signature calculation failed\n");
-  }
-  return res;
+  return true;
 }
 
 void hub_client_disconnect(bot_state_t *state) {
@@ -926,13 +917,13 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
                   "[HUB] Received new private key from hub (%d bytes)\n",
                   payload_len);
 
-      // Update the hub_key in memory
-      if (payload_len < MAX_HUB_KEY_SIZE) {
+      // Validate: must be exactly COMBINED_KEY_B64 chars (Curve25519 key)
+      if (payload_len == COMBINED_KEY_B64) {
         memset(state->hub_key, 0, sizeof(state->hub_key));
         memcpy(state->hub_key, payload, payload_len);
         state->hub_key[payload_len] = '\0';
 
-        log_message(L_INFO, state, "[HUB] Updated hub private key in memory\n");
+        log_message(L_INFO, state, "[HUB] Updated Curve25519 key in memory\n");
 
         // Save the new key to config file immediately
         if (strlen(state->startup_password) > 0) {
@@ -948,8 +939,8 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         }
       } else {
         log_message(L_INFO, state,
-                    "[HUB] ERROR: New key too large (%d bytes, max %d)\n",
-                    payload_len, MAX_HUB_KEY_SIZE);
+                    "[HUB] ERROR: New key wrong length (%d, need %d chars)\n",
+                    payload_len, COMBINED_KEY_B64);
       }
     }
     break;
@@ -1076,14 +1067,13 @@ void hub_client_connect(bot_state_t *state) {
     return;
   }
 
-  // RSA-2048 private key in base64 PEM format should be ~1600-1800 chars
+  // Curve25519 combined key is exactly 88 chars base64
   size_t key_len = strlen(state->hub_key);
-  if (key_len < 1400 || key_len > 2300) {
+  if (key_len != COMBINED_KEY_B64) {
     log_message(L_INFO, state,
-                "[HUB] Cannot connect: Hub key length suspicious (%zu chars). "
-                "Expected 1400-2300. Key may be truncated/corrupted. Use "
-                "'sethubkey' multipart mode.\n",
-                key_len);
+                "[HUB] Cannot connect: Hub key length wrong (%zu chars, need %d). "
+                "Use 'sethubkey <88-char-base64>' to set a Curve25519 key.\n",
+                key_len, COMBINED_KEY_B64);
     state->last_hub_connect_attempt = time(NULL) + 3600;
     return;
   }
@@ -1230,52 +1220,62 @@ void hub_client_process(bot_state_t *state) {
   }
   if (!state->hub_authenticated) {
     if (auth_state == HUB_AUTH_SENT_UUID) {
-      unsigned char challenge[32];
-      if (rsa_decrypt_with_bot_privkey(state, state->hub_key, packet_body,
-                                       packet_len, challenge) == 32) {
-        memcpy(challenge_received, challenge, 32);
-        unsigned char signature[512];
-        int sig_len = rsa_sign_with_bot_privkey(state, state->hub_key,
-                                                challenge, 32, signature);
-        if (sig_len > 0 && sig_len <= 512) {
-          unsigned char sig_frame[4 + 512];
-          uint32_t sig_net_len = htonl(sig_len);
-          memcpy(sig_frame, &sig_net_len, 4);
-          memcpy(sig_frame + 4, signature, sig_len);
-          if (send(state->hub_fd, sig_frame, 4 + sig_len, 0) == 4 + sig_len) {
-            auth_state = HUB_AUTH_SENT_SIGNATURE;
-            log_message(L_INFO, state, "[HUB] Signature sent.\n");
-          } else {
-            log_message(L_INFO, state, "[HUB] Failed to send signature\n");
-            free(packet_body);
-            hub_client_disconnect(state);
-            return;
-          }
-        } else {
-          log_message(L_INFO, state,
-                      "[HUB] Failed to sign challenge (Key mismatch?)\n");
-          free(packet_body);
-          hub_client_disconnect(state);
-          return;
-        }
-      } else {
+      // Hub sends exactly 64 bytes: challenge_32 || hub_eph_pub_32
+      if (packet_len != 64) {
         log_message(L_INFO, state,
-                    "[HUB] Failed to decrypt challenge (Incorrect Key?)\n");
+                    "[HUB] Expected 64-byte challenge packet, got %d bytes\n",
+                    packet_len);
+        free(packet_body);
+        hub_client_disconnect(state);
+        return;
+      }
+      const unsigned char *challenge   = packet_body;
+      const unsigned char *hub_eph_pub = packet_body + 32;
+
+      // Derive session key from X25519 + HKDF before signing
+      unsigned char session_key[32];
+      if (!x25519_derive_session_key(state, hub_eph_pub, challenge, session_key)) {
+        log_message(L_INFO, state, "[HUB] Failed to derive session key\n");
+        free(packet_body);
+        hub_client_disconnect(state);
+        return;
+      }
+      memcpy(state->hub_session_key, session_key, 32);
+      memset(session_key, 0, 32);
+
+      // Sign the challenge with Ed25519
+      unsigned char sig[64];
+      if (!ed25519_sign_challenge(state, challenge, sig)) {
+        log_message(L_INFO, state, "[HUB] Failed to sign challenge\n");
+        free(packet_body);
+        hub_client_disconnect(state);
+        return;
+      }
+
+      // Send 64-byte signature, length-framed
+      unsigned char sig_frame[4 + 64];
+      uint32_t sig_net_len = htonl(64);
+      memcpy(sig_frame, &sig_net_len, 4);
+      memcpy(sig_frame + 4, sig, 64);
+      if (send(state->hub_fd, sig_frame, 4 + 64, 0) == 4 + 64) {
+        auth_state = HUB_AUTH_SENT_SIGNATURE;
+        log_message(L_INFO, state, "[HUB] Ed25519 signature sent.\n");
+      } else {
+        log_message(L_INFO, state, "[HUB] Failed to send signature\n");
         free(packet_body);
         hub_client_disconnect(state);
         return;
       }
     } else if (auth_state == HUB_AUTH_SENT_SIGNATURE) {
-      unsigned char session_key[32];
-      if (rsa_decrypt_with_bot_privkey(state, state->hub_key, packet_body,
-                                       packet_len, session_key) == 32) {
-        memcpy(state->hub_session_key, session_key, 32);
+      // Hub sends a 1-byte ACK (0x01) — session_key already set in previous phase
+      if (packet_len == 1 && packet_body[0] == 0x01) {
         state->hub_authenticated = true;
         auth_state = HUB_AUTH_COMPLETE;
         state->last_hub_activity = time(NULL);
-        log_message(L_INFO, state, "[HUB] Authenticated!\n");
+        log_message(L_INFO, state, "[HUB] Authenticated (Curve25519)!\n");
         hub_client_push_config(state);
       } else {
+        log_message(L_INFO, state, "[HUB] Bad ACK from hub (len=%d)\n", packet_len);
         free(packet_body);
         hub_client_disconnect(state);
         return;

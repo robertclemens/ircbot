@@ -2,9 +2,29 @@
 #include <openssl/rand.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#include <openssl/kdf.h>
 #include <string.h>
 
 #include "bot.h"
+
+int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
+                       const unsigned char *salt, size_t salt_len,
+                       const unsigned char *info, size_t info_len,
+                       unsigned char *out, size_t out_len) {
+    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+    if (!ctx) return -1;
+    size_t outlen = out_len;
+    int ok = (EVP_PKEY_derive_init(ctx) == 1
+           && EVP_PKEY_CTX_set_hkdf_md(ctx, EVP_sha256()) == 1
+           && EVP_PKEY_CTX_set1_hkdf_salt(ctx, salt, (int)salt_len) == 1
+           && EVP_PKEY_CTX_set1_hkdf_key(ctx, ikm, (int)ikm_len) == 1
+           && EVP_PKEY_CTX_add1_hkdf_info(ctx, info, (int)info_len) == 1
+           && EVP_PKEY_derive(ctx, out, &outlen) == 1
+           && outlen == out_len);
+    EVP_PKEY_CTX_free(ctx);
+    if (!ok) memset(out, 0, out_len);
+    return ok ? 0 : -1;
+}
 
 int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
                            const unsigned char *key, unsigned char *output_buffer,

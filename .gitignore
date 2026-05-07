@@ -11,5 +11,7 @@ decrypt_tool
 .ircbot.log
 .ircbot.pid
 .ircbot.pass
+*.b64
 
 .claude
+docs

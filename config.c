@@ -276,9 +276,20 @@ bool config_load(bot_state_t *state, const char *password,
         }
         break;
 
-      case 'k': // Hub public key (bot-specific)
-        snprintf(state->hub_key, sizeof(state->hub_key), "%s", data);
+      case 'k': { // Hub key (Curve25519 combined: Ed25519 + X25519)
+        int dec_len = 0;
+        unsigned char *dec = base64_decode(data, &dec_len);
+        if (dec && dec_len == 64) {
+          snprintf(state->hub_key, sizeof(state->hub_key), "%s", data);
+        } else {
+          log_message(L_INFO, state,
+                      "[CFG] Hub key in config is not a valid 64-byte "
+                      "Curve25519 key (legacy RSA?). Run 'sethubkey' "
+                      "with a new Curve25519 key from the hub admin.\n");
+        }
+        if (dec) free(dec);
         break;
+      }
 
       case 'i': // Bot UUID (bot-specific)
         snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", data);

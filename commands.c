@@ -936,138 +936,48 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     } else if (strcasecmp(command, "sethubkey") == 0) {
       if (!arg1) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: sethubkey N/TOTAL:data or RESET\r\n",
+                   "PRIVMSG %s :Syntax: sethubkey <88-char-base64-Curve25519-key>\r\n",
                    nick);
-      } else if (strcasecmp(arg1, "RESET") == 0) {
-        memset(state->hub_key_parts, 0, sizeof(state->hub_key_parts));
-        state->hub_key_parts_received = 0;
-        state->hub_key_parts_expected = 0;
-        state->hub_key[0] = '\0';
-        irc_printf(state, "PRIVMSG %s :Multi-part buffer cleared.\r\n", nick);
       } else {
-        char *slash = strchr(arg1, '/');
-        char *colon = strchr(arg1, ':');
-
-        if (slash && colon && slash < colon) {
-          // Multi-part mode
-          int part_num = atoi(arg1);
-          int total_parts = atoi(slash + 1);
-          char *data = colon + 1;
-
-          if (part_num >= 1 && part_num <= 16 && total_parts >= 1 &&
-              total_parts <= 16) {
-            if (state->hub_key_parts_expected == 0) {
-              state->hub_key_parts_expected = total_parts;
-            }
-
-            int idx = part_num - 1;
-            snprintf(state->hub_key_parts[idx], sizeof(state->hub_key_parts[idx]),
-                     "%s", data);
-            state->hub_key_parts_received |= (1 << idx);
-
-            uint16_t expected_mask = (1 << total_parts) - 1;
-
-            if ((state->hub_key_parts_received & expected_mask) ==
-                expected_mask) {
-              // All parts received - assemble
-              state->hub_key[0] = '\0';
-              for (int i = 0; i < total_parts; i++) {
-                strncat(state->hub_key, state->hub_key_parts[i],
-                        sizeof(state->hub_key) - strlen(state->hub_key) - 1);
-              }
-
-              // Validate: Decode base64 and check for PEM headers
-              int pem_len = 0;
-              unsigned char *pem_data = base64_decode(state->hub_key, &pem_len);
-
-              if (pem_data && pem_len > 0) {
-                // Check if it contains PEM header
-                bool valid_pem =
-                    (memmem(pem_data, pem_len, "-----BEGIN PRIVATE KEY-----",
-                            27) != NULL ||
-                     memmem(pem_data, pem_len,
-                            "-----BEGIN RSA PRIVATE KEY-----", 31) != NULL);
-
-                if (valid_pem) {
-                  // Valid! Save and reconnect
-                  state->hub_key_parts_received = 0;
-                  state->hub_key_parts_expected = 0;
-                  memset(state->hub_key_parts, 0, sizeof(state->hub_key_parts));
-
-                  config_write(state, state->startup_password);
-                  irc_printf(state,
-                             "PRIVMSG %s :✓ Complete! Valid PEM key received "
-                             "(%d bytes). Reconnecting...\r\n",
-                             nick, pem_len);
-
-                  free(pem_data);
-
-                  if (state->hub_fd != -1) {
-                    close(state->hub_fd);
-                    state->hub_fd = -1;
-                  }
-                  state->last_hub_connect_attempt = 0;
-                  hub_client_connect(state);
-                } else {
-                  irc_printf(state,
-                             "PRIVMSG %s :ERROR: Decoded data is not a valid "
-                             "PEM private key. Use RESET.\r\n",
-                             nick);
-                  free(pem_data);
-                }
-              } else {
-                irc_printf(state,
-                           "PRIVMSG %s :ERROR: Invalid base64 encoding. Use "
-                           "RESET and try again.\r\n",
-                           nick);
-                if (pem_data)
-                  free(pem_data);
-              }
-            } else {
-              // Still waiting for more parts
-              int received_count = 0;
-              for (int i = 0; i < total_parts; i++) {
-                if (state->hub_key_parts_received & (1 << i))
-                  received_count++;
-              }
-              irc_printf(
-                  state,
-                  "PRIVMSG %s :Part %d/%d received (%d/%d complete).\r\n", nick,
-                  part_num, total_parts, received_count, total_parts);
-            }
-          } else {
-            irc_printf(state,
-                       "PRIVMSG %s :ERROR: Invalid part number or total. Must "
-                       "be 1-16.\r\n",
-                       nick);
-          }
+        // Reject legacy multipart syntax
+        if (strchr(arg1, '/') && strchr(arg1, ':')) {
+          irc_printf(state,
+                     "PRIVMSG %s :ERROR: Multipart keys no longer needed. "
+                     "Curve25519 keys fit in one IRC message (88 chars).\r\n",
+                     nick);
         } else {
-          // Single-part mode (legacy)
-          // Validate base64 and PEM format
-          int pem_len = 0;
-          unsigned char *pem_data = base64_decode(arg1, &pem_len);
+          // Validate: decode base64 → must be exactly 64 bytes
+          int dec_len = 0;
+          unsigned char *dec = base64_decode(arg1, &dec_len);
 
-          if (pem_data && pem_len > 0) {
-            bool valid_pem =
-                (memmem(pem_data, pem_len, "-----BEGIN PRIVATE KEY-----", 27) !=
-                     NULL ||
-                 memmem(pem_data, pem_len, "-----BEGIN RSA PRIVATE KEY-----",
-                        31) != NULL);
+          if (!dec || dec_len != HUB_KEY_RAW_LEN) {
+            irc_printf(state,
+                       "PRIVMSG %s :ERROR: Invalid key. Need 88-char base64 "
+                       "that decodes to exactly 64 bytes (Curve25519).\r\n",
+                       nick);
+            if (dec) free(dec);
+          } else {
+            // Validate Ed25519 and X25519 halves can be loaded
+            EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
+            EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
+            memset(dec, 0, 64);
+            free(dec);
 
-            if (valid_pem) {
+            if (!ep || !xp) {
+              irc_printf(state,
+                         "PRIVMSG %s :ERROR: Invalid Curve25519 key material.\r\n",
+                         nick);
+              if (ep) EVP_PKEY_free(ep);
+              if (xp) EVP_PKEY_free(xp);
+            } else {
+              EVP_PKEY_free(ep);
+              EVP_PKEY_free(xp);
+
               snprintf(state->hub_key, sizeof(state->hub_key), "%s", arg1);
-
-              memset(state->hub_key_parts, 0, sizeof(state->hub_key_parts));
-              state->hub_key_parts_received = 0;
-              state->hub_key_parts_expected = 0;
-
               config_write(state, state->startup_password);
               irc_printf(state,
-                         "PRIVMSG %s :✓ Valid PEM key set (%d bytes). "
-                         "Reconnecting...\r\n",
-                         nick, pem_len);
-
-              free(pem_data);
+                         "PRIVMSG %s :✓ Curve25519 key set. Reconnecting...\r\n",
+                         nick);
 
               if (state->hub_fd != -1) {
                 close(state->hub_fd);
@@ -1075,17 +985,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
               }
               state->last_hub_connect_attempt = 0;
               hub_client_connect(state);
-            } else {
-              irc_printf(state,
-                         "PRIVMSG %s :ERROR: Not a valid PEM private key.\r\n",
-                         nick);
-              free(pem_data);
             }
-          } else {
-            irc_printf(state, "PRIVMSG %s :ERROR: Invalid base64 encoding.\r\n",
-                       nick);
-            if (pem_data)
-              free(pem_data);
           }
         }
       }
@@ -1281,7 +1181,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         } else if (strcasecmp(arg1, "sethubkey") == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Syntax: sethubkey <key> - Set the Identity Key.\r\n",
+              "PRIVMSG %s :Syntax: sethubkey <88-char-b64> - Set Curve25519 key from hub admin.\r\n",
               nick);
         } else if (strcasecmp(arg1, "setuuid") == 0) {
           irc_printf(state,
