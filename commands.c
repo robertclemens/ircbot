@@ -26,23 +26,6 @@
 //   return decoded_len;
 // }
 #ifndef _GNU_SOURCE
-static void *memmem(const void *haystack, size_t haystacklen,
-                    const void *needle, size_t needlelen) {
-  if (needlelen == 0)
-    return (void *)haystack;
-  if (haystacklen < needlelen)
-    return NULL;
-
-  const unsigned char *h = (const unsigned char *)haystack;
-  const unsigned char *n = (const unsigned char *)needle;
-
-  for (size_t i = 0; i <= haystacklen - needlelen; i++) {
-    if (memcmp(h + i, n, needlelen) == 0) {
-      return (void *)(h + i);
-    }
-  }
-  return NULL;
-}
 #endif
 
 void commands_handle_private_message(bot_state_t *state, const char *nick,
