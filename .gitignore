@@ -3,6 +3,7 @@
 ircbot
 config_tool
 decrypt_tool
+bot_config_gen*
 
 # Logs and configs
 *.log
