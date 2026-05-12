@@ -13,6 +13,16 @@
 #include "bot.h"
 
 void irc_disconnect(bot_state_t *state) {
+  // Send QUIT first so the server removes the nick immediately.
+  // Without this, NAT holds the TCP state and the nick ghosts until ping-timeout.
+  if ((state->status & S_CONNECTED) && state->server_fd != -1) {
+    const char *quit_msg = "QUIT :bye\r\n";
+    if (state->is_ssl && state->ssl) {
+      SSL_write(state->ssl, quit_msg, strlen(quit_msg));
+    } else {
+      send(state->server_fd, quit_msg, strlen(quit_msg), MSG_NOSIGNAL);
+    }
+  }
   if (state->is_ssl && state->ssl) {
     SSL_shutdown(state->ssl);
     SSL_free(state->ssl);
@@ -273,6 +283,7 @@ void irc_handle_read(bot_state_t *state) {
 
   buffer_len += (int)bytes_read;
   read_buffer[buffer_len] = '\0';
+  state->last_pong_time = time(NULL);
 
   char *line_start = read_buffer;
   char *line_end;

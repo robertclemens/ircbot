@@ -27,6 +27,8 @@ static void state_init(bot_state_t *state) {
   state->log_type = DEFAULT_LOG_LEVEL;
   state->last_pong_time = time(NULL);
   state->nick_release_time = time(NULL) - NICK_TAKE_TIME;
+  state->actual_hostname_ts = 0;
+  state->current_nick_ts = time(NULL);
   state->server_fd = -1;
   state->server_count = 0;
   state->mask_count = 0;
@@ -639,6 +641,20 @@ int main(int argc, char *argv[]) {
     return 1;
   }
   if (flock(pid_fd, LOCK_EX | LOCK_NB) == -1) {
+    /* Read existing PID to report the conflict clearly */
+    char existing[16] = "";
+    if (read(pid_fd, existing, sizeof(existing) - 1) > 0) {
+      existing[strcspn(existing, "\n")] = '\0';
+      fprintf(stderr, "Already running (pid %s) — %s\n", existing, PID_FILE);
+    } else {
+      fprintf(stderr, "Already running — %s locked\n", PID_FILE);
+    }
+    close(pid_fd);
+    memset(startup_password, 0, sizeof(startup_password));
+    return 1;
+  }
+  /* Truncate then write so no stale bytes remain if new PID is shorter */
+  if (ftruncate(pid_fd, 0) < 0) {
     close(pid_fd);
     memset(startup_password, 0, sizeof(startup_password));
     return 1;

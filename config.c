@@ -319,14 +319,6 @@ bool config_load(bot_state_t *state, const char *password,
                 "or Ident).\n");
     return false;
   }
-  // Validation
-  // if (state->target_nick[0] == '\0' || state->user[0] == '\0' ||
-  // state->gecos[0] == '\0' ||
-  //       state->bot_pass[0] == '\0' || state->mask_count == 0 ||
-  //        state->server_count == 0 || state->chan_count == 0) {
-  //        log_message(L_INFO, state, "[CFG] Config file is missing required
-  //        fields.\n"); return false;
-  //    }
   return true;
 }
 

@@ -4,6 +4,58 @@
 
 #include "bot.h"
 
+// Look up the hub UUID for a roster entry whose IRC nick may carry trailing '_'
+// suffixes from nick collisions.  Tries exact hostmask match first, then exact
+// nick-prefix match, then base-nick match (strips trailing '_' from both sides).
+// Returns true and populates uuid_out if a match is found.
+static bool find_uuid_for_helper(const bot_state_t *state,
+                                  const roster_entry_t *helper,
+                                  char *uuid_out, size_t uuid_len) {
+  for (int tb = 0; tb < state->trusted_bot_count; tb++) {
+    char mask[MAX_MASK_LEN], uuid[64];
+    if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]", mask, uuid) < 2)
+      continue;
+
+    // 1. Exact hostmask match
+    if (strcasecmp(mask, helper->hostmask) == 0) {
+      snprintf(uuid_out, uuid_len, "%s", uuid);
+      return true;
+    }
+
+    // 2. Nick-prefix match: stored entry starts with "helper_nick!"
+    char pfx[MAX_NICK + 1];
+    snprintf(pfx, sizeof(pfx), "%s!", helper->nick);
+    if (strncasecmp(mask, pfx, strlen(pfx)) == 0) {
+      snprintf(uuid_out, uuid_len, "%s", uuid);
+      return true;
+    }
+
+    // 3. Base-nick match: strip trailing '_' from both nicks and compare.
+    // Handles ghost "bot6" matching stored "bot6_!~ircbot@..." and vice-versa.
+    char stored_nick[MAX_NICK] = "";
+    const char *bang = strchr(mask, '!');
+    if (bang) {
+      size_t n = (size_t)(bang - mask);
+      if (n >= MAX_NICK) n = MAX_NICK - 1;
+      memcpy(stored_nick, mask, n);
+      stored_nick[n] = '\0';
+    }
+    // Strip trailing underscores
+    char base_stored[MAX_NICK], base_helper[MAX_NICK];
+    snprintf(base_stored, sizeof(base_stored), "%s", stored_nick);
+    snprintf(base_helper, sizeof(base_helper), "%s", helper->nick);
+    size_t ls = strlen(base_stored), lh = strlen(base_helper);
+    while (ls > 0 && base_stored[ls - 1] == '_') base_stored[--ls] = '\0';
+    while (lh > 0 && base_helper[lh - 1] == '_') base_helper[--lh] = '\0';
+
+    if (ls > 0 && strcasecmp(base_stored, base_helper) == 0) {
+      snprintf(uuid_out, uuid_len, "%s", uuid);
+      return true;
+    }
+  }
+  return false;
+}
+
 // [UPDATED] Helper to handle mode changes securely + immediate Op Recovery
 static void channel_handle_mode_change(bot_state_t *state, const char *channel,
                                        const char *modes, char *args) {
@@ -32,6 +84,7 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
         if (mode == 'o') {
           // Check if it affects US
           if (strcasecmp(current_arg, state->current_nick) == 0) {
+            c->i_am_opped = adding;
             for (int k = 0; k < c->roster_count; k++) {
               if (strcasecmp(c->roster[k].nick, state->current_nick) == 0) {
                 c->roster[k].is_op = adding;
@@ -40,6 +93,7 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
             }
             if (adding) {
               c->op_request_pending = false;
+              c->op_request_retry_count = 0;
               log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
             } else {
               // [RESTORED] Immediate Op Recovery Logic
@@ -79,25 +133,10 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
 
                   // Try hub first - look up UUID for this helper
                   bool sent_via_hub = false;
-                  for (int tb = 0;
-                       tb < state->trusted_bot_count && !sent_via_hub; tb++) {
-                    char mask[MAX_MASK_LEN];
+                  {
                     char uuid[64];
-                    // Format: hostmask|uuid|timestamp
-                    if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]",
-                               mask, uuid) >= 2) {
-                      // Check if this trusted_bot entry matches our helper
-                      // Simple prefix match on hostmask
-                      char helper_check[MAX_MASK_LEN];
-                      snprintf(helper_check, sizeof(helper_check), "%s!",
-                               chosen_helper->nick);
-                      if (strncasecmp(state->trusted_bots[tb], helper_check,
-                                      strlen(helper_check)) == 0 ||
-                          strcasecmp(mask, chosen_helper->hostmask) == 0) {
-                        // Found matching UUID, try hub
-                        sent_via_hub =
-                            hub_client_request_op(state, uuid, c->name);
-                      }
+                    if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
+                      sent_via_hub = hub_client_request_op(state, uuid, c->name);
                     }
                   }
 
@@ -230,6 +269,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       if (strchr(last_token, '!') && strchr(last_token, '@')) {
         snprintf(state->actual_hostname, sizeof(state->actual_hostname),
                  "%s", last_token);
+        state->actual_hostname_ts = time(NULL);
         log_message(L_INFO, state, "[INFO] Discovered my hostmask: %s\n",
                     state->actual_hostname);
 
@@ -311,12 +351,16 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *nick = strtok_r(NULL, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
 
-    if (nick && ident && host && modes) {
+      if (nick && ident && host && modes) {
       roster_entry_t *entry = &c->roster[c->roster_count];
       snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
       snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
       entry->is_op = (strstr(modes, "@") != NULL);
       c->roster_count++;
+      
+      if (entry->is_op && strcasecmp(nick, state->current_nick) == 0) {
+        c->i_am_opped = true;
+      }
     }
   } else if (strcmp(command, "396") == 0) {
     char *hostname = strtok_r(params, " ", &saveptr_irc); // Nick
@@ -326,6 +370,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       // [UPDATED] Reconstruct full hostmask: Nick!User@NewHost
       snprintf(state->actual_hostname, sizeof(state->actual_hostname),
                "%s!%s@%s", state->current_nick, state->user, hostname);
+      state->actual_hostname_ts = time(NULL);
 
       log_message(L_INFO, state, "[INFO] My visible host is now: %s\n",
                   state->actual_hostname);
@@ -356,23 +401,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
                   state->trusted_bots[i]);
     }
 
-    bool am_i_opped = false;
-    for (int i = 0; i < c->roster_count; i++) {
-      if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
-          c->roster[i].is_op) {
-        am_i_opped = true;
-        break;
-      }
-    }
-
-    if (am_i_opped) {
-      if (c->op_request_pending) {
-        log_message(L_INFO, state,
-                    "[INFO] We have ops in %s now. Clearing request.\n",
-                    c->name);
-        c->op_request_pending = false;
-        c->op_request_retry_count = 0;
-      }
+    if (c->i_am_opped) {
+      c->op_request_pending = false;
+      c->op_request_retry_count = 0;
       return;
     }
 
@@ -428,31 +459,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
       log_message(L_DEBUG, state,
                   "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
                   chosen_helper->nick, chosen_helper->hostmask);
-      for (int tb = 0; tb < state->trusted_bot_count && !sent_via_hub; tb++) {
-        char mask[MAX_MASK_LEN];
+      {
         char uuid[64];
-        // Format: hostmask|uuid|timestamp
-        if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]", mask, uuid) >=
-            2) {
-          // Check if this trusted_bot entry matches our helper
-          char helper_check[MAX_MASK_LEN];
-          snprintf(helper_check, sizeof(helper_check), "%s!",
-                   chosen_helper->nick);
-          bool nick_match = strncasecmp(state->trusted_bots[tb], helper_check,
-                                        strlen(helper_check)) == 0;
-          bool mask_match = strcasecmp(mask, chosen_helper->hostmask) == 0;
+        if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
+          log_message(L_DEBUG, state, "[OP-REQ] Found UUID, trying hub request\n");
+          sent_via_hub = hub_client_request_op(state, uuid, c->name);
           log_message(L_DEBUG, state,
-                      "[OP-REQ] Check trusted_bots[%d]: mask='%s' uuid='%s' nick_match=%d mask_match=%d\n",
-                      tb, mask, uuid, nick_match, mask_match);
-          if (nick_match || mask_match) {
-            // Found matching UUID, try hub
-            log_message(L_DEBUG, state,
-                        "[OP-REQ] Found UUID match, trying hub request\n");
-            sent_via_hub = hub_client_request_op(state, uuid, c->name);
-            log_message(L_DEBUG, state,
-                        "[OP-REQ] hub_client_request_op returned: %d\n",
-                        sent_via_hub);
-          }
+                      "[OP-REQ] hub_client_request_op returned: %d\n", sent_via_hub);
         }
       }
 
@@ -467,12 +480,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
       c->op_request_retry_count++;
     } else {
       log_message(L_DEBUG, state,
-                  "[OP-REQ] No trusted ops found in roster. "
-                  "trusted_bot_count=%d, roster_count=%d (attempt %d)\n",
-                  state->trusted_bot_count, c->roster_count,
-                  c->op_request_retry_count + 1);
-      c->last_op_request_time = now;
-      c->op_request_retry_count++;
+                  "[OP-REQ] No trusted ops in roster. "
+                  "trusted_bot_count=%d, roster_count=%d\n",
+                  state->trusted_bot_count, c->roster_count);
+      // Don't burn retry_count — no helper present yet isn't a failed attempt.
+      // Set pending with a 30-second back-date so channel_manager retries
+      // via WHO in ~30 seconds (the 60-second timeout fires after 30 more).
+      c->op_request_pending = true;
+      c->last_op_request_time = now - 30;
     }
   } else if (strcmp(command, "PRIVMSG") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
@@ -510,6 +525,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       if (c) {
         c->status = C_IN;
         c->roster_count = 0;
+        c->i_am_opped = false;
         snprintf(state->who_request_channel, sizeof(state->who_request_channel),
                  "%s", c->name);
         c->last_who_request = time(NULL);
@@ -528,6 +544,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       if (c) {
         c->status = C_OUT;
         c->roster_count = 0;
+        c->i_am_opped = false;
         log_message(L_DEBUG, state, "[IRC] Parted channel %s\n", chan_name);
       }
     }
@@ -542,6 +559,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_OUT;
+        c->i_am_opped = false;
       }
     }
   } else if (strcmp(command, "NICK") == 0 && prefix) {
@@ -550,6 +568,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (old_nick && new_nick &&
         strcasecmp(old_nick, state->current_nick) == 0) {
       snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);
+      state->current_nick_ts = time(NULL);
+
+      /* Push nick change as a targeted delta immediately. */
+      if (state->hub_connected && state->hub_authenticated) {
+        hub_client_push_delta(state, "n", state->current_nick,
+                              state->current_nick_ts);
+      }
 
       char *at = strchr(state->actual_hostname, '@');
       if (at) {
@@ -558,6 +583,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
         snprintf(state->actual_hostname, sizeof(state->actual_hostname),
                  "%s!%s@%s", state->current_nick, state->user, host);
+        state->actual_hostname_ts = time(NULL);
 
         if (state->hub_connected && state->hub_authenticated) {
           hub_client_sync_hostmask(state);

@@ -29,7 +29,7 @@
 #define CONFIG_FILE ".ircbot.cnf" // Config file name
 #define PID_FILE ".ircbot.pid"    // PID file name
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
-#define DEFAULT_LOG_LEVEL 0  // Set the default log level. 0=none
+#define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
 #define BOT_UPDATE_URL                                                         \
   "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
@@ -63,7 +63,7 @@
 #define MAX_KEY 31   // Max length for a channel key
 #define MAX_MASK_LEN 256    // Max usermask length
 #define MAX_OP_MASKS 20     // Max number of operators
-#define MAX_TRUSTED_BOTS 20 // Max number of trusted bots
+#define MAX_TRUSTED_BOTS 200 // Max number of trusted bots
 #define MAX_ROSTER_SIZE                                                        \
   50 // Max channel roster size to store. Increase if in very large channels.
 #define MAX_SEEN_HASHES                                                        \
@@ -117,6 +117,7 @@
 #define CMD_ADMIN_DISCONNECT_BOT 0x21 // Force disconnect bot
 #define CMD_ADMIN_BOT_STATUS 0x22     // Get bot connection info
 #define CMD_BOT_KEY_UPDATE 0x40       // Hub -> Bot: New private key update
+#define CMD_BOT_DELTA      0x45       // Bot -> Hub: single-key delta (mesh.md Phase 4)
 
 // Global Config Management Commands
 #define CMD_ADMIN_LIST_CHANNELS 0x23  // List all channels
@@ -215,6 +216,7 @@ struct chan_t {
   roster_entry_t roster[MAX_ROSTER_SIZE];
   int roster_count;
   time_t last_join_attempt;
+  bool i_am_opped;
   bool op_request_pending;
   time_t last_op_request_time;
   int op_request_retry_count;
@@ -237,6 +239,8 @@ struct bot_state {
   char *server_list[MAX_SERVERS + 1];
   char actual_server_name[256];
   char actual_hostname[MAX_MASK_LEN];
+  time_t actual_hostname_ts;
+  time_t current_nick_ts;
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
@@ -352,6 +356,8 @@ void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
 void hub_client_promote_local_config(bot_state_t *state);
 void hub_client_push_config(bot_state_t *state);
+void hub_client_push_delta(bot_state_t *state, const char *key,
+                           const char *value, time_t ts);
 void hub_client_push_channel(bot_state_t *state, chan_t *chan);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);

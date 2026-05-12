@@ -172,21 +172,53 @@ void hub_client_heartbeat(bot_state_t *state) {
 }
 
 void hub_client_sync_hostmask(bot_state_t *state) {
-  // Don't sync if we don't have a hostmask yet
-  if (state->actual_hostname[0] == '\0') {
-    return;
-  }
-  // Don't sync if not hub-managed
+  if (state->actual_hostname[0] == '\0') return;
   if (state->hub_count == 0 || state->hub_fd == -1 ||
-      !state->hub_authenticated) {
-    return;
-  }
-
-  log_message(L_DEBUG, state, "[DEBUG] Syncing hostmask to hub: %s\n",
+      !state->hub_authenticated) return;
+  log_message(L_DEBUG, state, "[DEBUG] Syncing hostmask via delta: %s\n",
               state->actual_hostname);
+  hub_client_push_delta(state, "h", state->actual_hostname,
+                        state->actual_hostname_ts);
+}
 
-  // Use standard config push which includes 'h' lines
-  hub_client_push_config(state);
+/* Push a single key=value change to the hub via CMD_BOT_DELTA.
+ * This is a targeted update that the hub fans out as one DELTA per peer,
+ * instead of the full config push which fans out ~50 lines.  Falls back to
+ * hub_client_push_config if ts == 0 or key is empty. */
+void hub_client_push_delta(bot_state_t *state, const char *key,
+                           const char *value, time_t ts) {
+  if (!key || key[0] == '\0') return;
+  if (state->hub_count == 0 || state->hub_fd == -1 ||
+      !state->hub_authenticated) return;
+
+  char payload[MAX_BUFFER];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%ld",
+                         key, value ? value : "", (long)(ts ? ts : time(NULL)));
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
+
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_BOT_DELTA;
+  uint32_t inner_len = htonl(pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    memcpy(cipher, &net_len, 4);
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
+      log_message(L_DEBUG, state, "[HUB] Delta pushed: %s=%s ts=%ld\n",
+                  key, value ? value : "", (long)ts);
+    } else {
+      log_message(L_INFO, state, "[HUB] Delta push failed, falling back\n");
+      hub_client_disconnect(state);
+    }
+  }
 }
 
 /**
@@ -260,19 +292,20 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     }
   }
 
-  // Hostmask
-  if (state->actual_hostname[0] != '\0') {
+  // Hostmask — use the timestamp captured when actual_hostname last changed;
+  // never use time(NULL) here or every push looks like new data to the hub.
+  if (state->actual_hostname[0] != '\0' && state->actual_hostname_ts > 0) {
     written = snprintf(buffer + offset, max_len - offset, "h|%s|%ld\n",
-                       state->actual_hostname, (long)time(NULL));
+                       state->actual_hostname, (long)state->actual_hostname_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
     }
   }
 
-  // Nick
-  if (state->current_nick[0] != '\0') {
+  // Nick — same stable-timestamp rule.
+  if (state->current_nick[0] != '\0' && state->current_nick_ts > 0) {
     written = snprintf(buffer + offset, max_len - offset, "n|%s|%ld\n",
-                       state->current_nick, (long)time(NULL));
+                       state->current_nick, (long)state->current_nick_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
     }
@@ -756,7 +789,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
 
     case 'b': // Bot line: b|hostmask|uuid|timestamp
     {
-      // Format: hostmask|uuid|timestamp
+      // hub_generate_bot_payload sends: b|<hostmask>|<uuid>|<ts>
       char hostmask[MAX_MASK_LEN];
       char uuid[64];
       long ts = 0;
@@ -765,8 +798,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
 
       log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line\n");
 
-      // Parse broadcast format: b|hostmask|uuid|timestamp
-      int parsed = sscanf(data, "%127[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
+      int parsed = sscanf(data, "%255[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
       log_message(L_DEBUG, state,
                   "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%ld\n",
                   parsed, hostmask, uuid, ts);
@@ -775,12 +807,37 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
 
       if (hostmask[0] != '\0') {
-        // Check if already exists (by hostmask only)
+        // Find existing entry: prefer UUID match (handles nick/host changes),
+        // fall back to hostmask match.  Also sweep out any duplicate entries
+        // for the same UUID so stale masks from previous sessions don't linger.
         int existing_idx = -1;
-        for (int i = 0; i < state->trusted_bot_count; i++) {
-          char existing_mask[MAX_MASK_LEN];
-          if (sscanf(state->trusted_bots[i], "%127[^|]", existing_mask) >= 1) {
-            if (strcmp(existing_mask, hostmask) == 0) {
+
+        if (uuid[0] != '\0') {
+          for (int i = 0; i < state->trusted_bot_count; i++) {
+            char ex_uuid[64];
+            if (sscanf(state->trusted_bots[i], "%*[^|]|%63[^|]", ex_uuid) >= 1 &&
+                strcmp(ex_uuid, uuid) == 0) {
+              if (existing_idx == -1) {
+                existing_idx = i; // keep first match
+              } else {
+                // Remove duplicate: shift array down and free
+                free(state->trusted_bots[i]);
+                memmove(&state->trusted_bots[i],
+                        &state->trusted_bots[i + 1],
+                        (state->trusted_bot_count - i - 1) * sizeof(char *));
+                state->trusted_bot_count--;
+                i--;
+              }
+            }
+          }
+        }
+
+        // Fall back to hostmask match if no UUID match found
+        if (existing_idx == -1) {
+          for (int i = 0; i < state->trusted_bot_count; i++) {
+            char ex_mask[MAX_MASK_LEN];
+            if (sscanf(state->trusted_bots[i], "%255[^|]", ex_mask) >= 1 &&
+                strcmp(ex_mask, hostmask) == 0) {
               existing_idx = i;
               break;
             }
@@ -788,27 +845,21 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         }
 
         if (existing_idx != -1) {
-          // Check if update is newer
           long old_ts = 0;
-          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%ld",
-                 &old_ts);
+          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%ld", &old_ts);
           if (ts > old_ts) {
             char full_entry[256];
-            snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask,
-                     uuid, ts);
+            snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid, ts);
             char *new_entry = strdup(full_entry);
             if (!new_entry) break;
             free(state->trusted_bots[existing_idx]);
             state->trusted_bots[existing_idx] = new_entry;
             updates++;
-            log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n",
-                        hostmask);
+            log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n", hostmask);
           }
         } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          // New Add
           char full_entry[256];
-          snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid,
-                   ts);
+          snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid, ts);
           char *new_entry = strdup(full_entry);
           if (!new_entry) break;
           state->trusted_bots[state->trusted_bot_count++] = new_entry;
@@ -971,16 +1022,7 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       // Check if we're in that channel and have ops
       chan_t *c = channel_find(state, channel);
       if (c && c->status == C_IN) {
-        bool am_i_opped = false;
-        for (int i = 0; i < c->roster_count; i++) {
-          if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
-              c->roster[i].is_op) {
-            am_i_opped = true;
-            break;
-          }
-        }
-
-        if (am_i_opped) {
+        if (c->i_am_opped) {
           log_message(L_INFO, state,
                       "[HUB] Granting ops to %s in %s (hub request)\n", nick,
                       channel);
@@ -1001,8 +1043,13 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 
   case CMD_OP_FAILED:
     log_message(L_INFO, state, "[HUB] Op request failed: %s\n", payload);
-    // Trigger fallback to PRIVMSG method
-    // The channel manager will retry via PRIVMSG on next cycle
+    // Clear pending immediately so channel_manager retries in ~30 seconds
+    for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+      if (c->op_request_pending) {
+        c->op_request_pending = false;
+        c->last_op_request_time = time(NULL) - 30;
+      }
+    }
     break;
 
   case CMD_INVITE_REQUEST:
@@ -1011,15 +1058,7 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       if (sscanf(payload, "%9[^|]|%64[^\n]", inv_nick, inv_chan) == 2) {
         chan_t *ic = channel_find(state, inv_chan);
         if (ic && ic->status == C_IN) {
-          bool have_ops = false;
-          for (int i = 0; i < ic->roster_count; i++) {
-            if (strcasecmp(ic->roster[i].nick, state->current_nick) == 0 &&
-                ic->roster[i].is_op) {
-              have_ops = true;
-              break;
-            }
-          }
-          if (have_ops) {
+          if (ic->i_am_opped) {
             log_message(L_INFO, state,
                         "[INVITE] Inviting %s into %s (hub request)\n",
                         inv_nick, inv_chan);

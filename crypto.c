@@ -161,56 +161,6 @@ char *base64_encode(const unsigned char *input, int length) {
     return b64_text;
 }
 
-//unsigned char *base64_decode(const char *input, int *out_len) {
-//    BIO *bio, *b64;
-//    int decodeLen = strlen(input);
-//    unsigned char *buffer = (unsigned char *)malloc(decodeLen);
-//    memset(buffer, 0, decodeLen);
-
-//    bio = BIO_new_mem_buf(input, -1);
-//    b64 = BIO_new(BIO_f_base64());
-//    bio = BIO_push(b64, bio);
-
-//    BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-//    *out_len = BIO_read(bio, buffer, decodeLen);
-
-//    BIO_free_all(bio);
-//    return buffer;
-//}
-
-// working but with debug output
-//unsigned char *base64_decode(const char *input, int *out_len) {
-//    fprintf(stderr, "[B64] Decoding %zu chars...\n", strlen(input));
-//    
-//    BIO *b64, *bmem;
-//    int len = strlen(input);
-//    unsigned char *buffer = (unsigned char *)malloc(len);
-//    if (!buffer) {
-//        fprintf(stderr, "[B64] ERROR: malloc failed\n");
-//        *out_len = 0;
-//        return NULL;
-//    }
-//    
-//    memset(buffer, 0, len);
-//    b64 = BIO_new(BIO_f_base64());
-//    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-//    bmem = BIO_new_mem_buf((void *)input, len);
-//    bmem = BIO_push(b64, bmem);
-//    
-//    *out_len = BIO_read(bmem, buffer, len);
-//    BIO_free_all(bmem);
-//    
-//    if (*out_len <= 0) {
-//        fprintf(stderr, "[B64] ERROR: BIO_read returned %d\n", *out_len);
-//        free(buffer);
-//        *out_len = 0;
-//        return NULL;
-//    }
-//    
-//    fprintf(stderr, "[B64] Decoded %d bytes from %d input chars\n", *out_len, len);
-//    return buffer;
-//}
-
 unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
     int len = strlen(input);

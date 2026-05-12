@@ -77,6 +77,7 @@ void channel_list_reset_status(bot_state_t *state) {
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     c->status = C_OUT;
     c->last_join_attempt = 0;
+    c->i_am_opped = false;
     c->op_request_pending = false;
     c->op_request_retry_count = 0;
   }
@@ -103,21 +104,14 @@ void channel_manager_check_joins(bot_state_t *state) {
       continue;
     }
     if (c->status == C_IN) {
-      bool am_i_opped = false;
-      for (int i = 0; i < c->roster_count; i++) {
-        if (strcasecmp(c->roster[i].nick, state->current_nick) == 0 &&
-            c->roster[i].is_op) {
-          am_i_opped = true;
-          break;
-        }
-      }
-      if (am_i_opped) {
-        if (c->op_request_pending) {
-          log_message(L_DEBUG, state,
-                      "[DEBUG] We have ops in %s. Clearing pending request.\n",
-                      c->name);
-          c->op_request_pending = false;
-          c->op_request_retry_count = 0;
+      if (c->i_am_opped) {
+        c->op_request_pending = false;
+        c->op_request_retry_count = 0;
+        // Refresh roster periodically so we can op newly-joined trusted members.
+        if (now - c->last_who_request > ROSTER_REFRESH_INTERVAL) {
+          c->roster_count = 0;
+          irc_printf(state, "WHO %s\r\n", c->name);
+          c->last_who_request = now;
         }
         continue;
       }

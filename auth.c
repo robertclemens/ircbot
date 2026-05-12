@@ -195,16 +195,37 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   return false;
 }
 
+// Strip leading '~' from the ident portion of nick!ident@host, writing the
+// normalized form into out.  Handles both stored masks (which may lack '~' due
+// to 396/NICK reconstruction without tilde) and live WHO results (which carry
+// '~' when identd is absent).
+static void strip_ident_tilde(const char *in, char *out, size_t out_size) {
+  const char *bang = strchr(in, '!');
+  if (!bang || bang[1] != '~') {
+    snprintf(out, out_size, "%s", in);
+    return;
+  }
+  size_t prefix = (size_t)(bang - in) + 1; // includes '!'
+  if (prefix >= out_size) { snprintf(out, out_size, "%s", in); return; }
+  memcpy(out, in, prefix);
+  snprintf(out + prefix, out_size - prefix, "%s", bang + 2); // skip '~'
+}
+
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
   if (state->trusted_bot_count == 0)
     return false;
 
+  char norm_user_host[MAX_MASK_LEN];
+  strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
+
   for (int i = 0; i < state->trusted_bot_count; i++) {
     // Extract hostmask from format: hostmask|uuid|timestamp
     // or just hostmask for legacy entries
-    char hostmask[128];
-    if (sscanf(state->trusted_bots[i], "%127[^|]", hostmask) == 1) {
-      if (wildcard_match(hostmask, user_host)) {
+    char hostmask[MAX_MASK_LEN];
+    if (sscanf(state->trusted_bots[i], "%255[^|]", hostmask) == 1) {
+      char norm_hostmask[MAX_MASK_LEN];
+      strip_ident_tilde(hostmask, norm_hostmask, sizeof(norm_hostmask));
+      if (wildcard_match(norm_hostmask, norm_user_host)) {
         return true;
       }
     }

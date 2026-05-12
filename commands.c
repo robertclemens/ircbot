@@ -10,24 +10,6 @@
 
 #include "bot.h"
 
-// static int base64_decode(const char *input, unsigned char **output) {
-//   BIO *b64 = BIO_new(BIO_f_base64());
-//   BIO *bio = BIO_new_mem_buf((void *)input, -1);
-//   bio = BIO_push(b64, bio);
-//   BIO_set_flags(bio, BIO_FLAGS_BASE64_NO_NL);
-//   int input_len = strlen(input);
-//   *output = (unsigned char *)malloc(input_len);
-//   if (!*output) {
-//     BIO_free_all(bio);
-//     return 0;
-//   }
-//   int decoded_len = BIO_read(bio, *output, input_len);
-//   BIO_free_all(bio);
-//   return decoded_len;
-// }
-#ifndef _GNU_SOURCE
-#endif
-
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message) {
