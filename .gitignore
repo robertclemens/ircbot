@@ -17,3 +17,4 @@ decrypt_tool
 docsbot_config_gen
 utils/decrypt_config
 utils/encrypt_config
+docs/*
