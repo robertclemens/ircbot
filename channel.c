@@ -77,6 +77,7 @@ void channel_list_reset_status(bot_state_t *state) {
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     c->status = C_OUT;
     c->last_join_attempt = 0;
+    c->join_disabled = false;
     c->i_am_opped = false;
     c->op_request_pending = false;
     c->op_request_retry_count = 0;
@@ -90,8 +91,8 @@ void channel_manager_check_joins(bot_state_t *state) {
   time_t now = time(NULL);
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    // Skip tombstoned/deleted channels
-    if (!c->is_managed)
+    // Skip tombstoned/deleted channels and channels blocked by 405
+    if (!c->is_managed || c->join_disabled)
       continue;
 
     if (c->status != C_IN && (now - c->last_join_attempt > JOIN_RETRY_TIME)) {
@@ -107,8 +108,8 @@ void channel_manager_check_joins(bot_state_t *state) {
       if (c->i_am_opped) {
         c->op_request_pending = false;
         c->op_request_retry_count = 0;
-        // Refresh roster periodically so we can op newly-joined trusted members.
-        if (now - c->last_who_request > ROSTER_REFRESH_INTERVAL) {
+        // Refresh roster periodically to discover newly-joined trusted members.
+        if (now - c->last_who_request > ROSTER_REFRESH_OPPED) {
           c->roster_count = 0;
           irc_printf(state, "WHO %s\r\n", c->name);
           c->last_who_request = now;

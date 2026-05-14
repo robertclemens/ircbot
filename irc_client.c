@@ -375,7 +375,7 @@ void irc_attempt_nick_change(bot_state_t *state, const char *new_nick) {
 }
 
 void irc_generate_new_nick(bot_state_t *state) {
-  const char nick_append_chars[] = "_|`^";
+  const char nick_append_chars[] = "_`^";
   const int num_special_chars = sizeof(nick_append_chars) - 1;
   char new_nick[MAX_NICK];
   int attempt = state->nick_generation_attempt;

@@ -496,16 +496,25 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :%s\r\n", nick, line_buffer);
       }
 
-      irc_printf(state, "PRIVMSG %s :--- Trusted Bots ---\r\n", nick);
-      for (int i = 0; i < state->trusted_bot_count; i++) {
-        // Extract just the hostmask from format: hostmask|uuid|timestamp
-        char hostmask[128];
-        if (sscanf(state->trusted_bots[i], "%127[^|]", hostmask) == 1) {
-          irc_printf(state, "PRIVMSG %s : - %s\r\n", nick, hostmask);
-        } else {
-          irc_printf(state, "PRIVMSG %s : - %s\r\n", nick,
-                     state->trusted_bots[i]);
-        }
+      irc_printf(state, "PRIVMSG %s :--- Trusted Bots (%d) ---\r\n", nick,
+                 state->trusted_bot_count);
+      int bot_show = state->trusted_bot_count < BOT_STATUS_MAX_LINES
+                         ? state->trusted_bot_count
+                         : BOT_STATUS_MAX_LINES;
+      for (int i = 0; i < bot_show; i += 2) {
+        // Display 2 per line; extract hostmask from hostmask|uuid|ts format
+        char col1[128] = "", col2[128] = "";
+        sscanf(state->trusted_bots[i], "%127[^|]", col1);
+        if (i + 1 < bot_show)
+          sscanf(state->trusted_bots[i + 1], "%127[^|]", col2);
+        if (col2[0])
+          irc_printf(state, "PRIVMSG %s :  %-40s %s\r\n", nick, col1, col2);
+        else
+          irc_printf(state, "PRIVMSG %s :  %s\r\n", nick, col1);
+      }
+      if (state->trusted_bot_count > BOT_STATUS_MAX_LINES) {
+        irc_printf(state, "PRIVMSG %s :  ...and %d more (hub-managed)\r\n", nick,
+                   state->trusted_bot_count - BOT_STATUS_MAX_LINES);
       }
 
       irc_printf(state, "PRIVMSG %s :--- Configured Hubs ---\r\n", nick);
@@ -529,11 +538,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Syntax: setnick <nickname>\r\n", nick);
         return;
       }
-      if (strlen(arg1) >= MAX_NICK) {
-        irc_printf(
-            state,
-            "PRIVMSG %s :Error: Nickname is too long (max %d chars).\r\n", nick,
-            MAX_NICK - 1);
+      if (!is_valid_bot_nick(arg1)) {
+        if (strchr(arg1, '|'))
+          irc_printf(state,
+              "PRIVMSG %s :Error: Nickname cannot contain '|' (reserved as protocol delimiter).\r\n",
+              nick);
+        else
+          irc_printf(state,
+              "PRIVMSG %s :Error: Nickname is too long (max %d chars).\r\n",
+              nick, MAX_NICK - 1);
       } else {
         snprintf(state->target_nick, MAX_NICK, "%s", arg1);
         config_write(state, state->startup_password);

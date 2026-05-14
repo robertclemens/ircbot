@@ -125,29 +125,40 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
                 if (helper_count > 0) {
                   int random_index = rand() % helper_count;
                   roster_entry_t *chosen_helper = helpers[random_index];
+                  time_t req_now = time(NULL);
 
                   log_message(
                       L_INFO, state,
                       "[INFO] Found %d trusted ops. Requesting ops from: %s\n",
                       helper_count, chosen_helper->nick);
 
-                  // Try hub first - look up UUID for this helper
-                  bool sent_via_hub = false;
-                  {
-                    char uuid[64];
-                    if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
-                      sent_via_hub = hub_client_request_op(state, uuid, c->name);
-                    }
-                  }
-
-                  // Fallback to PRIVMSG if hub unavailable
-                  if (!sent_via_hub) {
-                    bot_comms_send_command(state, chosen_helper->nick,
-                                           "OPME %s", c->name);
-                  }
                   c->op_request_pending = true;
-                  c->last_op_request_time = time(NULL);
+                  c->last_op_request_time = req_now;
                   found_helper = true;
+
+                  if (req_now - state->last_op_request_sent >= OP_REQUEST_MIN_INTERVAL) {
+                    // Try hub first - look up UUID for this helper
+                    bool sent_via_hub = false;
+                    {
+                      char uuid[64];
+                      if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
+                        sent_via_hub = hub_client_request_op(state, uuid, c->name);
+                      }
+                    }
+
+                    // Fallback to PRIVMSG if hub unavailable
+                    if (!sent_via_hub) {
+                      bot_comms_send_command(state, chosen_helper->nick,
+                                             "OPME %s", c->name);
+                    }
+                    state->last_op_request_sent = req_now;
+                  } else {
+                    log_message(L_DEBUG, state,
+                                "[OP-REQ] Rate limited deop recovery in %s; retry in %lds\n",
+                                c->name,
+                                (long)(OP_REQUEST_MIN_INTERVAL -
+                                       (req_now - state->last_op_request_sent)));
+                  }
                 }
               }
 
@@ -293,6 +304,19 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
       }
     }
+  } else if (strcmp(command, "405") == 0) {
+    /* ERR_TOOMANYCHANNELS: server channel limit reached; stop retrying this channel */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name) {
+      chan_t *c = channel_find(state, chan_name);
+      if (c) {
+        c->join_disabled = true;
+        log_message(L_INFO, state,
+                    "[405] Channel limit reached, disabling join retry: %s\n",
+                    chan_name);
+      }
+    }
   } else if (strcmp(command, "473") == 0) {
     /* ERR_INVITEONLYCHAN: need invite to join managed channel */
     strtok_r(params, " ", &saveptr_irc);
@@ -342,7 +366,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
 
     chan_t *c = channel_find(state, chan_name);
-    if (!c || c->roster_count >= MAX_ROSTER_SIZE)
+    if (!c)
       return;
 
     char *ident = strtok_r(NULL, " ", &saveptr_irc);
@@ -351,15 +375,23 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *nick = strtok_r(NULL, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
 
-      if (nick && ident && host && modes) {
-      roster_entry_t *entry = &c->roster[c->roster_count];
-      snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
-      snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
-      entry->is_op = (strstr(modes, "@") != NULL);
-      c->roster_count++;
-      
-      if (entry->is_op && strcasecmp(nick, state->current_nick) == 0) {
-        c->i_am_opped = true;
+    if (nick && ident && host && modes) {
+      bool is_op = (strstr(modes, "@") != NULL);
+
+      /* Always update own op status even when the roster array is full.
+       * Without this, the bot's own 352 entry can be silently dropped in
+       * large channels (>MAX_ROSTER_SIZE users), leaving i_am_opped = false
+       * and triggering spurious OP-REQs on the next 315. */
+      if (strcasecmp(nick, state->current_nick) == 0) {
+        c->i_am_opped = is_op;
+      }
+
+      if (c->roster_count < MAX_ROSTER_SIZE) {
+        roster_entry_t *entry = &c->roster[c->roster_count];
+        snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
+        snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
+        entry->is_op = is_op;
+        c->roster_count++;
       }
     }
   } else if (strcmp(command, "396") == 0) {
@@ -454,30 +486,38 @@ void parser_handle_line(bot_state_t *state, char *line) {
                   helper_count, chosen_helper->nick,
                   c->op_request_retry_count + 1);
 
-      // Try hub first - look up UUID for this helper
-      bool sent_via_hub = false;
-      log_message(L_DEBUG, state,
-                  "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
-                  chosen_helper->nick, chosen_helper->hostmask);
-      {
-        char uuid[64];
-        if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
-          log_message(L_DEBUG, state, "[OP-REQ] Found UUID, trying hub request\n");
-          sent_via_hub = hub_client_request_op(state, uuid, c->name);
-          log_message(L_DEBUG, state,
-                      "[OP-REQ] hub_client_request_op returned: %d\n", sent_via_hub);
-        }
-      }
-
-      // Fallback to PRIVMSG if hub unavailable
-      if (!sent_via_hub) {
-        log_message(L_DEBUG, state,
-                    "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n");
-        bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
-      }
       c->last_op_request_time = now;
       c->op_request_pending = true;
-      c->op_request_retry_count++;
+
+      if (now - state->last_op_request_sent >= OP_REQUEST_MIN_INTERVAL) {
+        // Try hub first - look up UUID for this helper
+        bool sent_via_hub = false;
+        log_message(L_DEBUG, state,
+                    "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
+                    chosen_helper->nick, chosen_helper->hostmask);
+        {
+          char uuid[64];
+          if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
+            log_message(L_DEBUG, state, "[OP-REQ] Found UUID, trying hub request\n");
+            sent_via_hub = hub_client_request_op(state, uuid, c->name);
+            log_message(L_DEBUG, state,
+                        "[OP-REQ] hub_client_request_op returned: %d\n", sent_via_hub);
+          }
+        }
+
+        // Fallback to PRIVMSG if hub unavailable
+        if (!sent_via_hub) {
+          log_message(L_DEBUG, state,
+                      "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n");
+          bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+        }
+        state->last_op_request_sent = now;
+        c->op_request_retry_count++;
+      } else {
+        log_message(L_DEBUG, state,
+                    "[OP-REQ] Rate limited in %s; will retry (attempt %d pending)\n",
+                    c->name, c->op_request_retry_count + 1);
+      }
     } else {
       log_message(L_DEBUG, state,
                   "[OP-REQ] No trusted ops in roster. "

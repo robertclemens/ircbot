@@ -292,12 +292,14 @@ static void run_config_wizard(void) {
     printf("\n--- Setup Bot Nickname ---\n");
     while (true) {
       get_input("Enter bot nick", state.target_nick, MAX_NICK);
-      if (strlen(state.target_nick) > 0 &&
-          strlen(state.target_nick) < MAX_NICK) {
+      if (is_valid_bot_nick(state.target_nick)) {
         snprintf(state.current_nick, MAX_NICK, "%s", state.target_nick);
         break;
       }
-      printf("🚨 ERROR: Invalid nick length.\n");
+      if (strchr(state.target_nick, '|'))
+        printf("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).\n");
+      else
+        printf("ERROR: Invalid nick length.\n");
     }
 
     get_input("Enter bot username (ident)", state.user, sizeof(state.user));

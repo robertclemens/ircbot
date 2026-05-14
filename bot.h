@@ -47,9 +47,8 @@
   10 // Time delay for trying to gain the target nick (outside of givenick cmd)
 #define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
 #define CHECK_LAG_TIMEOUT 60    // Lag timeout
-#define ROSTER_REFRESH_INTERVAL                                                \
-  120 // How often should a /who #channel be performed to look for known bots
-      // that are ops
+#define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops)
+#define ROSTER_REFRESH_OPPED    360 // WHO interval (s) when already opped (peer discovery)
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
 
 // Limits
@@ -81,6 +80,9 @@
      // provided
 #define MAX_LOG_LINES                                                          \
   20 // Max number of lines to cap getlog request to help prevent flooding
+#define BOT_STATUS_MAX_LINES 30 // Max trusted-bot lines in status output (anti-flood)
+#define MAX_IRC_CHANNELS 10     // Realistic per-bot IRC channel ceiling (server CHANLIMIT)
+#define OP_REQUEST_MIN_INTERVAL 5 // Minimum seconds between any OP-REQ sent by this bot
 #define MAX_CONFIG_SIZE                                                        \
   (1024 * 1024) // Limit config file size to 1MB to provent OOM
 #define MAX_HUB_KEY_SIZE  128  // 88 chars base64 + null + headroom (Curve25519)
@@ -216,6 +218,7 @@ struct chan_t {
   roster_entry_t roster[MAX_ROSTER_SIZE];
   int roster_count;
   time_t last_join_attempt;
+  bool join_disabled;  // 405 received: stop retrying this channel this session
   bool i_am_opped;
   bool op_request_pending;
   time_t last_op_request_time;
@@ -289,8 +292,9 @@ struct bot_state {
   bool hub_authenticated;
   unsigned char hub_session_key[32];
   time_t last_hub_connect_attempt;
-  time_t last_hub_ping_time; // Last time we sent a PING to the hub
-  time_t last_hub_activity;  // Last time we received a valid PONG/Data from hub
+  time_t last_hub_ping_time;    // Last time we sent a PING to the hub
+  time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
+  time_t last_op_request_sent;  // Global rate-limit: last OP-REQ sent across all channels
 };
 
 // ... [Function Prototypes same as before] ...
@@ -367,6 +371,11 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
                                     const char *channel);
+static inline bool is_valid_bot_nick(const char *nick) {
+  return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&
+         strchr(nick, '|') == NULL;
+}
+
 #ifdef DEBUG
 static inline void debug_hex_dump(const char *label, const unsigned char *data,
                                   int len) {
