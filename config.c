@@ -164,74 +164,132 @@ bool config_load(bot_state_t *state, const char *password,
         }
       } break;
 
-      case 'm': // Admin mask (global, with timestamp)
+      case 'm': // Usermask record (new: uuid|mask|add/del|last_used|ts  old: mask|add/del|ts)
       {
-        char mask[MAX_MASK_LEN], op[16];
-        time_t ts = 0;
+        char first[40] = {0};
+        char *p = strchr(data, '|');
+        if (p) {
+          size_t fl = (size_t)(p - data);
+          if (fl < sizeof(first)) { memcpy(first, data, fl); first[fl] = 0; }
+        }
+        bool is_new = (strlen(first) == 36 && first[8]=='-' &&
+                       first[13]=='-' && first[18]=='-' && first[23]=='-');
 
-        // Parse: mask|add/del|timestamp
-        int parsed = sscanf(data, "%127[^|]|%15[^|]|%ld", mask, op, &ts);
-
-        if (parsed >= 2 && state->mask_count < MAX_MASKS) {
-          size_t mask_len = strlen(mask);
-          size_t copy_len =
-              (mask_len < MAX_MASK_LEN) ? mask_len : MAX_MASK_LEN - 1;
-          memcpy(state->auth_masks[state->mask_count].mask, mask, copy_len);
-          state->auth_masks[state->mask_count].mask[copy_len] = '\0';
-          state->auth_masks[state->mask_count].is_managed =
-              (strcmp(op, "del") != 0);
-          state->auth_masks[state->mask_count].timestamp =
-              (parsed == 3) ? ts : time(NULL);
-          state->mask_count++;
+        if (is_new && state->mask_record_count < MAX_USER_MASKS) {
+          mask_record_t *m = &state->mask_records[state->mask_record_count];
+          memset(m, 0, sizeof(*m));
+          char *p1 = strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+          char *p3 = p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+          if (p1 && p2 && p3 && p4) {
+            snprintf(m->uuid,  sizeof(m->uuid),  "%.*s",(int)(p1-data),data);
+            snprintf(m->mask,  sizeof(m->mask),  "%.*s",(int)(p2-p1-1),p1+1);
+            m->is_active = (strncmp(p2+1,"add",3)==0);
+            m->last_used = (time_t)atol(p3+1);
+            m->timestamp = (time_t)atol(p4+1);
+            state->mask_record_count++;
+          }
+        } else if (!is_new && state->mask_record_count < MAX_USER_MASKS) {
+          /* Old format: mask|add/del|timestamp — tag with MIGRATE sentinel */
+          mask_record_t *m = &state->mask_records[state->mask_record_count];
+          memset(m, 0, sizeof(*m));
+          snprintf(m->uuid, sizeof(m->uuid), "MIGRATE");
+          char mask[MAX_MASK_LEN], op[16]; time_t ts = 0;
+          if (sscanf(data, "%255[^|]|%15[^|]|%ld", mask, op, &ts) >= 2) {
+            snprintf(m->mask, sizeof(m->mask), "%s", mask);
+            m->is_active = (strcmp(op,"del") != 0);
+            m->timestamp = (ts > 0) ? ts : time(NULL);
+            state->mask_record_count++;
+          }
         }
       } break;
 
-      case 'o': // Oper mask (global, with timestamp)
+      case 'o': // Oper record (new: uuid|name|pass|add/del|last_seen|ts  old: mask|pass|add/del|ts)
       {
-        char mask[MAX_MASK_LEN], pass[MAX_PASS], op[16];
-        time_t ts = 0;
+        char first[40] = {0};
+        char *p = strchr(data, '|');
+        if (p) {
+          size_t fl = (size_t)(p - data);
+          if (fl < sizeof(first)) { memcpy(first, data, fl); first[fl] = 0; }
+        }
+        bool is_new = (strlen(first) == 36 && first[8]=='-' &&
+                       first[13]=='-' && first[18]=='-' && first[23]=='-');
 
-        // Parse: mask|password|add/del|timestamp
-        int parsed =
-            sscanf(data, "%127[^|]|%127[^|]|%15[^|]|%ld", mask, pass, op, &ts);
-
-        if (parsed >= 3 && strlen(pass) > 0 &&
-            state->op_mask_count < MAX_OP_MASKS) {
-
-          size_t mask_len = strlen(mask);
-          size_t copy_len =
-              (mask_len < MAX_MASK_LEN) ? mask_len : MAX_MASK_LEN - 1;
-          memcpy(state->op_masks[state->op_mask_count].mask, mask, copy_len);
-          state->op_masks[state->op_mask_count].mask[copy_len] = '\0';
-
-          size_t pass_len = strlen(pass);
-          size_t copy_len_pass =
-              (pass_len < MAX_PASS) ? pass_len : MAX_PASS - 1;
-          memcpy(state->op_masks[state->op_mask_count].password, pass,
-                 copy_len_pass);
-          state->op_masks[state->op_mask_count].password[copy_len_pass] = '\0';
-
-          state->op_masks[state->op_mask_count].is_managed =
-              (strcmp(op, "del") != 0);
-          state->op_masks[state->op_mask_count].timestamp =
-              (parsed == 4) ? ts : time(NULL);
-
-          state->op_mask_count++;
+        if (is_new && state->user_record_count < MAX_USER_RECORDS) {
+          user_record_t *u = &state->user_records[state->user_record_count];
+          memset(u, 0, sizeof(*u));
+          char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+          char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+          char *p5=p4?strchr(p4+1,'|'):NULL;
+          if (p1&&p2&&p3&&p4&&p5) {
+            snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
+            snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
+            snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
+            u->type      = 'o';
+            u->is_active = (strncmp(p3+1,"add",3)==0);
+            u->last_seen = (time_t)atol(p4+1);
+            u->timestamp = (time_t)atol(p5+1);
+            state->user_record_count++;
+          }
+        } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
+          /* Old format o|mask|password|add/del|timestamp — tag with MIGRATE sentinel */
+          user_record_t *u = &state->user_records[state->user_record_count];
+          memset(u, 0, sizeof(*u));
+          snprintf(u->uuid, sizeof(u->uuid), "MIGRATE_O");
+          u->type = 'o';
+          char mask[MAX_MASK_LEN], pass[MAX_PASS], op[16]; time_t ts = 0;
+          if (sscanf(data,"%255[^|]|%127[^|]|%15[^|]|%ld",mask,pass,op,&ts)>=3) {
+            /* Store mask in name temporarily; real name derived at migration */
+            snprintf(u->name,     sizeof(u->name),     "%.63s", mask);
+            snprintf(u->password, sizeof(u->password), "%s", pass);
+            u->is_active = (strcmp(op,"del")!=0);
+            u->timestamp = (ts > 0) ? ts : time(NULL);
+            state->user_record_count++;
+          }
         }
       } break;
 
-      case 'a': // Admin password (global, no operation field)
+      case 'a': // Admin record (new: uuid|name|pass|add/del|last_seen|ts  old: pass|ts)
       {
-        // Format: a|password|timestamp (optional timestamp for legacy compat)
-        char pass[MAX_PASS];
-        time_t ts = 0;
-        if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
-          snprintf(state->bot_pass, MAX_PASS, "%s", pass);
-          state->bot_pass_ts = (ts > 0) ? ts : time(NULL);
-        } else {
-          // Legacy fallback
-          snprintf(state->bot_pass, MAX_PASS, "%s", data);
-          state->bot_pass_ts = time(NULL);
+        char first[40] = {0};
+        char *p = strchr(data, '|');
+        if (p) {
+          size_t fl = (size_t)(p - data);
+          if (fl < sizeof(first)) { memcpy(first, data, fl); first[fl] = 0; }
+        }
+        bool is_new = (strlen(first) == 36 && first[8]=='-' &&
+                       first[13]=='-' && first[18]=='-' && first[23]=='-');
+
+        if (is_new && state->user_record_count < MAX_USER_RECORDS) {
+          user_record_t *u = &state->user_records[state->user_record_count];
+          memset(u, 0, sizeof(*u));
+          char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+          char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+          char *p5=p4?strchr(p4+1,'|'):NULL;
+          if (p1&&p2&&p3&&p4&&p5) {
+            snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
+            snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
+            snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
+            u->type      = 'a';
+            u->is_active = (strncmp(p3+1,"add",3)==0);
+            u->last_seen = (time_t)atol(p4+1);
+            u->timestamp = (time_t)atol(p5+1);
+            state->user_record_count++;
+          }
+        } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
+          /* Old format a|password|timestamp — MIGRATE sentinel */
+          user_record_t *u = &state->user_records[state->user_record_count];
+          memset(u, 0, sizeof(*u));
+          snprintf(u->uuid, sizeof(u->uuid), "MIGRATE");
+          u->type = 'a';
+          char pass[MAX_PASS]; time_t ts = 0;
+          if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
+            snprintf(u->password, sizeof(u->password), "%s", pass);
+            u->timestamp = (ts > 0) ? ts : time(NULL);
+          } else {
+            snprintf(u->password, sizeof(u->password), "%s", data);
+            u->timestamp = time(NULL);
+          }
+          state->user_record_count++;
         }
       } break;
 
@@ -311,6 +369,143 @@ bool config_load(bot_state_t *state, const char *password,
   EVP_CIPHER_CTX_free(ctx);
   free(ciphertext);
   free(plaintext);
+
+  /* Migration: convert old-format MIGRATE sentinel records to new typed records */
+  bool needs_migration = false;
+  for (int i = 0; i < state->user_record_count && !needs_migration; i++)
+    if (strncmp(state->user_records[i].uuid, "MIGRATE", 7) == 0)
+      needs_migration = true;
+  for (int i = 0; i < state->mask_record_count && !needs_migration; i++)
+    if (strcmp(state->mask_records[i].uuid, "MIGRATE") == 0)
+      needs_migration = true;
+
+  if (needs_migration) {
+    time_t now = time(NULL);
+
+    /* Generate a simple UUID-like value using random bytes */
+    unsigned char rnd[16];
+    RAND_bytes(rnd, sizeof(rnd));
+    rnd[6] = (rnd[6] & 0x0f) | 0x40; /* version 4 */
+    rnd[8] = (rnd[8] & 0x3f) | 0x80; /* variant */
+    char admin_uuid[37];
+    snprintf(admin_uuid, sizeof(admin_uuid),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             rnd[0],rnd[1],rnd[2],rnd[3],rnd[4],rnd[5],rnd[6],rnd[7],
+             rnd[8],rnd[9],rnd[10],rnd[11],rnd[12],rnd[13],rnd[14],rnd[15]);
+
+    user_record_t new_users[MAX_USER_RECORDS];
+    mask_record_t new_masks[MAX_USER_MASKS];
+    int nu = 0, nm = 0;
+    memset(new_users, 0, sizeof(new_users));
+    memset(new_masks, 0, sizeof(new_masks));
+
+    /* Build admin record from MIGRATE sentinel */
+    for (int i = 0; i < state->user_record_count; i++) {
+      user_record_t *u = &state->user_records[i];
+      if (strcmp(u->uuid, "MIGRATE") == 0 && u->type == 'a' && nu < MAX_USER_RECORDS) {
+        user_record_t *nu_rec = &new_users[nu++];
+        snprintf(nu_rec->uuid,     sizeof(nu_rec->uuid),     "%s", admin_uuid);
+        snprintf(nu_rec->name,     sizeof(nu_rec->name),     "admin");
+        snprintf(nu_rec->password, sizeof(nu_rec->password), "%s", u->password);
+        nu_rec->type      = 'a';
+        nu_rec->is_active = true;
+        nu_rec->last_seen = 0;
+        nu_rec->timestamp = u->timestamp ? u->timestamp : now;
+        break;
+      }
+    }
+
+    /* Migrate old mask records under admin uuid */
+    for (int i = 0; i < state->mask_record_count; i++) {
+      if (strcmp(state->mask_records[i].uuid, "MIGRATE") != 0) continue;
+      if (nm >= MAX_USER_MASKS) break;
+      mask_record_t *mr = &new_masks[nm++];
+      snprintf(mr->uuid, sizeof(mr->uuid), "%s", admin_uuid);
+      snprintf(mr->mask, sizeof(mr->mask), "%s", state->mask_records[i].mask);
+      mr->is_active = state->mask_records[i].is_active;
+      mr->last_used = 0;
+      mr->timestamp = state->mask_records[i].timestamp;
+    }
+
+    /* Migrate old oper records (MIGRATE_O sentinel), generating individual UUIDs */
+    for (int i = 0; i < state->user_record_count; i++) {
+      user_record_t *u = &state->user_records[i];
+      if (strcmp(u->uuid, "MIGRATE_O") != 0 || nu >= MAX_USER_RECORDS) continue;
+      unsigned char ornd[16];
+      RAND_bytes(ornd, sizeof(ornd));
+      ornd[6] = (ornd[6] & 0x0f) | 0x40;
+      ornd[8] = (ornd[8] & 0x3f) | 0x80;
+      char ouuid[37];
+      snprintf(ouuid, sizeof(ouuid),
+               "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+               ornd[0],ornd[1],ornd[2],ornd[3],ornd[4],ornd[5],ornd[6],ornd[7],
+               ornd[8],ornd[9],ornd[10],ornd[11],ornd[12],ornd[13],ornd[14],ornd[15]);
+      /* Derive name from nick portion of old mask (everything before !) */
+      char derived_name[64] = {0};
+      char *bang = strchr(u->name, '!');
+      if (bang) {
+        size_t nlen = (size_t)(bang - u->name);
+        if (nlen >= sizeof(derived_name)) nlen = sizeof(derived_name) - 1;
+        memcpy(derived_name, u->name, nlen);
+      } else {
+        snprintf(derived_name, sizeof(derived_name), "oper%d", i);
+      }
+      /* Deduplicate name */
+      bool collision = true;
+      int suffix = 2;
+      char try_name[64];
+      snprintf(try_name, sizeof(try_name), "%s", derived_name);
+      while (collision) {
+        collision = false;
+        for (int j = 0; j < nu; j++) {
+          if (strcmp(new_users[j].name, try_name) == 0) {
+            collision = true;
+            snprintf(try_name, sizeof(try_name), "%s_%d", derived_name, suffix++);
+            break;
+          }
+        }
+      }
+      user_record_t *nr = &new_users[nu++];
+      snprintf(nr->uuid,     sizeof(nr->uuid),     "%s", ouuid);
+      snprintf(nr->name,     sizeof(nr->name),     "%s", try_name);
+      snprintf(nr->password, sizeof(nr->password), "%s", u->password);
+      nr->type      = 'o';
+      nr->is_active = u->is_active;
+      nr->last_seen = 0;
+      nr->timestamp = u->timestamp ? u->timestamp : now;
+      /* Add the old mask as a mask record under this oper's uuid */
+      if (nm < MAX_USER_MASKS) {
+        mask_record_t *mr = &new_masks[nm++];
+        snprintf(mr->uuid, sizeof(mr->uuid), "%s", ouuid);
+        /* u->name holds the old mask string */
+        snprintf(mr->mask, sizeof(mr->mask), "%s", u->name);
+        mr->is_active = u->is_active;
+        mr->last_used = 0;
+        mr->timestamp = u->timestamp ? u->timestamp : now;
+      }
+    }
+
+    /* Copy already-clean records */
+    for (int i = 0; i < state->user_record_count; i++) {
+      if (strncmp(state->user_records[i].uuid, "MIGRATE", 7) == 0) continue;
+      if (nu >= MAX_USER_RECORDS) break;
+      new_users[nu++] = state->user_records[i];
+    }
+    for (int i = 0; i < state->mask_record_count; i++) {
+      if (strcmp(state->mask_records[i].uuid, "MIGRATE") == 0) continue;
+      if (nm >= MAX_USER_MASKS) break;
+      new_masks[nm++] = state->mask_records[i];
+    }
+
+    memcpy(state->user_records, new_users, sizeof(new_users));
+    state->user_record_count = nu;
+    memcpy(state->mask_records, new_masks, sizeof(new_masks));
+    state->mask_record_count = nm;
+
+    /* Write migrated config immediately */
+    config_write(state, password);
+  }
+
   // Validation changed
   if (state->target_nick[0] == '\0' || state->server_count == 0 ||
       state->user[0] == '\0') {
@@ -322,183 +517,79 @@ bool config_load(bot_state_t *state, const char *password,
   return true;
 }
 
-void config_write(const bot_state_t *state, const char *password) {
-  if (strlen(password) >= MAX_PASS) {
+/* Serialize state to the encrypted config file on disk.
+ * Does NOT push to the hub — callers that want a push call config_write(). */
+static void config_write_file(const bot_state_t *state, const char *password) {
+  if (strlen(password) >= MAX_PASS)
     return;
-  }
 
   char plaintext_overrides[MAX_BUFFER * 4] = "";
   int offset = 0;
   int remaining = sizeof(plaintext_overrides);
   int written;
 
-  // Nickname (bot-specific, no timestamp)
-  written = snprintf(plaintext_overrides + offset, remaining, "n|%s\n",
-                     state->target_nick);
-  if (written > 0 && written < remaining) {
-    offset += written;
-    remaining -= written;
-  }
+#define CFG_WRITE(...)                                          \
+  do {                                                          \
+    if (remaining > 1) {                                        \
+      written = snprintf(plaintext_overrides + offset,          \
+                         remaining, __VA_ARGS__);               \
+      if (written > 0 && written < remaining) {                 \
+        offset += written; remaining -= written;                \
+      }                                                         \
+    }                                                           \
+  } while (0)
 
-  // Servers (bot-specific, no timestamp)
-  for (int i = 0; i < state->server_count; i++) {
-    if (remaining > 1) {
-      written = snprintf(plaintext_overrides + offset, remaining, "s|%s\n",
-                         state->server_list[i]);
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
-  }
+  CFG_WRITE("n|%s\n", state->target_nick);
 
-  // Channels (global, with timestamp)
+  for (int i = 0; i < state->server_count; i++)
+    CFG_WRITE("s|%s\n", state->server_list[i]);
+
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    if (remaining > 1) {
-      const char *key = (c->key[0] != '\0') ? c->key : "";
-      const char *operation = c->is_managed ? "add" : "del";
-
-      written =
-          snprintf(plaintext_overrides + offset, remaining, "c|%s|%s|%s|%ld\n",
-                   c->name, key, operation, (long)c->timestamp);
-
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
+    const char *key = (c->key[0] != '\0') ? c->key : "";
+    CFG_WRITE("c|%s|%s|%s|%ld\n",
+              c->name, key, c->is_managed ? "add" : "del", (long)c->timestamp);
   }
 
-  // Admin masks (global, with timestamp)
-  for (int i = 0; i < state->mask_count; i++) {
-    if (remaining > 1) {
-      const char *operation = state->auth_masks[i].is_managed ? "add" : "del";
-
-      written = snprintf(plaintext_overrides + offset, remaining,
-                         "m|%s|%s|%ld\n", state->auth_masks[i].mask, operation,
-                         (long)state->auth_masks[i].timestamp);
-
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *u = &state->user_records[i];
+    CFG_WRITE("%c|%s|%s|%s|%s|%ld|%ld\n",
+              u->type, u->uuid, u->name, u->password,
+              u->is_active ? "add" : "del",
+              (long)u->last_seen, (long)u->timestamp);
   }
 
-  // Oper masks (global, with timestamp)
-  for (int i = 0; i < state->op_mask_count; i++) {
-    if (remaining > 1) {
-      const char *operation = state->op_masks[i].is_managed ? "add" : "del";
-
-      written =
-          snprintf(plaintext_overrides + offset, remaining, "o|%s|%s|%s|%ld\n",
-                   state->op_masks[i].mask, state->op_masks[i].password,
-                   operation, (long)state->op_masks[i].timestamp);
-
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
+  for (int i = 0; i < state->mask_record_count; i++) {
+    const mask_record_t *m = &state->mask_records[i];
+    CFG_WRITE("m|%s|%s|%s|%ld|%ld\n",
+              m->uuid, m->mask, m->is_active ? "add" : "del",
+              (long)m->last_used, (long)m->timestamp);
   }
 
-  // Admin password (global, no timestamp, no operation)
-  written = snprintf(plaintext_overrides + offset, remaining, "a|%s|%ld\n",
-                     state->bot_pass, (long)state->bot_pass_ts);
-  if (written > 0 && written < remaining) {
-    offset += written;
-    remaining -= written;
-  }
+  if (state->bot_comm_pass[0] != '\0')
+    CFG_WRITE("p|%s|%ld\n", state->bot_comm_pass, (long)state->bot_comm_pass_ts);
 
-  // Bot password (global, no timestamp, no operation)
-  if (state->bot_comm_pass[0] != '\0') {
-    written = snprintf(plaintext_overrides + offset, remaining, "p|%s|%ld\n",
-                       state->bot_comm_pass, (long)state->bot_comm_pass_ts);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
+  for (int i = 0; i < state->trusted_bot_count; i++)
+    CFG_WRITE("b|%s\n", state->trusted_bots[i]);
 
-  // Bot lines (hub-generated, no timestamp)
-  for (int i = 0; i < state->trusted_bot_count; i++) {
-    if (remaining > 1) {
-      written = snprintf(plaintext_overrides + offset, remaining, "b|%s\n",
-                         state->trusted_bots[i]);
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
-  }
+  if (state->log_type != DEFAULT_LOG_LEVEL)
+    CFG_WRITE("l|%d\n", state->log_type);
 
-  // Log level (optional, bot-specific)
-  if (state->log_type != DEFAULT_LOG_LEVEL) {
-    written = snprintf(plaintext_overrides + offset, remaining, "l|%d\n",
-                       state->log_type);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
+  CFG_WRITE("u|%s\n", state->user);
+  CFG_WRITE("g|%s\n", state->gecos);
 
-  // User (ident) - bot-specific
-  written =
-      snprintf(plaintext_overrides + offset, remaining, "u|%s\n", state->user);
-  if (written > 0 && written < remaining) {
-    offset += written;
-    remaining -= written;
-  }
+  if (state->vhost[0] != '\0')
+    CFG_WRITE("v|%s\n", state->vhost);
 
-  // Gecos - bot-specific
-  written =
-      snprintf(plaintext_overrides + offset, remaining, "g|%s\n", state->gecos);
-  if (written > 0 && written < remaining) {
-    offset += written;
-    remaining -= written;
-  }
+  for (int i = 0; i < state->hub_count; i++)
+    CFG_WRITE("h|%s\n", state->hub_list[i]);
 
-  // Vhost (optional) - bot-specific
-  if (state->vhost[0] != '\0') {
-    written = snprintf(plaintext_overrides + offset, remaining, "v|%s\n",
-                       state->vhost);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
+  if (state->hub_key[0] != '\0')
+    CFG_WRITE("k|%s\n", state->hub_key);
 
-  // Hub list (bot-specific)
-  for (int i = 0; i < state->hub_count; i++) {
-    if (remaining > 1) {
-      written = snprintf(plaintext_overrides + offset, remaining, "h|%s\n",
-                         state->hub_list[i]);
-      if (written > 0 && written < remaining) {
-        offset += written;
-        remaining -= written;
-      }
-    }
-  }
+  if (state->bot_uuid[0] != '\0')
+    CFG_WRITE("i|%s\n", state->bot_uuid);
 
-  // Hub public key (bot-specific)
-  if (state->hub_key[0] != '\0') {
-    written = snprintf(plaintext_overrides + offset, remaining, "k|%s\n",
-                       state->hub_key);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
-
-  // Bot UUID (bot-specific)
-  if (state->bot_uuid[0] != '\0') {
-    written = snprintf(plaintext_overrides + offset, remaining, "i|%s\n",
-                       state->bot_uuid);
-    if (written > 0 && written < remaining) {
-      offset += written;
-      remaining -= written;
-    }
-  }
+#undef CFG_WRITE
 
   if (strlen(plaintext_overrides) == 0) {
     remove(CONFIG_FILE);
@@ -523,14 +614,11 @@ void config_write(const bot_state_t *state, const char *password) {
   int len, ciphertext_len;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
-    free(ciphertext);
-    return;
-  }
+  if (!ctx) { free(ciphertext); return; }
+
   if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
       EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len,
-                        (unsigned char *)plaintext_overrides,
-                        plaintext_len) != 1 ||
+                        (unsigned char *)plaintext_overrides, plaintext_len) != 1 ||
       EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1) {
     EVP_CIPHER_CTX_free(ctx);
     free(ciphertext);
@@ -540,46 +628,24 @@ void config_write(const bot_state_t *state, const char *password) {
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
   EVP_CIPHER_CTX_free(ctx);
 
-  // Use atomic write pattern: write to temp file, then rename
   char temp_file[256];
   snprintf(temp_file, sizeof(temp_file), "%s.tmp", CONFIG_FILE);
 
   FILE *out_file = fopen(temp_file, "wb");
   if (!out_file) {
-    fprintf(stderr, "[CFG] Failed to open %s for writing: %s\n", temp_file,
-            strerror(errno));
+    fprintf(stderr, "[CFG] Failed to open %s for writing: %s\n",
+            temp_file, strerror(errno));
     free(ciphertext);
     return;
   }
 
-  // Write all data with error checking
-  bool write_success = true;
-  if (fwrite(salt, 1, sizeof(salt), out_file) != sizeof(salt)) {
-    fprintf(stderr, "[CFG] Failed to write salt: %s\n", strerror(errno));
-    write_success = false;
-  } else if (fwrite(iv, 1, sizeof(iv), out_file) != sizeof(iv)) {
-    fprintf(stderr, "[CFG] Failed to write IV: %s\n", strerror(errno));
-    write_success = false;
-  } else if (fwrite(tag, 1, sizeof(tag), out_file) != sizeof(tag)) {
-    fprintf(stderr, "[CFG] Failed to write tag: %s\n", strerror(errno));
-    write_success = false;
-  } else if (fwrite(ciphertext, 1, ciphertext_len, out_file) !=
-             (size_t)ciphertext_len) {
-    fprintf(stderr, "[CFG] Failed to write ciphertext: %s\n", strerror(errno));
-    write_success = false;
-  }
-
-  // Ensure data is written to disk before closing
-  if (write_success) {
-    if (fflush(out_file) != 0) {
-      fprintf(stderr, "[CFG] Failed to flush file: %s\n", strerror(errno));
-      write_success = false;
-    } else if (fsync(fileno(out_file)) != 0) {
-      fprintf(stderr, "[CFG] Failed to sync file to disk: %s\n",
-              strerror(errno));
-      write_success = false;
-    }
-  }
+  bool write_success =
+      fwrite(salt,       1, sizeof(salt),       out_file) == sizeof(salt)       &&
+      fwrite(iv,         1, sizeof(iv),         out_file) == sizeof(iv)         &&
+      fwrite(tag,        1, sizeof(tag),         out_file) == sizeof(tag)        &&
+      fwrite(ciphertext, 1, ciphertext_len,      out_file) == (size_t)ciphertext_len &&
+      fflush(out_file) == 0 &&
+      fsync(fileno(out_file)) == 0;
 
   fclose(out_file);
   free(ciphertext);
@@ -590,17 +656,23 @@ void config_write(const bot_state_t *state, const char *password) {
     return;
   }
 
-  // Set permissions on temp file before rename
   chmod(temp_file, S_IRUSR | S_IWUSR);
 
-  // Atomically replace old config with new one
   if (rename(temp_file, CONFIG_FILE) != 0) {
-    fprintf(stderr, "[CFG] Failed to rename %s to %s: %s\n", temp_file,
-            CONFIG_FILE, strerror(errno));
+    fprintf(stderr, "[CFG] Failed to rename %s to %s: %s\n",
+            temp_file, CONFIG_FILE, strerror(errno));
     remove(temp_file);
-    return;
   }
-  if (state->hub_count > 0 && state->hub_authenticated) {
+}
+
+void config_write(const bot_state_t *state, const char *password) {
+  config_write_file(state, password);
+  if (state->hub_count > 0 && state->hub_authenticated)
     hub_client_push_config((bot_state_t *)state);
-  }
+}
+
+/* Save config to disk only — does NOT push to hub.
+ * Use this when saving data received FROM the hub so we don't echo it back. */
+void config_write_local(const bot_state_t *state, const char *password) {
+  config_write_file(state, password);
 }

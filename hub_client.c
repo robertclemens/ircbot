@@ -252,38 +252,13 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     offset += written;
   }
 
-  // Admin masks
-  for (int i = 0; i < state->mask_count; i++) {
-    const char *op = state->auth_masks[i].is_managed ? "add" : "del";
-    written = snprintf(buffer + offset, max_len - offset, "m|%s|%s|%ld\n",
-                       state->auth_masks[i].mask, op,
-                       (long)state->auth_masks[i].timestamp);
-    if (written < 0 || written >= max_len - offset)
-      break;
-    offset += written;
-  }
+  /* Admin/oper/mask records are hub-authoritative — bots receive them from hub,
+   * they do NOT push them back. IRC admin commands (+admin, +usermask, etc.)
+   * update local state and call hub_client_push_config, but only the bot-local
+   * fields (channels, nick, hostmask) are included in the push payload.
+   * The hub manages a|/o|/m| records via CMD_ADMIN_* commands only. */
 
-  // Operator masks
-  for (int i = 0; i < state->op_mask_count; i++) {
-    const char *op = state->op_masks[i].is_managed ? "add" : "del";
-    written = snprintf(buffer + offset, max_len - offset, "o|%s|%s|%s|%ld\n",
-                       state->op_masks[i].mask, state->op_masks[i].password, op,
-                       (long)state->op_masks[i].timestamp);
-    if (written < 0 || written >= max_len - offset)
-      break;
-    offset += written;
-  }
-
-  // Admin password (with timestamp for conflict resolution)
-  if (state->bot_pass[0] != '\0') {
-    written = snprintf(buffer + offset, max_len - offset, "a|%s|%ld\n",
-                       state->bot_pass, (long)state->bot_pass_ts);
-    if (written > 0 && written < max_len - offset) {
-      offset += written;
-    }
-  }
-
-  // Bot password (with timestamp for conflict resolution)
+  // Bot communication password (p| line, unchanged)
   if (state->bot_comm_pass[0] != '\0') {
     written = snprintf(buffer + offset, max_len - offset, "p|%s|%ld\n",
                        state->bot_comm_pass, (long)state->bot_comm_pass_ts);
@@ -405,6 +380,61 @@ void hub_client_promote_local_config(bot_state_t *state) {
   hub_client_push_config(state);
 }
 
+/* Push all user/mask records to hub via CMD_CONFIG_PUSH so the hub can store
+ * and broadcast newly created or modified admin/oper/mask records.  The hub's
+ * process_bot_config_push uses strict ts > stored_ts, so unchanged records
+ * (same timestamp) are silently rejected — only new or modified ones land. */
+void hub_client_push_admin_delta(bot_state_t *state) {
+  if (!state->hub_authenticated || state->hub_fd == -1) return;
+
+  char payload[MAX_BUFFER];
+  int offset = 0;
+  int remaining = (int)sizeof(payload);
+
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *u = &state->user_records[i];
+    int w = snprintf(payload + offset, (size_t)remaining,
+                     "%c|%s|%s|%s|%s|%ld|%ld\n",
+                     u->type, u->uuid, u->name, u->password,
+                     u->is_active ? "add" : "del",
+                     (long)u->last_seen, (long)u->timestamp);
+    if (w > 0 && w < remaining) { offset += w; remaining -= w; }
+  }
+  for (int i = 0; i < state->mask_record_count; i++) {
+    const mask_record_t *m = &state->mask_records[i];
+    int w = snprintf(payload + offset, (size_t)remaining,
+                     "m|%s|%s|%s|%ld|%ld\n",
+                     m->uuid, m->mask,
+                     m->is_active ? "add" : "del",
+                     (long)m->last_used, (long)m->timestamp);
+    if (w > 0 && w < remaining) { offset += w; remaining -= w; }
+  }
+
+  if (offset == 0) return;
+
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_CONFIG_PUSH;
+  uint32_t inner_len = htonl((uint32_t)offset);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, (size_t)offset);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + offset, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
+    memcpy(cipher, &net_len, 4);
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total)
+      log_message(L_INFO, state, "[HUB] Admin delta pushed (%d user, %d mask records)\n",
+                  state->user_record_count, state->mask_record_count);
+    else
+      hub_client_disconnect(state);
+  }
+}
+
 /**
  * Push full config to hub
  * Called: After authentication, after config changes
@@ -504,6 +534,19 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
 
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
+
+  /* Hub is authoritative for user/mask records. Replace rather than merge so
+   * the bot always has exactly the hub's current set — no stale or duplicate
+   * UUIDs from a previous sync can accumulate. Preserve last_seen/last_used
+   * that were updated locally since the last hub push. */
+  user_record_t saved_users[MAX_USER_RECORDS];
+  mask_record_t saved_masks[MAX_USER_MASKS];
+  int saved_user_count = state->user_record_count;
+  int saved_mask_count = state->mask_record_count;
+  memcpy(saved_users, state->user_records, sizeof(user_record_t) * (size_t)saved_user_count);
+  memcpy(saved_masks, state->mask_records, sizeof(mask_record_t) * (size_t)saved_mask_count);
+  state->user_record_count = 0;
+  state->mask_record_count = 0;
 
   char work_buf[MAX_BUFFER];
   snprintf(work_buf, sizeof(work_buf), "%s", payload);
@@ -625,142 +668,89 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'm': // Admin mask
+    case 'm': // Usermask record (new: uuid|mask|add/del|last_used|ts)
     {
-      char mask[MAX_MASK_LEN], op[8];
-      long ts;
-      if (sscanf(data, "%255[^|]|%7[^|]|%ld", mask, op, &ts) == 3) {
-        bool is_add = (strcmp(op, "add") == 0);
-
-        // Find existing
-        int idx = -1;
-        for (int i = 0; i < state->mask_count; i++) {
-          if (strcmp(state->auth_masks[i].mask, mask) == 0) {
-            idx = i;
-            break;
+      char first_m[40] = {0};
+      char *pfm = strchr(data, '|');
+      if (pfm) { size_t fl=(size_t)(pfm-data); if(fl<sizeof(first_m)){memcpy(first_m,data,fl);first_m[fl]=0;} }
+      bool is_new_m = (strlen(first_m)==36 && first_m[8]=='-' && first_m[13]=='-' && first_m[18]=='-' && first_m[23]=='-');
+      if (is_new_m) {
+        char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+        char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+        if (p1&&p2&&p3&&p4) {
+          char uuid[37], mask_s[MAX_MASK_LEN], act[8];
+          long last_used, ts;
+          snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(p1-data),data);
+          snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(p2-p1-1),p1+1);
+          snprintf(act,    sizeof(act),    "%.*s",(int)(p3-p2-1),p2+1);
+          last_used = atol(p3+1); ts = atol(p4+1);
+          bool is_active = (strncmp(act,"add",3)==0);
+          mask_record_t *found_m = NULL;
+          for (int mi=0; mi<state->mask_record_count; mi++) {
+            if (strcmp(state->mask_records[mi].uuid,uuid)==0 &&
+                strcasecmp(state->mask_records[mi].mask,mask_s)==0) {
+              found_m = &state->mask_records[mi]; break;
+            }
           }
-        }
-
-        log_message(L_DEBUG, state, "[HUB-SYNC] Mask %s: hub_ts=%ld local_ts=%ld op=%s\n",
-                    mask, ts, idx >= 0 ? (long)state->auth_masks[idx].timestamp : 0, op);
-
-        if (idx == -1 && is_add) {
-          // New mask from hub
-          if (state->mask_count < MAX_MASKS) {
-            size_t mask_len = strlen(mask);
-            if (mask_len >= MAX_MASK_LEN)
-              mask_len = MAX_MASK_LEN - 1;
-            memcpy(state->auth_masks[state->mask_count].mask, mask, mask_len);
-            state->auth_masks[state->mask_count].mask[mask_len] = '\0';
-            state->auth_masks[state->mask_count].is_managed = true;
-            state->auth_masks[state->mask_count].timestamp = ts;
-            state->mask_count++;
-            updates++;
-            log_message(L_INFO, state, "[HUB] Added admin mask: %s\n", mask);
+          if (!found_m && state->mask_record_count < MAX_USER_MASKS) {
+            found_m = &state->mask_records[state->mask_record_count++];
+            memset(found_m,0,sizeof(*found_m));
+            snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
+            snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
           }
-        } else if (idx != -1) {
-          // Compare timestamps
-          if (ts > state->auth_masks[idx].timestamp) {
-            state->auth_masks[idx].is_managed = is_add;
-            state->auth_masks[idx].timestamp = ts;
+          if (found_m && ts > found_m->timestamp) {
+            found_m->is_active = is_active;
+            if (last_used > found_m->last_used) found_m->last_used = last_used;
+            found_m->timestamp = ts;
             updates++;
-            log_message(L_INFO, state, "[HUB] Updated admin mask: %s (%s)\n",
-                        mask, op);
-          } else {
-            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected mask %s: hub_ts=%ld <= local_ts=%ld\n",
-                        mask, ts, (long)state->auth_masks[idx].timestamp);
+            log_message(L_INFO, state, "[HUB] Synced mask %s (%s)\n", mask_s, act);
           }
         }
       }
     } break;
 
-    case 'o': // Oper mask
+    case 'o': // Oper user record (new: uuid|name|pass|add/del|last_seen|ts)
+    case 'a': // Admin user record (new: uuid|name|pass|add/del|last_seen|ts)
     {
-      char mask[MAX_MASK_LEN], pass[MAX_PASS], op[8];
-      long ts;
-      if (sscanf(data, "%255[^|]|%127[^|]|%7[^|]|%ld", mask, pass, op, &ts) ==
-          4) {
-        bool is_add = (strcmp(op, "add") == 0);
-
-        int idx = -1;
-        for (int i = 0; i < state->op_mask_count; i++) {
-          if (strcmp(state->op_masks[i].mask, mask) == 0) {
-            idx = i;
-            break;
+      char first_ua[40] = {0};
+      char *pfua = strchr(data, '|');
+      if (pfua) { size_t fl=(size_t)(pfua-data); if(fl<sizeof(first_ua)){memcpy(first_ua,data,fl);first_ua[fl]=0;} }
+      bool is_new_ua = (strlen(first_ua)==36 && first_ua[8]=='-' && first_ua[13]=='-' && first_ua[18]=='-' && first_ua[23]=='-');
+      if (is_new_ua) {
+        char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
+        char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
+        char *p5=p4?strchr(p4+1,'|'):NULL;
+        if (p1&&p2&&p3&&p4&&p5) {
+          char uuid[37], uname[64], upass[MAX_PASS], act[8];
+          long last_seen, ts;
+          snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
+          snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
+          snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
+          snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
+          last_seen = atol(p4+1); ts = atol(p5+1);
+          bool is_active = (strncmp(act,"add",3)==0);
+          user_record_t *found_u = NULL;
+          for (int ui=0; ui<state->user_record_count; ui++) {
+            if (strcmp(state->user_records[ui].uuid,uuid)==0) {
+              found_u = &state->user_records[ui]; break;
+            }
+          }
+          if (!found_u && state->user_record_count < MAX_USER_RECORDS) {
+            found_u = &state->user_records[state->user_record_count++];
+            memset(found_u,0,sizeof(*found_u));
+            snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
+          }
+          if (found_u && ts > found_u->timestamp) {
+            snprintf(found_u->name,     sizeof(found_u->name),     "%s",uname);
+            snprintf(found_u->password, sizeof(found_u->password), "%s",upass);
+            found_u->type      = type;
+            found_u->is_active = is_active;
+            if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
+            found_u->timestamp = ts;
+            updates++;
+            log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s)\n", uname, type, act);
           }
         }
-
-        log_message(L_DEBUG, state, "[HUB-SYNC] Oper %s: hub_ts=%ld local_ts=%ld op=%s idx=%d\n",
-                    mask, ts, idx >= 0 ? (long)state->op_masks[idx].timestamp : 0, op, idx);
-
-        if (idx == -1 && is_add) {
-          if (state->op_mask_count < MAX_OP_MASKS) {
-            size_t mask_len = strlen(mask);
-            if (mask_len >= MAX_MASK_LEN)
-              mask_len = MAX_MASK_LEN - 1;
-            memcpy(state->op_masks[state->op_mask_count].mask, mask, mask_len);
-            state->op_masks[state->op_mask_count].mask[mask_len] = '\0';
-
-            size_t pass_len = strlen(pass);
-            if (pass_len >= MAX_PASS)
-              pass_len = MAX_PASS - 1;
-            memcpy(state->op_masks[state->op_mask_count].password, pass,
-                   pass_len);
-            state->op_masks[state->op_mask_count].password[pass_len] = '\0';
-            state->op_masks[state->op_mask_count].is_managed = true;
-            state->op_masks[state->op_mask_count].timestamp = ts;
-            state->op_mask_count++;
-            updates++;
-            log_message(L_INFO, state, "[HUB] Added oper mask: %s\n", mask);
-          } else {
-            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected oper %s: max masks reached\n", mask);
-          }
-        } else if (idx != -1) {
-          if (ts > state->op_masks[idx].timestamp) {
-            size_t pass_len = strlen(pass);
-            if (pass_len >= MAX_PASS)
-              pass_len = MAX_PASS - 1;
-            memcpy(state->op_masks[idx].password, pass, pass_len);
-            state->op_masks[idx].password[pass_len] = '\0';
-            state->op_masks[idx].is_managed = is_add;
-            state->op_masks[idx].timestamp = ts;
-            updates++;
-            log_message(L_INFO, state, "[HUB] Updated oper mask: %s (%s)\n",
-                        mask, op);
-          } else {
-            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected oper %s: hub_ts=%ld <= local_ts=%ld\n",
-                        mask, ts, (long)state->op_masks[idx].timestamp);
-          }
-        } else if (idx == -1 && !is_add) {
-          log_message(L_DEBUG, state, "[HUB-SYNC] Skipped oper del for non-existent: %s\n", mask);
-        }
-      }
-    } break;
-
-    case 'a': // Admin password: a|password|timestamp
-    {
-      // Hub sends: a|password|timestamp
-      char pass[MAX_PASS];
-      long ts = 0;
-      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
-      if (parsed < 1) {
-        snprintf(pass, sizeof(pass), "%s", data);
-        ts = 0;
-      }
-
-      log_message(L_DEBUG, state, "[HUB-SYNC] AdminPass: hub_ts=%ld local_ts=%ld\n",
-                  ts, (long)state->bot_pass_ts);
-
-      // Only update if hub has newer timestamp
-      if (ts > state->bot_pass_ts || state->bot_pass[0] == '\0') {
-        snprintf(state->bot_pass, sizeof(state->bot_pass), "%s", pass);
-        state->bot_pass_ts = ts;
-        updates++;
-        log_message(L_INFO, state, "[HUB] Updated admin password (ts=%ld)\n",
-                    ts);
-      } else {
-        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected admin password: hub_ts=%ld <= local_ts=%ld\n",
-                    ts, (long)state->bot_pass_ts);
       }
     } break;
 
@@ -889,25 +879,25 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           c = next;
         }
 
-        // Purge tombstoned admin masks
-        for (int i = 0; i < state->mask_count; i++) {
-          if (!state->auth_masks[i].is_managed &&
-              (cutoff == 0 || state->auth_masks[i].timestamp < cutoff)) {
-            memmove(&state->auth_masks[i], &state->auth_masks[i+1],
-                    (state->mask_count - i - 1) * sizeof(admin_entry_t));
-            state->mask_count--;
+        // Purge tombstoned user records (admins/opers)
+        for (int i = 0; i < state->user_record_count; i++) {
+          if (!state->user_records[i].is_active &&
+              (cutoff == 0 || state->user_records[i].timestamp < cutoff)) {
+            memmove(&state->user_records[i], &state->user_records[i+1],
+                    (state->user_record_count - i - 1) * sizeof(user_record_t));
+            state->user_record_count--;
             purged++;
             i--;
           }
         }
 
-        // Purge tombstoned oper masks
-        for (int i = 0; i < state->op_mask_count; i++) {
-          if (!state->op_masks[i].is_managed &&
-              (cutoff == 0 || state->op_masks[i].timestamp < cutoff)) {
-            memmove(&state->op_masks[i], &state->op_masks[i+1],
-                    (state->op_mask_count - i - 1) * sizeof(op_entry_t));
-            state->op_mask_count--;
+        // Purge tombstoned usermask records
+        for (int i = 0; i < state->mask_record_count; i++) {
+          if (!state->mask_records[i].is_active &&
+              (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
+            memmove(&state->mask_records[i], &state->mask_records[i+1],
+                    (state->mask_record_count - i - 1) * sizeof(mask_record_t));
+            state->mask_record_count--;
             purged++;
             i--;
           }
@@ -928,11 +918,36 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     line = strtok_r(NULL, "\n", &saveptr);
   }
 
+  /* Restore locally-updated last_seen / last_used timestamps that are newer
+   * than what the hub sent (e.g. from recent auths not yet flushed to hub). */
+  for (int i = 0; i < state->user_record_count; i++) {
+    user_record_t *u = &state->user_records[i];
+    for (int j = 0; j < saved_user_count; j++) {
+      if (strcmp(saved_users[j].uuid, u->uuid) == 0) {
+        if (saved_users[j].last_seen > u->last_seen)
+          u->last_seen = saved_users[j].last_seen;
+        break;
+      }
+    }
+  }
+  for (int i = 0; i < state->mask_record_count; i++) {
+    mask_record_t *m = &state->mask_records[i];
+    for (int j = 0; j < saved_mask_count; j++) {
+      if (strcmp(saved_masks[j].uuid, m->uuid) == 0 &&
+          strcasecmp(saved_masks[j].mask, m->mask) == 0) {
+        if (saved_masks[j].last_used > m->last_used)
+          m->last_used = saved_masks[j].last_used;
+        break;
+      }
+    }
+  }
+
   if (updates > 0) {
     log_message(L_INFO, state, "[HUB] Applied %d config updates from hub\n",
                 updates);
-    log_message(L_DEBUG, state, "[HUB-SYNC] Saving config (will trigger push back to hub)\n");
-    config_write(state, state->startup_password);
+    /* Save locally only — do NOT push back to hub. Hub is authoritative for
+     * a|/o|/m| records; echoing them back would create an infinite sync loop. */
+    config_write_local(state, state->startup_password);
   } else {
     log_message(L_DEBUG, state, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
   }

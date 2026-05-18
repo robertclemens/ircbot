@@ -35,95 +35,6 @@ static bool wildcard_match(const char *pattern, const char *text) {
   return !*p;
 }
 
-bool auth_check_hostmask(const bot_state_t *state, const char *user_host) {
-  log_message(L_DEBUG, state, "[AUTH_CHECK] Checking user: %s\n", user_host);
-
-  bool is_explicitly_allowed = false;
-  bool is_explicitly_ignored = false;
-
-  if (state->ignored_default_mask[0] != '\0') {
-    if (wildcard_match(state->ignored_default_mask, user_host)) {
-      is_explicitly_ignored = true;
-    }
-  }
-
-  for (int i = 0; i < state->mask_count; i++) {
-    // [UPDATED] Check .mask field of struct and skip deleted entries
-    if (state->auth_masks[i].mask[0] == '\0')
-      continue;
-    if (!state->auth_masks[i].is_managed)
-      continue; // Skip tombstoned entries
-
-    log_message(L_DEBUG, state, "[AUTH_CHECK] Comparing against: %s\n",
-                state->auth_masks[i].mask);
-
-    if (wildcard_match(state->auth_masks[i].mask, user_host)) {
-      log_message(L_DEBUG, state, "[AUTH_CHECK] MATCH FOUND at index %d.\n", i);
-      is_explicitly_allowed = true;
-      break;
-    }
-  }
-
-  if (is_explicitly_allowed)
-    return true;
-  if (is_explicitly_ignored)
-    return false;
-
-  log_message(L_DEBUG, state, "[AUTH_CHECK] No admin match found.\n");
-  return false;
-}
-
-bool auth_verify_op_command(bot_state_t *state, const char *user_host,
-                            const char *nonce_str, const char *hash_attempt) {
-  log_message(L_DEBUG, state, "[OP_CHECK] Checking User: %s | Nonce: %s\n",
-              user_host, nonce_str);
-
-  for (int i = 0; i < state->op_mask_count; i++) {
-    // Skip tombstoned entries
-    if (!state->op_masks[i].is_managed)
-      continue;
-
-    log_message(L_DEBUG, state, "[OP_CHECK] Compare vs Mask: %s\n",
-                state->op_masks[i].mask);
-
-    if (wildcard_match(state->op_masks[i].mask, user_host)) {
-      log_message(L_DEBUG, state,
-                  "[OP_CHECK] Mask MATCH! Verifying password...\n");
-
-      if (auth_verify_password(state, nonce_str, hash_attempt,
-                               state->op_masks[i].password)) {
-        log_message(L_DEBUG, state, "[OP_CHECK] Password MATCH. Authorized.\n");
-        return true;
-      } else {
-        log_message(L_DEBUG, state, "[OP_CHECK] Password FAIL.\n");
-
-        char to_hash[512];
-        char hex[65];
-        unsigned char raw[SHA256_DIGEST_LENGTH];
-        uint64_t nonce = strtoull(nonce_str, NULL, 10);
-        long min = time(NULL) / 60;
-
-        snprintf(to_hash, sizeof(to_hash), "%s:%ld:%llu",
-                 state->op_masks[i].password, min, (unsigned long long)nonce);
-        SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
-        int offset = 0;
-        for (int j = 0; j < SHA256_DIGEST_LENGTH; j++)
-          offset +=
-              snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[j]);
-
-        log_message(L_DEBUG, state,
-                    "[OP_CHECK] \n   EXPECTED: %s\n   RECEIVED: %s\n", hex,
-                    hash_attempt);
-        OPENSSL_cleanse(to_hash, sizeof(to_hash));
-      }
-    }
-  }
-
-  log_message(L_DEBUG, state,
-              "[OP_CHECK] No matching op masks found (or all failed).\n");
-  return false;
-}
-
 bool auth_verify_password(bot_state_t *state, const char *nonce_str,
                           const char *hash_attempt,
                           const char *stored_password) {
@@ -192,6 +103,67 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
   }
 
   OPENSSL_cleanse(to_hash, sizeof(to_hash));
+  return false;
+}
+
+/* auth_find_user: find the user_record_t whose usermask matches user_host.
+ * Updates last_used on the matching mask and last_seen on the user record.
+ * Sets state->config_dirty so the timestamps are persisted on next flush. */
+user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
+                              time_t now) {
+  for (int i = 0; i < state->mask_record_count; i++) {
+    mask_record_t *mr = &state->mask_records[i];
+    if (!mr->is_active || mr->mask[0] == '\0') continue;
+
+    if (wildcard_match(mr->mask, user_host)) {
+      /* Find the owning user record */
+      for (int j = 0; j < state->user_record_count; j++) {
+        user_record_t *ur = &state->user_records[j];
+        if (!ur->is_active) continue;
+        if (strcmp(ur->uuid, mr->uuid) != 0) continue;
+        /* Match — update timestamps */
+        mr->last_used  = now;
+        ur->last_seen  = now;
+        state->config_dirty = true;
+        log_message(L_DEBUG, state,
+                    "[AUTH] mask %s matched user %s (%c)\n",
+                    mr->mask, ur->name, ur->type);
+        return ur;
+      }
+    }
+  }
+  log_message(L_DEBUG, state, "[AUTH] no mask matched %s\n", user_host);
+  return NULL;
+}
+
+/* auth_verify_password_record: same HMAC check as auth_verify_password but
+ * uses user_record_t.password instead of a global bot_pass. */
+bool auth_verify_password_record(const user_record_t *user,
+                                 const char *nonce_str,
+                                 const char *hash_attempt) {
+  if (!user || !nonce_str || !hash_attempt) return false;
+  /* Re-use the existing auth_verify_password by casting away const on state
+   * just for nonce cache tracking — we pass NULL state to skip cache, then
+   * do manual replay check via admin_nonces in the caller. */
+  /* Build the expected hash directly so we don't need a full state pointer. */
+  uint64_t nonce = strtoull(nonce_str, NULL, 10);
+  long min = (long)(time(NULL) / 60);
+
+  for (int window = 0; window <= 1; window++) {
+    char to_hash[512];
+    char hex[65];
+    unsigned char raw[SHA256_DIGEST_LENGTH];
+    snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
+             user->password, min - window, nonce);
+    SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
+    int off = 0;
+    for (int k = 0; k < SHA256_DIGEST_LENGTH; k++)
+      off += snprintf(hex + off, sizeof(hex) - off, "%02x", raw[k]);
+    OPENSSL_cleanse(to_hash, sizeof(to_hash));
+    if (strlen(hash_attempt) == 64 &&
+        CRYPTO_memcmp(hash_attempt, hex, 64) == 0)
+      return true;
+  }
   return false;
 }
 

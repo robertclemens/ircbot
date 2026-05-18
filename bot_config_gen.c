@@ -1,7 +1,9 @@
 /* bot_config_gen.c — standalone encrypted .ircbot.cnf generator
  * Usage: bot_config_gen <outfile> <config_pass> <nick> <server>
- *                       <channel> <mask1> <mask2> <admin_pass>
+ *                       <channel> <admin_name> <mask1> <mask2> <admin_pass>
  *                       [hub_addr] [hub_uuid] [hub_key]
+ * Generates new-format named admin records (a|uuid|name|pass|add|0|ts)
+ * and usermask records (m|uuid|mask|add|0|ts).
  */
 #define _POSIX_C_SOURCE 200809L
 #include <stdio.h>
@@ -48,11 +50,22 @@ static int write_config(const char *path, const char *pass, const char *plain) {
     return 0;
 }
 
+static void gen_uuid(char *out, size_t outlen) {
+    unsigned char r[16];
+    RAND_bytes(r, sizeof(r));
+    r[6] = (r[6] & 0x0f) | 0x40;
+    r[8] = (r[8] & 0x3f) | 0x80;
+    snprintf(out, outlen,
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             r[0],r[1],r[2],r[3],r[4],r[5],r[6],r[7],
+             r[8],r[9],r[10],r[11],r[12],r[13],r[14],r[15]);
+}
+
 int main(int argc, char *argv[]) {
-    if (argc < 9) {
+    if (argc < 10) {
         fprintf(stderr,
             "Usage: %s <file> <cfgpass> <nick> <server> <channel>\n"
-            "          <mask1> <mask2> <adminpass> [hub_addr] [hub_uuid] [hub_key]\n",
+            "          <admin_name> <mask1> <mask2> <adminpass> [hub_addr] [hub_uuid] [hub_key]\n",
             argv[0]);
         return 1;
     }
@@ -61,14 +74,18 @@ int main(int argc, char *argv[]) {
     const char *nick       = argv[3];
     const char *server     = argv[4];
     const char *channel    = argv[5];
-    const char *mask1      = argv[6];
-    const char *mask2      = argv[7];
-    const char *adminpass  = argv[8];
-    const char *hub_addr   = (argc > 9)  ? argv[9]  : NULL;
-    const char *hub_uuid   = (argc > 10) ? argv[10] : NULL;
-    const char *hub_key    = (argc > 11) ? argv[11] : NULL;
+    const char *adminname  = argv[6];
+    const char *mask1      = argv[7];
+    const char *mask2      = argv[8];
+    const char *adminpass  = argv[9];
+    const char *hub_addr   = (argc > 10) ? argv[10] : NULL;
+    const char *hub_uuid   = (argc > 11) ? argv[11] : NULL;
+    const char *hub_key    = (argc > 12) ? argv[12] : NULL;
 
     time_t now = time(NULL);
+    char admin_uuid[37];
+    gen_uuid(admin_uuid, sizeof(admin_uuid));
+
     char buf[65536];
     int n = 0, rem = (int)sizeof(buf);
 
@@ -78,10 +95,12 @@ int main(int argc, char *argv[]) {
     APP("n|%s\n", nick);
     APP("s|%s\n", server);
     APP("c|%s||add|%ld\n", channel, (long)now);
-    APP("m|%s|add|%ld\n", mask1, (long)now);
+    /* New format admin record: a|uuid|name|pass|add|last_seen|timestamp */
+    APP("a|%s|%s|%s|add|0|%ld\n", admin_uuid, adminname, adminpass, (long)now);
+    /* New format mask records: m|uuid|mask|add|last_used|timestamp */
+    APP("m|%s|%s|add|0|%ld\n", admin_uuid, mask1, (long)now);
     if (mask2 && mask2[0])
-        APP("m|%s|add|%ld\n", mask2, (long)now);
-    APP("a|%s|%ld\n", adminpass, (long)now);
+        APP("m|%s|%s|add|0|%ld\n", admin_uuid, mask2, (long)now);
     APP("u|ircbot\n");
     APP("g|irc bot\n");
     if (hub_addr && hub_addr[0]) APP("h|%s\n", hub_addr);

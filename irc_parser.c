@@ -425,18 +425,18 @@ void parser_handle_line(bot_state_t *state, char *line) {
     log_message(L_INFO, state, "[INFO] Roster for %s updated with %d users.\n",
                 c->name, c->roster_count);
 
-    // Debug: Show trusted bot info
+    if (c->i_am_opped) {
+      c->op_request_pending = false;
+      c->op_request_retry_count = 0;
+      return;
+    }
+
+    // Debug: only logged when we actually need op
     log_message(L_DEBUG, state, "[OP-REQ] trusted_bot_count=%d\n",
                 state->trusted_bot_count);
     for (int i = 0; i < state->trusted_bot_count; i++) {
       log_message(L_DEBUG, state, "[OP-REQ] trusted_bots[%d]: %s\n", i,
                   state->trusted_bots[i]);
-    }
-
-    if (c->i_am_opped) {
-      c->op_request_pending = false;
-      c->op_request_retry_count = 0;
-      return;
     }
 
     time_t now = time(NULL);

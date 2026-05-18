@@ -31,9 +31,10 @@ static void state_init(bot_state_t *state) {
   state->current_nick_ts = time(NULL);
   state->server_fd = -1;
   state->server_count = 0;
-  state->mask_count = 0;
-  state->op_mask_count = 0;
+  state->user_record_count = 0;
+  state->mask_record_count = 0;
   state->trusted_bot_count = 0;
+  state->config_dirty = false;
   hub_client_init(state);
   srand(time(NULL));
 }
@@ -265,10 +266,17 @@ done:
 static void run_config_wizard(void) {
   bot_state_t state;
   char config_pass[MAX_PASS];
-  char mask_buf[MAX_MASK_LEN];
   char server_buf[MAX_BUFFER];
   char chan_buf[MAX_CHAN];
   char confirm_char[16];
+  char admin_name[64];
+  char admin_pass[MAX_PASS];
+#define WIZARD_MAX_MASKS 20
+  char admin_masks[WIZARD_MAX_MASKS][MAX_MASK_LEN];
+  int  admin_mask_count = 0;
+  memset(admin_name,  0, sizeof(admin_name));
+  memset(admin_pass,  0, sizeof(admin_pass));
+  memset(admin_masks, 0, sizeof(admin_masks));
 
   printf("--- IRC Bot Initial Setup ---\n");
   printf("No config file found. Let's create one.\n\n");
@@ -276,7 +284,6 @@ static void run_config_wizard(void) {
   do {
     state_init(&state);
     memset(config_pass, 0, MAX_PASS);
-    memset(mask_buf, 0, MAX_MASK_LEN);
     memset(server_buf, 0, MAX_BUFFER);
     memset(chan_buf, 0, MAX_CHAN);
 
@@ -307,19 +314,40 @@ static void run_config_wizard(void) {
     get_input("Enter VHOST IP (optional, press Enter for default [no vhost])",
               state.vhost, sizeof(state.vhost));
 
-    printf("\n--- Setup Admin Password ---\n");
-    while (!get_confirmed_password("Enter new bot ADMIN password",
-                                   state.bot_pass, MAX_PASS))
-      ;
-
-    printf("\n--- Setup Admin Usermask ---\n");
+    printf("\n--- Setup First Admin ---\n");
+    memset(admin_name,  0, sizeof(admin_name));
+    memset(admin_pass,  0, sizeof(admin_pass));
+    memset(admin_masks, 0, sizeof(admin_masks));
+    admin_mask_count = 0;
     while (true) {
-      get_input("Enter your admin usermask (e.g., *!*@your.host)", mask_buf,
-                MAX_MASK_LEN);
-      if (strchr(mask_buf, '!') && strchr(mask_buf, '@') &&
-          strlen(mask_buf) > 5)
+      get_input("Enter admin friendly name (no spaces, e.g. robert)", admin_name, sizeof(admin_name));
+      if (strlen(admin_name) > 0 && !strchr(admin_name,' ') && !strchr(admin_name,'|'))
         break;
-      printf("🚨 ERROR: Invalid usermask.\n");
+      printf("ERROR: Name cannot contain spaces or '|'.\n");
+    }
+    while (!get_confirmed_password("Enter admin password", admin_pass, MAX_PASS))
+      ;
+    printf("\n--- Setup Admin Usermasks ---\n");
+    printf("Enter usermasks for this admin (e.g. nick!*@*.example.com).\n");
+    printf("Press Enter with no mask when done (at least one required).\n\n");
+    while (admin_mask_count < WIZARD_MAX_MASKS) {
+      char tmp_mask[MAX_MASK_LEN] = {0};
+      printf("Usermask %d%s: ", admin_mask_count + 1,
+             admin_mask_count == 0 ? " (required)" : " (or Enter to finish)");
+      fflush(stdout);
+      char *res = fgets(tmp_mask, sizeof(tmp_mask), stdin);
+      if (!res) break;
+      tmp_mask[strcspn(tmp_mask, "\n")] = '\0';
+      if (tmp_mask[0] == '\0') {
+        if (admin_mask_count == 0) { printf("ERROR: At least one usermask required.\n"); continue; }
+        break;
+      }
+      if (!strchr(tmp_mask, '!') || !strchr(tmp_mask, '@')) {
+        printf("ERROR: Mask must contain '!' and '@'. Try again.\n");
+        continue;
+      }
+      snprintf(admin_masks[admin_mask_count], MAX_MASK_LEN, "%s", tmp_mask);
+      admin_mask_count++;
     }
 
     printf("\n--- Setup IRC Server ---\n");
@@ -545,12 +573,34 @@ static void run_config_wizard(void) {
     }
   } while (true);
 
-  // Commit
-  snprintf(state.auth_masks[state.mask_count].mask, MAX_MASK_LEN, "%s",
-           mask_buf);
-  state.auth_masks[state.mask_count].is_managed = true; // Active by default
-  state.auth_masks[state.mask_count].timestamp = time(NULL);
-  state.mask_count++;
+  // Commit — create admin user_record + all collected mask_records
+  {
+    unsigned char rnd[16];
+    RAND_bytes(rnd, sizeof(rnd));
+    rnd[6]=(rnd[6]&0x0f)|0x40; rnd[8]=(rnd[8]&0x3f)|0x80;
+    char new_uuid[37];
+    snprintf(new_uuid, sizeof(new_uuid),
+             "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+             rnd[0],rnd[1],rnd[2],rnd[3],rnd[4],rnd[5],rnd[6],rnd[7],
+             rnd[8],rnd[9],rnd[10],rnd[11],rnd[12],rnd[13],rnd[14],rnd[15]);
+    time_t now = time(NULL);
+    user_record_t *u = &state.user_records[state.user_record_count++];
+    memset(u, 0, sizeof(*u));
+    snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
+    snprintf(u->name,     sizeof(u->name),     "%s", admin_name);
+    snprintf(u->password, sizeof(u->password), "%s", admin_pass);
+    u->type = 'a'; u->is_active = true; u->timestamp = now;
+    for (int mi = 0; mi < admin_mask_count && state.mask_record_count < MAX_USER_MASKS; mi++) {
+      mask_record_t *m = &state.mask_records[state.mask_record_count++];
+      memset(m, 0, sizeof(*m));
+      snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
+      snprintf(m->mask, sizeof(m->mask), "%s", admin_masks[mi]);
+      m->is_active = true; m->timestamp = now;
+    }
+    memset(admin_pass,  0, sizeof(admin_pass));
+    memset(admin_masks, 0, sizeof(admin_masks));
+  }
+#undef WIZARD_MAX_MASKS
   state.server_list[state.server_count++] = strdup(server_buf);
 
   if (strlen(chan_buf) > 0) {

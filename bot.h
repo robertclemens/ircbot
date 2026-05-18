@@ -53,7 +53,9 @@
 
 // Limits
 #define MAX_SERVERS 10 // Max number of servers to store
-#define MAX_MASKS 20   // Max number of admin masks to store
+#define MAX_MASKS 20   // Max number of admin masks to store (kept for migration)
+#define MAX_USER_RECORDS 40   // max combined admin + oper records
+#define MAX_USER_MASKS   200  // max total usermask records across all users
 #define MAX_CHAN 65    // Max length of channel name. Do not change
 #define MAX_BUFFER                                                             \
   16384 // Size of RAW IRC message. Do not change (Matched to Hub size)
@@ -121,6 +123,18 @@
 #define CMD_BOT_KEY_UPDATE 0x40       // Hub -> Bot: New private key update
 #define CMD_BOT_DELTA      0x45       // Bot -> Hub: single-key delta (mesh.md Phase 4)
 
+// Named Admin/Oper/Usermask Commands (v2) — must match hub.h
+#define CMD_ADMIN_ADD_ADMIN      0x46
+#define CMD_ADMIN_DEL_ADMIN      0x47
+#define CMD_ADMIN_ADD_OPER_RECORD 0x48
+#define CMD_ADMIN_DEL_OPER_RECORD 0x49
+#define CMD_ADMIN_ADD_USERMASK   0x4A
+#define CMD_ADMIN_DEL_USERMASK   0x4B
+#define CMD_ADMIN_SET_USERPASS   0x4C
+#define CMD_ADMIN_MATCH          0x4D
+#define CMD_ADMIN_LIST_ADMINS    0x4E
+#define CMD_ADMIN_LIST_OPERS_V2  0x4F
+
 // Global Config Management Commands
 #define CMD_ADMIN_LIST_CHANNELS 0x23  // List all channels
 #define CMD_ADMIN_ADD_CHANNEL 0x24    // Add channel
@@ -174,18 +188,24 @@ typedef enum { LS_NONE = 0, LS_LISTEN = 1, LS_CONNECTED = 2 } listen_status_t;
 typedef struct bot_state bot_state_t;
 typedef struct chan_t chan_t;
 
-typedef struct {
-  char mask[MAX_MASK_LEN];
-  bool is_managed;
-  time_t timestamp;
-} admin_entry_t;
 
 typedef struct {
-  char mask[MAX_MASK_LEN];
-  char password[MAX_PASS];
-  bool is_managed;
+  char   uuid[37];
+  char   name[64];
+  char   password[MAX_PASS];
+  char   type;         /* 'a' = admin, 'o' = oper */
+  bool   is_active;    /* false when action == "del" */
+  time_t last_seen;
   time_t timestamp;
-} op_entry_t;
+} user_record_t;
+
+typedef struct {
+  char   uuid[37];     /* matches user_record_t.uuid */
+  char   mask[MAX_MASK_LEN];
+  bool   is_active;    /* false when action == "del" */
+  time_t last_used;    /* 0 = never used */
+  time_t timestamp;
+} mask_record_t;
 
 typedef struct {
   char nick[MAX_NICK];
@@ -236,9 +256,6 @@ struct bot_state {
   char user[64];
   char gecos[128];
   char vhost[128];
-  char bot_pass[MAX_PASS];
-  op_entry_t op_masks[MAX_OP_MASKS];
-  int op_mask_count;
   char *server_list[MAX_SERVERS + 1];
   char actual_server_name[256];
   char actual_hostname[MAX_MASK_LEN];
@@ -247,8 +264,6 @@ struct bot_state {
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
-  admin_entry_t auth_masks[MAX_MASKS];
-  int mask_count;
   unsigned long local_ip_long;
   time_t connection_time;
   time_t last_pong_time;
@@ -268,7 +283,6 @@ struct bot_state {
   int chan_count;
   char startup_password[MAX_PASS];
   char bot_comm_pass[MAX_PASS];
-  time_t bot_pass_ts;
   time_t bot_comm_pass_ts;
   char *trusted_bots[MAX_TRUSTED_BOTS + 1];
   int trusted_bot_count;
@@ -279,6 +293,13 @@ struct bot_state {
   uint64_t admin_nonces[MAX_SEEN_HASHES];
   int admin_nonce_idx;
   log_buffer_t in_memory_logs[NUM_LOG_LEVELS];
+
+  // Named admin/oper records and their usermasks (v2)
+  user_record_t user_records[MAX_USER_RECORDS];
+  int user_record_count;
+  mask_record_t mask_records[MAX_USER_MASKS];
+  int mask_record_count;
+  bool config_dirty;   // true when last_used/last_seen needs flushing
 
   // Hub Management
   char bot_uuid[64];
@@ -299,12 +320,11 @@ struct bot_state {
 
 // ... [Function Prototypes same as before] ...
 void ssl_init_openssl(void);
-bool auth_verify_password(bot_state_t *state, const char *nonce_str,
-                          const char *hash_attempt,
-                          const char *stored_password);
-bool auth_check_hostmask(const bot_state_t *state, const char *user_host);
-bool auth_verify_op_command(bot_state_t *state, const char *user_host,
-                            const char *nonce_str, const char *hash_attempt);
+user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
+                              time_t now);
+bool auth_verify_password_record(const user_record_t *user,
+                                 const char *nonce_str,
+                                 const char *hash_attempt);
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host);
 void setup_signals(void);
 void daemonize(void);
@@ -314,6 +334,7 @@ void config_read(bot_state_t *state, const char *filename);
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename);
 void config_write(const bot_state_t *state, const char *password);
+void config_write_local(const bot_state_t *state, const char *password);
 void config_notify_hub_if_changed(bot_state_t *state);
 chan_t *channel_add(bot_state_t *state, const char *name);
 bool channel_remove(bot_state_t *state, const char *name);
@@ -360,6 +381,7 @@ void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
 void hub_client_promote_local_config(bot_state_t *state);
 void hub_client_push_config(bot_state_t *state);
+void hub_client_push_admin_delta(bot_state_t *state);
 void hub_client_push_delta(bot_state_t *state, const char *key,
                            const char *value, time_t ts);
 void hub_client_push_channel(bot_state_t *state, chan_t *chan);
