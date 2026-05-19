@@ -51,6 +51,83 @@ int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
     return ok ? 0 : -1;
 }
 
+/* AES-256-GCM encrypt with optional Additional Authenticated Data (AAD).
+ * Wire: output_buffer = iv(GCM_IV_LEN) || ciphertext.  Returns total written
+ * to output_buffer, or -1 on failure. AAD is authenticated under the tag but
+ * not encrypted; it travels separately on the wire and the receiver must
+ * supply the same bytes to crypto_aes_gcm_decrypt_aad. */
+int crypto_aes_gcm_encrypt_aad(const unsigned char *plaintext, int plaintext_len,
+                                const unsigned char *aad, int aad_len,
+                                const unsigned char *key,
+                                unsigned char *output_buffer,
+                                unsigned char *tag) {
+    EVP_CIPHER_CTX *ctx = NULL;
+    int len;
+    int ciphertext_len;
+    unsigned char iv[GCM_IV_LEN];
+
+    if (RAND_bytes(iv, sizeof(iv)) != 1) return -1;
+    if (!(ctx = EVP_CIPHER_CTX_new())) return -1;
+    if (1 != EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto err;
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) goto err;
+    if (1 != EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv)) goto err;
+
+    if (aad && aad_len > 0) {
+        int dummy;
+        /* AAD-only Update: pass NULL output, OpenSSL records it under the tag. */
+        if (1 != EVP_EncryptUpdate(ctx, NULL, &dummy, aad, aad_len)) goto err;
+    }
+
+    memcpy(output_buffer, iv, GCM_IV_LEN);
+    unsigned char *cipher_ptr = output_buffer + GCM_IV_LEN;
+    if (1 != EVP_EncryptUpdate(ctx, cipher_ptr, &len, plaintext, plaintext_len)) goto err;
+    ciphertext_len = len;
+    if (1 != EVP_EncryptFinal_ex(ctx, cipher_ptr + len, &len)) goto err;
+    ciphertext_len += len;
+    if (1 != EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag)) goto err;
+    EVP_CIPHER_CTX_free(ctx);
+    return ciphertext_len + GCM_IV_LEN;
+
+err:
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return -1;
+}
+
+int crypto_aes_gcm_decrypt_aad(const unsigned char *input_buffer, int input_len,
+                                const unsigned char *aad, int aad_len,
+                                const unsigned char *key, unsigned char *plaintext,
+                                unsigned char *tag) {
+    EVP_CIPHER_CTX *ctx = NULL;
+    int len, plaintext_len;
+    unsigned char iv[GCM_IV_LEN];
+    if (input_len < GCM_IV_LEN) return -1;
+    memcpy(iv, input_buffer, GCM_IV_LEN);
+    const unsigned char *ciphertext = input_buffer + GCM_IV_LEN;
+    int ciphertext_len = input_len - GCM_IV_LEN;
+    if (!(ctx = EVP_CIPHER_CTX_new())) return -1;
+    if (!EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL)) goto err;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL)) goto err;
+    if (!EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv)) goto err;
+    if (aad && aad_len > 0) {
+        int dummy;
+        if (!EVP_DecryptUpdate(ctx, NULL, &dummy, aad, aad_len)) goto err;
+    }
+    if (!EVP_DecryptUpdate(ctx, plaintext, &len, ciphertext, ciphertext_len)) goto err;
+    plaintext_len = len;
+    if (!EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag)) goto err;
+    if (EVP_DecryptFinal_ex(ctx, plaintext + len, &len) <= 0) {
+        /* Wipe partial unauthenticated output before returning. */
+        secure_wipe(plaintext, (size_t)(plaintext_len + len));
+        goto err;
+    }
+    plaintext_len += len;
+    EVP_CIPHER_CTX_free(ctx);
+    return plaintext_len;
+err:
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    return -1;
+}
+
 int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
                            const unsigned char *key, unsigned char *output_buffer,
                            unsigned char *tag) {

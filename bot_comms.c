@@ -17,8 +17,29 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   char msg_copy[MAX_BUFFER];
   snprintf(msg_copy, sizeof(msg_copy), "%s", payload);
 
+  /* New (v2) payload layout from hub-relayed CMD_BOT_MSG:
+   *     <sender_uuid>|<b64_cipher>:<b64_tag>
+   * Old (PRIVMSG / legacy hub) layout:
+   *     <b64_cipher>:<b64_tag>
+   *
+   * If we see a '|' before the first ':' we treat the part before '|' as a
+   * UUID the hub has attested to, and pass it as AAD to the GCM verify.
+   * Otherwise we fall back to legacy decrypt with empty AAD. */
+  const char *sender_uuid_aad = NULL;
+  int sender_uuid_aad_len = 0;
+
+  char *colon_pos = strchr(msg_copy, ':');
+  char *pipe_pos  = strchr(msg_copy, '|');
+  char *enc_start = msg_copy;
+  if (pipe_pos && colon_pos && pipe_pos < colon_pos) {
+    *pipe_pos = '\0';
+    sender_uuid_aad     = msg_copy;
+    sender_uuid_aad_len = (int)(pipe_pos - msg_copy);
+    enc_start = pipe_pos + 1;
+  }
+
   char *saveptr_enc;
-  char *encoded_ciphertext = strtok_r(msg_copy, ":", &saveptr_enc);
+  char *encoded_ciphertext = strtok_r(enc_start, ":", &saveptr_enc);
   char *encoded_tag_str = strtok_r(NULL, "", &saveptr_enc);
   if (!encoded_ciphertext || !encoded_tag_str) return;
 
@@ -45,19 +66,36 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   int ciphertext_len = decoded_len - SALT_SIZE;
   unsigned char *decrypted_data = malloc(ciphertext_len + 1);
   if (decrypted_data) {
-    int decrypted_len = crypto_aes_gcm_decrypt(decoded_data + SALT_SIZE,
-                                               ciphertext_len, key,
-                                               decrypted_data, tag);
-    /* Fall back to legacy single-iteration KDF so messages from un-migrated
-     * peer bots can still be decrypted. Once everyone has upgraded this can
-     * be removed. */
+    int decrypted_len = crypto_aes_gcm_decrypt_aad(
+        decoded_data + SALT_SIZE, ciphertext_len,
+        (const unsigned char *)sender_uuid_aad, sender_uuid_aad_len,
+        key, decrypted_data, tag);
+    /* If AAD verification failed and we tried with the hub-supplied sender
+     * UUID, also try without — handles the IRC PRIVMSG fallback path where
+     * the sender didn't include a UUID prefix.  Likewise fall back to the
+     * legacy KDF for un-migrated peers. */
+    if (decrypted_len < 0 && sender_uuid_aad) {
+      decrypted_len = crypto_aes_gcm_decrypt_aad(
+          decoded_data + SALT_SIZE, ciphertext_len, NULL, 0,
+          key, decrypted_data, tag);
+    }
     if (decrypted_len < 0 &&
         crypto_derive_legacy_key(state->bot_comm_pass, salt, key)) {
-      decrypted_len = crypto_aes_gcm_decrypt(decoded_data + SALT_SIZE,
-                                             ciphertext_len, key,
-                                             decrypted_data, tag);
+      decrypted_len = crypto_aes_gcm_decrypt_aad(
+          decoded_data + SALT_SIZE, ciphertext_len,
+          (const unsigned char *)sender_uuid_aad, sender_uuid_aad_len,
+          key, decrypted_data, tag);
+      if (decrypted_len < 0 && sender_uuid_aad) {
+        decrypted_len = crypto_aes_gcm_decrypt_aad(
+            decoded_data + SALT_SIZE, ciphertext_len, NULL, 0,
+            key, decrypted_data, tag);
+      }
     }
     if (decrypted_len >= 0) {
+      if (sender_uuid_aad)
+        log_message(L_DEBUG, state,
+                    "[BOT-COMM] Sender UUID verified via AAD: %s\n",
+                    sender_uuid_aad);
       decrypted_data[decrypted_len] = '\0';
       char *saveptr_bot;
       char *ts_str  = strtok_r((char *)decrypted_data, ":", &saveptr_bot);
@@ -158,9 +196,17 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   unsigned char ciphertext[SALT_SIZE + GCM_IV_LEN + 512 + 32];
   unsigned char tag[GCM_TAG_LEN];
 
+  /* Bind the sender UUID into the GCM AAD.  The receiver re-computes AAD
+   * from the sender UUID the hub tags on the relay; tag verifies iff the
+   * sender_uuid the hub claims matches what *we* signed here.  The bot's
+   * own UUID is in state->bot_uuid (36 chars for v4). */
+  const char *sender_uuid = state->bot_uuid;
+  int sender_uuid_len = sender_uuid ? (int)strlen(sender_uuid) : 0;
+
   int encrypted_len =
-      crypto_aes_gcm_encrypt((unsigned char *)plaintext_message, plaintext_len,
-                             key, ciphertext + SALT_SIZE, tag);
+      crypto_aes_gcm_encrypt_aad((unsigned char *)plaintext_message, plaintext_len,
+                                  (const unsigned char *)sender_uuid, sender_uuid_len,
+                                  key, ciphertext + SALT_SIZE, tag);
 
   if (encrypted_len > 0) {
     memcpy(ciphertext, salt, SALT_SIZE);

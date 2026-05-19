@@ -383,6 +383,16 @@ int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
 int crypto_aes_gcm_decrypt(const unsigned char *ciphertext, int ciphertext_len,
                            const unsigned char *key, unsigned char *plaintext,
                            unsigned char *tag);
+int crypto_aes_gcm_encrypt_aad(const unsigned char *plaintext, int plaintext_len,
+                                const unsigned char *aad, int aad_len,
+                                const unsigned char *key,
+                                unsigned char *output_buffer,
+                                unsigned char *tag);
+int crypto_aes_gcm_decrypt_aad(const unsigned char *input_buffer, int input_len,
+                                const unsigned char *aad, int aad_len,
+                                const unsigned char *key,
+                                unsigned char *plaintext,
+                                unsigned char *tag);
 int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *salt, size_t salt_len,
                        const unsigned char *info, size_t info_len,
