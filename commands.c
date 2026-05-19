@@ -152,56 +152,232 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
   }
   /* --- Block 2: Admin/Op Logic --- */
-  char message_copy[MAX_BUFFER];
-  snprintf(message_copy, sizeof(message_copy), "%s", message);
+  /* Two accepted formats:
+   *   v1 (new, default):   "~A1 <base64-blob>"
+   *     blob = salt(16) || iv(12) || ciphertext(N) || tag(16)
+   *     key  = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 32)
+   *     plaintext = "<timestamp>:<nonce>:<command> [args...]"
+   *   legacy (deprecated): "<nonce>:<hash> <command> [args...]"
+   *     hash = sha256(password ":" minute ":" nonce)
+   *
+   * Both formats end up populating the same dispatch variables and fall
+   * through to the existing command tree below. */
 
-  char *saveptr_adm;
-  char *auth_token = strtok_r(message_copy, " ", &saveptr_adm);
-  if (!auth_token)
-    return;
-
-  char *saveptr_token;
-  char *nonce_str = strtok_r(auth_token, ":", &saveptr_token);
-  char *hash_str = strtok_r(NULL, "", &saveptr_token);
-
-  if (!nonce_str || !hash_str)
-    return;
-
-  char *command = strtok_r(NULL, " ", &saveptr_adm);
-  if (!command)
-    return;
-  char *arg1 = strtok_r(NULL, " ", &saveptr_adm);
-  char *arg2 = strtok_r(NULL, " ", &saveptr_adm);
-  char *arg3 = strtok_r(NULL, " ", &saveptr_adm);
-
-  log_message(L_DEBUG, state,
-              "[CMD_DEBUG] Parsed: Cmd='%s' Arg1='%s' Nonce='%s'\n", command,
-              (arg1 ? arg1 : "NULL"), nonce_str);
-
+  char message_copy[MAX_BUFFER];     /* legacy parser working buffer */
+  char v1_plaintext[MAX_BUFFER];     /* v1 decrypted-payload working buffer */
+  bool used_v1 = false;
   bool is_admin = false;
   bool is_op = false;
   user_record_t *auth_user = NULL;
+  char *command = NULL, *arg1 = NULL, *arg2 = NULL, *arg3 = NULL;
+  uint64_t nonce_val = 0;
 
-  /* Anti-replay: check nonce before mask lookup */
-  uint64_t nonce_val = strtoull(nonce_str, NULL, 10);
-  bool replay = false;
-  for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-    if (state->admin_nonces[_ri] == nonce_val) { replay = true; break; }
-  }
+  if (strncmp(message, "~A1 ", 4) == 0) {
+    /* ---- v1: AES-256-GCM-protected admin command ---- */
+    used_v1 = true;
+    const char *b64 = message + 4;
+    int blob_len = 0;
+    unsigned char *blob = base64_decode(b64, &blob_len);
+    if (!blob || blob_len < (int)(SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN)) {
+      if (blob) { secure_wipe(blob, (size_t)(blob_len > 0 ? blob_len : 0)); free(blob); }
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: malformed blob from %s\n", user_host);
+      return;
+    }
+    int ct_len = blob_len - (int)SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
+    if (ct_len <= 0) {
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
 
-  if (!replay) {
+    unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
+    memcpy(salt, blob, SALT_SIZE);
+    memcpy(iv,   blob + SALT_SIZE, GCM_IV_LEN);
+    memcpy(tag,  blob + blob_len - GCM_TAG_LEN, GCM_TAG_LEN);
+
+    /* Identify the sender by hostmask BEFORE trusting any payload content.
+     * auth_find_user updates last_seen/last_used and sets config_dirty even
+     * on the v1 path, so the hub stays in sync. */
     time_t now_auth = time(NULL);
     user_record_t *candidate = auth_find_user(state, user_host, now_auth);
-    if (candidate && auth_verify_password_record(candidate, nonce_str, hash_str)) {
-      state->admin_nonces[state->admin_nonce_idx] = nonce_val;
-      state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-      if (candidate->type == 'a') { is_admin = true; auth_user = candidate; }
-      if (candidate->type == 'o') { is_op   = true; auth_user = candidate; }
+    if (!candidate || !candidate->is_active || candidate->password[0] == '\0') {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: no matching active user for %s\n", user_host);
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    unsigned char key[32];
+    if (!crypto_derive_config_key(candidate->password, salt, key)) {
+      log_message(L_CMD, state, "[CMD] v1 auth: PBKDF2 failed\n");
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    /* crypto_aes_gcm_decrypt expects input = iv || ciphertext, plus tag. */
+    int gcm_in_len = GCM_IV_LEN + ct_len;
+    unsigned char *gcm_in = malloc((size_t)gcm_in_len);
+    if (!gcm_in) {
+      secure_wipe(key, sizeof(key));
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+    memcpy(gcm_in,              iv,                 GCM_IV_LEN);
+    memcpy(gcm_in + GCM_IV_LEN, blob + SALT_SIZE + GCM_IV_LEN, (size_t)ct_len);
+
+    unsigned char *plain = malloc((size_t)ct_len + 1);
+    if (!plain) {
+      secure_wipe(key, sizeof(key));
+      secure_wipe(gcm_in, (size_t)gcm_in_len);
+      free(gcm_in);
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+    int plain_len = crypto_aes_gcm_decrypt(gcm_in, gcm_in_len, key, plain, tag);
+    secure_wipe(key, sizeof(key));
+    secure_wipe(gcm_in, (size_t)gcm_in_len);
+    free(gcm_in);
+    secure_wipe(blob, (size_t)blob_len);
+    free(blob);
+
+    if (plain_len < 0) {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: GCM tag failed for %s (wrong password?)\n",
+                  user_host);
+      secure_wipe(plain, (size_t)ct_len + 1);
+      free(plain);
+      return;
+    }
+    plain[plain_len] = '\0';
+
+    /* Copy decrypted plaintext to v1_plaintext so strtok_r pointers we save
+     * remain valid for the dispatch below. */
+    if ((size_t)plain_len >= sizeof(v1_plaintext)) {
+      secure_wipe(plain, (size_t)plain_len);
+      free(plain);
+      return;
+    }
+    memcpy(v1_plaintext, plain, (size_t)plain_len);
+    v1_plaintext[plain_len] = '\0';
+    secure_wipe(plain, (size_t)plain_len);
+    free(plain);
+
+    /* Parse: timestamp:nonce:command args */
+    char *sp_v1;
+    char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1);
+    char *nonce_str = strtok_r(NULL,         ":", &sp_v1);
+    char *cmd_line  = strtok_r(NULL,         "",  &sp_v1);
+    if (!ts_str || !nonce_str || !cmd_line) {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: malformed plaintext (missing fields)\n");
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+
+    /* Freshness window — narrower than legacy because the script doesn't
+     * need clock-skew tolerance beyond a few seconds. */
+    time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
+    if (llabs((long long)(now_auth - client_ts)) > 30) {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: timestamp skew %lds (max 30) from %s\n",
+                  (long)(now_auth - client_ts), user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+
+    /* Replay check against the shared admin_nonces ring. */
+    nonce_val = strtoull(nonce_str, NULL, 10);
+    bool replay_v1 = false;
+    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
+      if (state->admin_nonces[_ri] == nonce_val) { replay_v1 = true; break; }
+    }
+    if (replay_v1) {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: replay detected (nonce=%llu) from %s\n",
+                  (unsigned long long)nonce_val, user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+    state->admin_nonces[state->admin_nonce_idx] = nonce_val;
+    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+
+    /* Tokenize the command line, in place, the same way the legacy path does. */
+    char *sp_cmd;
+    command = strtok_r(cmd_line, " ", &sp_cmd);
+    arg1    = strtok_r(NULL,     " ", &sp_cmd);
+    arg2    = strtok_r(NULL,     " ", &sp_cmd);
+    arg3    = strtok_r(NULL,     " ", &sp_cmd);
+    if (!command) {
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+
+    auth_user = candidate;
+    if (candidate->type == 'a') is_admin = true;
+    if (candidate->type == 'o') is_op    = true;
+
+    log_message(L_DEBUG, state,
+                "[CMD_DEBUG] v1 Parsed: Cmd='%s' Arg1='%s' User='%s' Type=%c\n",
+                command, (arg1 ? arg1 : "NULL"),
+                candidate->name, candidate->type);
+  } else {
+    /* ---- Legacy: "<nonce>:<hash> <command> [args]" ---- */
+    snprintf(message_copy, sizeof(message_copy), "%s", message);
+
+    char *saveptr_adm;
+    char *auth_token = strtok_r(message_copy, " ", &saveptr_adm);
+    if (!auth_token)
+      return;
+
+    char *saveptr_token;
+    char *nonce_str = strtok_r(auth_token, ":", &saveptr_token);
+    char *hash_str  = strtok_r(NULL,       "",  &saveptr_token);
+
+    if (!nonce_str || !hash_str)
+      return;
+
+    command = strtok_r(NULL, " ", &saveptr_adm);
+    if (!command)
+      return;
+    arg1 = strtok_r(NULL, " ", &saveptr_adm);
+    arg2 = strtok_r(NULL, " ", &saveptr_adm);
+    arg3 = strtok_r(NULL, " ", &saveptr_adm);
+
+    log_message(L_DEBUG, state,
+                "[CMD_DEBUG] legacy Parsed: Cmd='%s' Arg1='%s' Nonce='%s'\n",
+                command, (arg1 ? arg1 : "NULL"), nonce_str);
+
+    /* Anti-replay: check nonce before mask lookup */
+    nonce_val = strtoull(nonce_str, NULL, 10);
+    bool replay = false;
+    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
+      if (state->admin_nonces[_ri] == nonce_val) { replay = true; break; }
+    }
+
+    if (!replay) {
+      time_t now_auth = time(NULL);
+      user_record_t *candidate = auth_find_user(state, user_host, now_auth);
+      if (candidate && auth_verify_password_record(candidate, nonce_str, hash_str)) {
+        state->admin_nonces[state->admin_nonce_idx] = nonce_val;
+        state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+        if (candidate->type == 'a') { is_admin = true; auth_user = candidate; }
+        if (candidate->type == 'o') { is_op   = true; auth_user = candidate; }
+        log_message(L_CMD, state,
+                    "[CMD] DEPRECATED legacy SHA256-hash auth used by %s — "
+                    "upgrade your client to the AES-GCM (~A1) format.\n",
+                    user_host);
+      }
     }
   }
 
   if (!is_admin && !is_op) {
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
+    if (used_v1) secure_wipe(v1_plaintext, sizeof(v1_plaintext));
   }
 
   if (is_admin) {
