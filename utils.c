@@ -5,6 +5,7 @@
 #endif
 #include <netdb.h>
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,6 +15,41 @@
 #include <unistd.h>
 
 #include "bot.h"
+
+void bot_set_startup_pass(bot_state_t *s, const char *pass) {
+  RAND_bytes(s->startup_pass_key, MAX_PASS);
+  size_t n = pass ? strlen(pass) : 0;
+  if (n >= MAX_PASS) n = MAX_PASS - 1;
+  for (int i = 0; i < MAX_PASS; i++)
+    s->startup_password[i] = (char)((unsigned char)(i < (int)n ? pass[i] : '\0')
+                                     ^ s->startup_pass_key[i]);
+}
+
+void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]) {
+  for (int i = 0; i < MAX_PASS; i++)
+    out[i] = (char)((unsigned char)s->startup_password[i] ^ s->startup_pass_key[i]);
+  out[MAX_PASS - 1] = '\0';
+}
+
+bool bot_has_startup_pass(const bot_state_t *s) {
+  for (int i = 0; i < MAX_PASS; i++)
+    if (s->startup_pass_key[i]) return true;
+  return false;
+}
+
+void config_write_with_state_pass(bot_state_t *s) {
+  char pass[MAX_PASS];
+  bot_get_startup_pass(s, pass);
+  config_write(s, pass);
+  memset(pass, 0, MAX_PASS);
+}
+
+void config_write_local_with_state_pass(bot_state_t *s) {
+  char pass[MAX_PASS];
+  bot_get_startup_pass(s, pass);
+  config_write_local(s, pass);
+  memset(pass, 0, MAX_PASS);
+}
 
 void handle_fatal_error(const char *message) {
   perror(message);
@@ -458,7 +494,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
     remove(safe_filename);
     return;
   }
-  config_write(state, state->startup_password);
+  config_write_with_state_pass(state);
   char backup_path[PATH_MAX + 8];
   snprintf(backup_path, sizeof(backup_path), "%s.backup", state->executable_path);
   rename(state->executable_path, backup_path);

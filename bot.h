@@ -154,6 +154,10 @@
 #define CMD_OP_GRANT 0x29   // Hub -> Bot: Grant ops to requesting bot
 #define CMD_OP_FAILED 0x2A  // Hub -> Bot: Op request failed
 
+// Bot-to-Bot Relay Commands (via Hub)
+#define CMD_BOT_RELAY 0x50  // Bot -> Hub: relay encrypted bot command to target bot by UUID
+#define CMD_BOT_MSG   0x51  // Hub -> Bot: relayed encrypted bot command payload
+
 extern volatile bool g_shutdown_flag;
 
 // Enums
@@ -282,6 +286,7 @@ struct bot_state {
   int ignored_chan_count;
   int chan_count;
   char startup_password[MAX_PASS];
+  unsigned char startup_pass_key[MAX_PASS];
   char bot_comm_pass[MAX_PASS];
   time_t bot_comm_pass_ts;
   char *trusted_bots[MAX_TRUSTED_BOTS + 1];
@@ -316,6 +321,7 @@ struct bot_state {
   time_t last_hub_ping_time;    // Last time we sent a PING to the hub
   time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
   time_t last_op_request_sent;  // Global rate-limit: last OP-REQ sent across all channels
+  time_t hub_connect_time;      // When current hub connection was authenticated
 };
 
 // ... [Function Prototypes same as before] ...
@@ -393,6 +399,16 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
                                     const char *channel);
+bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
+                                  const char *encoded_cipher,
+                                  const char *encoded_tag);
+void bot_comms_process_payload(bot_state_t *state, const char *payload);
+void bot_set_startup_pass(bot_state_t *s, const char *pass);
+void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]);
+bool bot_has_startup_pass(const bot_state_t *s);
+void config_write_with_state_pass(bot_state_t *s);
+void config_write_local_with_state_pass(bot_state_t *s);
+
 static inline bool is_valid_bot_nick(const char *nick) {
   return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&
          strchr(nick, '|') == NULL;

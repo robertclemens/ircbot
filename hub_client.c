@@ -27,6 +27,7 @@ void hub_client_init(bot_state_t *state) {
   state->last_hub_connect_attempt = 0;
   state->last_hub_ping_time = 0;
   state->last_hub_activity = 0;
+  state->hub_connect_time = 0;
   memset(state->hub_session_key, 0, 32);
   auth_state = HUB_AUTH_NONE;
   last_pong_sent = 0;
@@ -139,6 +140,7 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_connected = false;
   state->hub_authenticated = false;
   state->hub_connecting = false;
+  state->hub_connect_time = 0;
   auth_state = HUB_AUTH_NONE;
   memset(state->hub_session_key, 0, 32);
   state->current_hub[0] = '\0'; // Clear current hub tracking
@@ -335,6 +337,46 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
     hub_client_disconnect(state);
   }
 
+  return false;
+}
+
+/* Route an encrypted bot command to a specific bot by UUID via hub relay.
+ * encoded_cipher and encoded_tag are the base64 strings from bot_comms.
+ * Returns true if the frame was sent to the hub; false to fall back to PRIVMSG. */
+bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
+                                  const char *encoded_cipher,
+                                  const char *encoded_tag) {
+  if (!state->hub_connected || !state->hub_authenticated ||
+      state->hub_fd == -1)
+    return false;
+
+  char payload[MAX_BUFFER];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s:%s",
+                         target_uuid, encoded_cipher, encoded_tag);
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return false;
+
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)CMD_BOT_RELAY;
+  uint32_t inner_len = htonl((uint32_t)pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  memcpy(&plain[5], payload, pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+
+  if (cipher_len > 0) {
+    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
+    memcpy(cipher, &net_len, 4);
+    int total = 4 + cipher_len + GCM_TAG_LEN;
+    if (send(state->hub_fd, cipher, total, 0) == total) {
+      log_message(L_DEBUG, state,
+                  "[BOT-COMM] CMD_BOT_RELAY sent to hub for %s\n", target_uuid);
+      return true;
+    }
+    hub_client_disconnect(state);
+  }
   return false;
 }
 
@@ -905,7 +947,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
 
         if (purged > 0) {
           log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
-          config_write(state, state->startup_password);
+          config_write_with_state_pass(state);
         }
       }
     } break;
@@ -947,7 +989,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
                 updates);
     /* Save locally only — do NOT push back to hub. Hub is authoritative for
      * a|/o|/m| records; echoing them back would create an infinite sync loop. */
-    config_write_local(state, state->startup_password);
+    config_write_local_with_state_pass(state);
   } else {
     log_message(L_DEBUG, state, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
   }
@@ -992,8 +1034,8 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         log_message(L_INFO, state, "[HUB] Updated Curve25519 key in memory\n");
 
         // Save the new key to config file immediately
-        if (strlen(state->startup_password) > 0) {
-          config_write(state, state->startup_password);
+        if (bot_has_startup_pass(state)) {
+          config_write_with_state_pass(state);
           log_message(L_INFO, state,
                       "[HUB] Saved new private key to config file\n");
           log_message(L_INFO, state,
@@ -1081,6 +1123,15 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
           }
         }
       }
+    }
+    break;
+
+  case CMD_BOT_MSG:
+    if (payload && payload_len > 0) {
+      log_message(L_DEBUG, state,
+                  "[BOT-COMM] Received relayed bot command via hub (%d bytes)\n",
+                  payload_len);
+      bot_comms_process_payload(state, payload);
     }
     break;
   }
@@ -1326,6 +1377,7 @@ void hub_client_process(bot_state_t *state) {
         state->hub_authenticated = true;
         auth_state = HUB_AUTH_COMPLETE;
         state->last_hub_activity = time(NULL);
+        state->hub_connect_time = time(NULL);
         log_message(L_INFO, state, "[HUB] Authenticated (Curve25519)!\n");
         hub_client_push_config(state);
       } else {

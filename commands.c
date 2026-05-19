@@ -38,12 +38,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       int decoded_len = 0;
       int tag_len = 0;
 
-      // 1. Capture the returned pointer into our variables
-      // 2. Pass the address of the integer lengths (&decoded_len)
       decoded_data = base64_decode(encoded_ciphertext, &decoded_len);
       tag = base64_decode(encoded_tag, &tag_len);
 
-      // Verify both decodes succeeded and meet size requirements
       if (decoded_data && tag && decoded_len > (SALT_SIZE + GCM_IV_LEN) &&
           tag_len == GCM_TAG_LEN) {
         unsigned char salt[SALT_SIZE];
@@ -94,9 +91,18 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                       bot_arg1) {
                     irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, nick);
                   } else if (bot_command &&
+                             strcasecmp(bot_command, "SETNICK") == 0 &&
+                             bot_arg1) {
+                    if (is_valid_bot_nick(bot_arg1)) {
+                      snprintf(state->target_nick, MAX_NICK, "%s", bot_arg1);
+                      state->current_nick_ts = time(NULL);
+                      hub_client_push_delta(state, "n", bot_arg1,
+                                            state->current_nick_ts);
+                      config_write_with_state_pass(state);
+                    }
+                  } else if (bot_command &&
                              strcasecmp(bot_command, "INVITE") == 0 &&
                              bot_arg1) {
-                    /* arg1 = #channel, arg2 = nick_to_invite */
                     char *bot_arg2 = strtok_r(NULL, " ", &saveptr_cmd);
                     if (bot_arg2) {
                       chan_t *ic = channel_find(state, bot_arg1);
@@ -128,7 +134,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
       }
 
-      // Cleanup base64 buffers
       if (decoded_data)
         free(decoded_data);
       if (tag)
@@ -195,8 +200,32 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "QUIT :Sayonara.\r\n");
       state->status |= S_DIE;
     } else if (strcasecmp(command, "jump") == 0) {
-      irc_printf(state, "QUIT :Jumping servers...\r\n");
-      irc_disconnect(state);
+      if (arg1) {
+        /* Jump to named server: match by hostname only, ignore stored port */
+        char arg_host[256];
+        snprintf(arg_host, sizeof(arg_host), "%s", arg1);
+        char *arg_colon = strrchr(arg_host, ':');
+        if (arg_colon) *arg_colon = '\0';
+        int target_idx = -1;
+        for (int i = 0; i < state->server_count; i++) {
+          char srv_host[256];
+          snprintf(srv_host, sizeof(srv_host), "%s", state->server_list[i]);
+          char *srv_colon = strrchr(srv_host, ':');
+          if (srv_colon) *srv_colon = '\0';
+          if (strcasecmp(arg_host, srv_host) == 0) { target_idx = i; break; }
+        }
+        if (target_idx == -1) {
+          irc_printf(state, "PRIVMSG %s :Error: Server '%s' not in list.\r\n",
+                     nick, arg1);
+        } else {
+          state->current_server_index = target_idx;
+          irc_printf(state, "QUIT :Jumping to %s...\r\n", arg1);
+          irc_disconnect(state);
+        }
+      } else {
+        irc_printf(state, "QUIT :Jumping servers...\r\n");
+        irc_disconnect(state);
+      }
     } else if (strcasecmp(command, "join") == 0) {
       char channel_name[MAX_CHAN];
       if (!arg1) {
@@ -227,7 +256,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         log_message(L_DEBUG, state, "[JOIN] Channel %s: re-enabled ts=%ld\n",
                     channel_name, (long)c->timestamp);
       }
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_config(state); // Sync to hub immediately
       irc_printf(state, "PRIVMSG %s :JOIN %s and saving config file.\r\n", nick,
                  arg1);
@@ -250,7 +279,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         log_message(L_DEBUG, state, "[PART-OP] Channel %s: soft delete ts=%ld\n",
                     channel_name, (long)c->timestamp);
         irc_printf(state, "PART %s\r\n", channel_name);
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
       }
     } else if (strcasecmp(command, "op") == 0) {
       if (!arg1) {
@@ -303,7 +332,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       snprintf(state->bot_comm_pass, MAX_PASS, "%s", arg1);
       state->bot_comm_pass_ts = time(NULL);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       irc_printf(state,
                  "PRIVMSG %s :Bot communication password set and saved.\r\n",
                  nick);
@@ -335,7 +364,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         if (!dup) return;
         state->trusted_bots[state->trusted_bot_count++] = dup;
         state->trusted_bots[state->trusted_bot_count] = NULL;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Added trusted bot: %s\r\n", nick, arg1);
       }
     } else if (strcasecmp(command, "-bot") == 0) {
@@ -366,7 +395,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         }
         state->trusted_bot_count--;
         state->trusted_bots[state->trusted_bot_count] = NULL;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Removed trusted bot: %s\r\n", nick,
                    arg1);
       }
@@ -384,11 +413,25 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         snprintf(uptime_str, sizeof(uptime_str), "N/A");
       }
 
-      /* Network string */
-      const char *srv = (state->actual_server_name[0] != '\0')
-          ? state->actual_server_name
-          : (state->current_server_index > 0
-             ? state->server_list[state->current_server_index - 1] : "N/A");
+      /* Network string — include port after hostname */
+      char srv_buf[300] = "N/A";
+      if (state->actual_server_name[0] != '\0') {
+        int srv_port = 0;
+        if (state->current_server_index > 0) {
+          const char *sl = state->server_list[state->current_server_index - 1];
+          const char *colon = sl ? strrchr(sl, ':') : NULL;
+          if (colon) srv_port = atoi(colon + 1);
+        }
+        if (srv_port > 0)
+          snprintf(srv_buf, sizeof(srv_buf), "%s:%d", state->actual_server_name, srv_port);
+        else
+          snprintf(srv_buf, sizeof(srv_buf), "%s", state->actual_server_name);
+      } else if (state->current_server_index > 0 &&
+                 state->server_list[state->current_server_index - 1]) {
+        snprintf(srv_buf, sizeof(srv_buf), "%s",
+                 state->server_list[state->current_server_index - 1]);
+      }
+      const char *srv = srv_buf;
       const char *conn_str = (state->status & S_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
 
       /* Count active admins and opers */
@@ -410,6 +453,31 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :| Network  : %s (%s, TLS: %s)\r\n",
                  nick, srv, conn_str, state->is_ssl ? "YES" : "NO");
       nanosleep(&st_delay, NULL);
+
+      /* Servers section — only shown when multiple servers configured */
+      if (state->server_count > 1) {
+        irc_printf(state, "PRIVMSG %s :+-[ Servers ]---------------------------------------------------------------\r\n", nick);
+        char srv_line[600] = ""; int soff = 0;
+        for (int i = 0; i < state->server_count; i++) {
+          const char *s = state->server_list[i];
+          if (!s) continue;
+          bool is_cur = (state->current_server_index > 0 &&
+                         i == state->current_server_index - 1 &&
+                         (state->status & S_CONNECTED));
+          char entry[140];
+          snprintf(entry, sizeof(entry), "%s%s", is_cur ? "*" : " ", s);
+          int elen = (int)strlen(entry);
+          if (soff > 0 && soff + 2 + elen < (int)sizeof(srv_line) - 1) {
+            srv_line[soff++] = ','; srv_line[soff++] = ' ';
+          }
+          if (soff + elen < (int)sizeof(srv_line) - 1) {
+            memcpy(srv_line + soff, entry, elen);
+            soff += elen; srv_line[soff] = '\0';
+          }
+        }
+        irc_printf(state, "PRIVMSG %s :| %s\r\n", nick, srv_line);
+        nanosleep(&st_delay, NULL);
+      }
 
       /* Channels section — collect IN and OUT into comma-wrapped lines */
       irc_printf(state, "PRIVMSG %s :+-[ Channels ]---------------------------------------------------------------\r\n", nick);
@@ -475,27 +543,80 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                  nick, admin_count, oper_count);
       nanosleep(&st_delay, NULL);
 
-      /* Hub Config */
-      irc_printf(state, "PRIVMSG %s :+-[ Hub Config ]-------------------------------------------------------------\r\n", nick);
-      if (state->hub_connected && state->current_hub[0])
-        irc_printf(state, "PRIVMSG %s :| Hub    : CONNECTED (%s)\r\n",
-                   nick, state->current_hub);
-      else
-        irc_printf(state, "PRIVMSG %s :| Hub    : DISCONNECTED\r\n", nick);
-
-      /* Trusted bots — word-wrap at 68 chars, continuation "| " + 9 spaces */
-      if (state->trusted_bot_count > 0) {
+      /* Hub Config or standalone Bots section */
+#define HUB_TRUST_MAX 100
+#define BOTS_PFX1 "| Bots   : "
+#define BOTS_PFX2 "|          "
+#define BOTS_CW   66
+      if (state->hub_count > 0) {
+        /* Hub is configured — show full Hub Config */
+        irc_printf(state, "PRIVMSG %s :+-[ Hub Config ]-------------------------------------------------------------\r\n", nick);
+        if (state->hub_connected && state->current_hub[0]) {
+          if (state->hub_connect_time > 0 && state->hub_authenticated) {
+            long hup = (long)(time(NULL) - state->hub_connect_time);
+            char hub_up_str[64];
+            snprintf(hub_up_str, sizeof(hub_up_str), "%ldd %ldh %ldm %lds",
+                     hup/86400, (hup%86400)/3600, (hup%3600)/60, hup%60);
+            irc_printf(state, "PRIVMSG %s :| Hub    : %s (CONNECTED, UPTIME: %s)\r\n",
+                       nick, state->current_hub, hub_up_str);
+          } else {
+            irc_printf(state, "PRIVMSG %s :| Hub    : %s (CONNECTED)\r\n",
+                       nick, state->current_hub);
+          }
+        } else {
+          irc_printf(state, "PRIVMSG %s :| Hub    : DISCONNECTED\r\n", nick);
+        }
+        /* Configured hubs */
+        {
+          char hubs_line[300] = ""; int hoff = 0;
+          for (int i = 0; i < state->hub_count; i++) {
+            int hlen = (int)strlen(state->hub_list[i]);
+            if (hoff) { hubs_line[hoff++] = ','; hubs_line[hoff++] = ' '; }
+            if (hoff + hlen < (int)sizeof(hubs_line) - 1) {
+              memcpy(hubs_line + hoff, state->hub_list[i], hlen);
+              hoff += hlen; hubs_line[hoff] = '\0';
+            }
+          }
+          irc_printf(state, "PRIVMSG %s :| Hubs   : %s\r\n", nick, hubs_line);
+        }
+        /* Bots — word-wrap, truncate after 100 */
+        if (state->trusted_bot_count > 0) {
+          char trust_line[512] = ""; int toff = 0;
+          int first = 1, shown = 0;
+          for (int i = 0; i < state->trusted_bot_count && shown < HUB_TRUST_MAX; i++, shown++) {
+            char tname[64] = "";
+            sscanf(state->trusted_bots[i], "%63[^!]", tname);
+            int tlen = (int)strlen(tname);
+            int need = toff ? tlen + 2 : tlen;
+            if (toff && toff + need > BOTS_CW) {
+              irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? BOTS_PFX1 : BOTS_PFX2, trust_line);
+              first = 0; toff = 0; trust_line[0] = '\0';
+            }
+            if (toff) { trust_line[toff++] = ','; trust_line[toff++] = ' '; }
+            memcpy(trust_line + toff, tname, tlen);
+            toff += tlen; trust_line[toff] = '\0';
+          }
+          if (toff)
+            irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? BOTS_PFX1 : BOTS_PFX2, trust_line);
+          if (state->trusted_bot_count > HUB_TRUST_MAX)
+            irc_printf(state, "PRIVMSG %s :|          ...and %d more\r\n", nick,
+                       state->trusted_bot_count - HUB_TRUST_MAX);
+        } else {
+          irc_printf(state, "PRIVMSG %s :| Bots   : (none)\r\n", nick);
+        }
+        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, ST_FOOT);
+      } else if (state->trusted_bot_count > 0) {
+        /* No hub — standalone bot-to-bot mode, show Bots section only */
+        irc_printf(state, "PRIVMSG %s :+-[ Bots ]-------------------------------------------------------------------\r\n", nick);
         char trust_line[512] = ""; int toff = 0;
-        const char *tp1 = "| Trusted: ", *tp2 = "|          ";
-        int tcw = 66; /* content width after prefix */
         int first = 1, shown = 0;
-        for (int i = 0; i < state->trusted_bot_count && shown < BOT_STATUS_MAX_LINES; i++, shown++) {
+        for (int i = 0; i < state->trusted_bot_count && shown < HUB_TRUST_MAX; i++, shown++) {
           char tname[64] = "";
-          sscanf(state->trusted_bots[i], "%63[^!]", tname); /* nick before ! */
+          sscanf(state->trusted_bots[i], "%63[^!]", tname);
           int tlen = (int)strlen(tname);
           int need = toff ? tlen + 2 : tlen;
-          if (toff && toff + need > tcw) {
-            irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? tp1 : tp2, trust_line);
+          if (toff && toff + need > BOTS_CW) {
+            irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? BOTS_PFX1 : BOTS_PFX2, trust_line);
             first = 0; toff = 0; trust_line[0] = '\0';
           }
           if (toff) { trust_line[toff++] = ','; trust_line[toff++] = ' '; }
@@ -503,29 +624,19 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           toff += tlen; trust_line[toff] = '\0';
         }
         if (toff)
-          irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? tp1 : tp2, trust_line);
-        if (state->trusted_bot_count > BOT_STATUS_MAX_LINES)
+          irc_printf(state, "PRIVMSG %s :%s%s\r\n", nick, first ? BOTS_PFX1 : BOTS_PFX2, trust_line);
+        if (state->trusted_bot_count > HUB_TRUST_MAX)
           irc_printf(state, "PRIVMSG %s :|          ...and %d more\r\n", nick,
-                     state->trusted_bot_count - BOT_STATUS_MAX_LINES);
+                     state->trusted_bot_count - HUB_TRUST_MAX);
+        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, ST_FOOT);
       } else {
-        irc_printf(state, "PRIVMSG %s :| Trusted: (none)\r\n", nick);
+        /* No hub, no bots — just close the box */
+        irc_printf(state, "PRIVMSG %s :%s\r\n", nick, ST_FOOT);
       }
-
-      /* Configured hubs */
-      if (state->hub_count > 0) {
-        char hubs_line[300] = ""; int hoff = 0;
-        for (int i = 0; i < state->hub_count; i++) {
-          int hlen = (int)strlen(state->hub_list[i]);
-          if (hoff) { hubs_line[hoff++] = ','; hubs_line[hoff++] = ' '; }
-          if (hoff + hlen < (int)sizeof(hubs_line) - 1) {
-            memcpy(hubs_line + hoff, state->hub_list[i], hlen);
-            hoff += hlen; hubs_line[hoff] = '\0';
-          }
-        }
-        irc_printf(state, "PRIVMSG %s :| Hubs   : %s\r\n", nick, hubs_line);
-      }
-
-      irc_printf(state, "PRIVMSG %s :%s\r\n", nick, ST_FOOT);
+#undef HUB_TRUST_MAX
+#undef BOTS_PFX1
+#undef BOTS_PFX2
+#undef BOTS_CW
 #undef ST_SEP
 #undef ST_FOOT
 #undef ST_LINE
@@ -535,29 +646,113 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                  NICK_TAKE_TIME);
       irc_generate_new_nick(state);
       state->nick_release_time = time(NULL);
-    } else if (strcasecmp(command, "setnick") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: setnick <nickname>\r\n", nick);
+    } else if (strcasecmp(command, "chnick") == 0) {
+      if (!arg1 || !arg2) {
+        irc_printf(state, "PRIVMSG %s :Syntax: chnick <oldnick> <newnick>\r\n", nick);
         return;
       }
-      if (!is_valid_bot_nick(arg1)) {
-        if (strchr(arg1, '|'))
+      if (!is_valid_bot_nick(arg2)) {
+        if (strchr(arg2, '|'))
           irc_printf(state,
-              "PRIVMSG %s :Error: Nickname cannot contain '|' (reserved as protocol delimiter).\r\n",
-              nick);
+              "PRIVMSG %s :Error: New nick cannot contain '|'.\r\n", nick);
         else
           irc_printf(state,
-              "PRIVMSG %s :Error: Nickname is too long (max %d chars).\r\n",
+              "PRIVMSG %s :Error: New nick too long (max %d chars).\r\n",
               nick, MAX_NICK - 1);
-      } else {
-        snprintf(state->target_nick, MAX_NICK, "%s", arg1);
-        config_write(state, state->startup_password);
-        irc_printf(state,
-                   "PRIVMSG %s :Target nickname changed to '%s' and saved.\r\n",
-                   nick, state->target_nick);
+        return;
       }
+      /* Uniqueness check: newnick must not already exist in any type */
+      for (int i = 0; i < state->user_record_count; i++) {
+        if (state->user_records[i].is_active &&
+            strcasecmp(state->user_records[i].name, arg2) == 0) {
+          irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use.\r\n",
+                     nick, arg2);
+          return;
+        }
+      }
+      if (strcasecmp(state->target_nick, arg2) == 0) {
+        irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use by this bot.\r\n",
+                   nick, arg2);
+        return;
+      }
+      for (int i = 0; i < state->trusted_bot_count; i++) {
+        char bnick[MAX_NICK] = "";
+        sscanf(state->trusted_bots[i], "%9[^!]", bnick);
+        if (strcasecmp(bnick, arg2) == 0) {
+          irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use by a bot.\r\n",
+                     nick, arg2);
+          return;
+        }
+      }
+      bool cn_found = false;
+      /* Case 1: this bot's own target nick */
+      if (strcasecmp(state->target_nick, arg1) == 0) {
+        snprintf(state->target_nick, MAX_NICK, "%s", arg2);
+        state->current_nick_ts = time(NULL);
+        config_write_with_state_pass(state);
+        hub_client_push_delta(state, "n", arg2, state->current_nick_ts);
+        irc_printf(state, "PRIVMSG %s :This bot's nick changed to '%s' and saved.\r\n",
+                   nick, arg2);
+        cn_found = true;
+      }
+      /* Case 2: admin or oper */
+      if (!cn_found) {
+        for (int i = 0; i < state->user_record_count; i++) {
+          user_record_t *u = &state->user_records[i];
+          if (u->is_active && strcasecmp(u->name, arg1) == 0) {
+            snprintf(u->name, sizeof(u->name), "%s", arg2);
+            u->timestamp = time(NULL);
+            config_write_with_state_pass(state);
+            hub_client_push_admin_delta(state);
+            irc_printf(state, "PRIVMSG %s :User '%s' renamed to '%s'.\r\n",
+                       nick, arg1, arg2);
+            cn_found = true;
+            break;
+          }
+        }
+      }
+      /* Case 3: trusted bot */
+      if (!cn_found) {
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          char bnick[MAX_NICK] = "", bmask[MAX_MASK_LEN] = "";
+          char buuid[64] = "";
+          long bts = 0;
+          sscanf(state->trusted_bots[i], "%9[^!]", bnick);
+          if (strcasecmp(bnick, arg1) != 0) continue;
+          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%ld",
+                 bmask, buuid, &bts);
+          /* Replace the nick part of the mask (up to '!') */
+          char newmask[MAX_MASK_LEN] = "";
+          char *bang = strchr(bmask, '!');
+          if (bang)
+            snprintf(newmask, sizeof(newmask), "%s%s", arg2, bang);
+          else
+            snprintf(newmask, sizeof(newmask), "%s", arg2);
+          long new_ts = time(NULL);
+          char new_entry[512];
+          snprintf(new_entry, sizeof(new_entry), "%s|%s|%ld",
+                   newmask, buuid, new_ts);
+          char *dup_entry = strdup(new_entry);
+          if (!dup_entry) {
+            irc_printf(state, "PRIVMSG %s :Error: Memory allocation failed.\r\n", nick);
+            return;
+          }
+          free(state->trusted_bots[i]);
+          state->trusted_bots[i] = dup_entry;
+          config_write_with_state_pass(state);
+          /* Send SETNICK to the bot via encrypted bot comms (old nick) */
+          bot_comms_send_command(state, arg1, "SETNICK %s", arg2);
+          irc_printf(state, "PRIVMSG %s :Bot '%s' renamed to '%s' and notified.\r\n",
+                     nick, arg1, arg2);
+          cn_found = true;
+          break;
+        }
+      }
+      if (!cn_found)
+        irc_printf(state, "PRIVMSG %s :Error: No bot/admin/oper named '%s' found.\r\n",
+                   nick, arg1);
     } else if (strcasecmp(command, "saveconf") == 0) {
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       irc_printf(state, "PRIVMSG %s :Configuration state saved to %s.\r\n",
                  nick, CONFIG_FILE);
     } else if (strcasecmp(command, "setlog") == 0) {
@@ -579,7 +774,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         state->log_type = (log_type_t)new_level;
         irc_printf(state, "PRIVMSG %s :Log level set to %d.\r\n", nick,
                    new_level);
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
       } else
         irc_printf(state,
                    "PRIVMSG %s :Invalid log level. Please provide a valid "
@@ -717,34 +912,86 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "match") == 0) {
-      /* Show all records for named user or * for all */
+      /* Show active records for named user or * for all */
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s :Syntax: match <name|*>\r\n", nick);
         return;
       }
       bool match_all = (strcmp(arg1, "*") == 0);
-      if (match_all)
-        irc_printf(state, "PRIVMSG %s :--- All users (may produce many lines) ---\r\n", nick);
+      irc_printf(state, "PRIVMSG %s :| ircbot %s match%s\r\n", nick, BOT_VERSION,
+                 match_all ? " *" : "");
+      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
       struct timespec delay = {0, 100000000};
       int shown = 0;
       for (int i = 0; i < state->user_record_count; i++) {
         user_record_t *u = &state->user_records[i];
         if (!match_all && strcasecmp(u->name, arg1) != 0) continue;
-        irc_printf(state, "PRIVMSG %s :[%c] %s uuid:%s last_seen:%ld [%s]\r\n",
-                   nick, u->type, u->name, u->uuid,
-                   (long)u->last_seen, u->is_active ? "active" : "del");
+        if (!u->is_active) continue;
+        char ts_buf[48];
+        if (u->last_seen == 0) {
+          snprintf(ts_buf, sizeof(ts_buf), "never");
+        } else {
+          struct tm *tm_utc = gmtime(&u->last_seen);
+          strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+        }
+        irc_printf(state, "PRIVMSG %s :| [%c] %-20s  (last seen: %s)\r\n",
+                   nick, u->type, u->name, ts_buf);
         nanosleep(&delay, NULL);
         for (int j = 0; j < state->mask_record_count; j++) {
           mask_record_t *m = &state->mask_records[j];
           if (strcmp(m->uuid, u->uuid) != 0) continue;
-          irc_printf(state, "PRIVMSG %s :  mask: %s [%s] last_used:%ld\r\n",
-                     nick, m->mask, m->is_active ? "active" : "del",
-                     (long)m->last_used);
+          if (!m->is_active) continue;
+          char used_buf[48];
+          if (m->last_used == 0) {
+            snprintf(used_buf, sizeof(used_buf), "never");
+          } else {
+            struct tm *tm_used = gmtime(&m->last_used);
+            strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tm_used);
+          }
+          irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
+                     nick, m->mask, used_buf);
           nanosleep(&delay, NULL);
           if (++shown >= BOT_STATUS_MAX_LINES) goto match_done;
         }
       }
-      match_done: ;
+      /* If no user record found and not wildcard, check trusted bots */
+      if (shown == 0 && !match_all) {
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          char bot_mask[256] = "", bot_uuid[64] = "";
+          long bot_ts = 0;
+          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%ld",
+                 bot_mask, bot_uuid, &bot_ts);
+          char bot_nick[MAX_NICK] = "";
+          sscanf(bot_mask, "%9[^!]", bot_nick);
+          if (strcasecmp(bot_nick, arg1) != 0) continue;
+          /* Found a matching bot */
+          char ts_buf[48];
+          if (bot_ts == 0) {
+            snprintf(ts_buf, sizeof(ts_buf), "never");
+          } else {
+            time_t bts = (time_t)bot_ts;
+            struct tm *tm_utc = gmtime(&bts);
+            strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+          }
+          irc_printf(state, "PRIVMSG %s :| [b] %-20s  (last seen: %s)\r\n",
+                     nick, bot_nick, ts_buf);
+          nanosleep(&delay, NULL);
+          if (bot_mask[0])
+            irc_printf(state, "PRIVMSG %s :|   mask: %s\r\n", nick, bot_mask);
+          if (bot_uuid[0])
+            irc_printf(state, "PRIVMSG %s :|   uuid: %s\r\n", nick, bot_uuid);
+          const char *hub_str = (state->hub_connected && state->current_hub[0])
+                                ? state->current_hub : "none";
+          irc_printf(state, "PRIVMSG %s :|   hub : %s\r\n", nick, hub_str);
+          shown++;
+          nanosleep(&delay, NULL);
+          break;
+        }
+      }
+      if (shown == 0 && !match_all)
+        irc_printf(state, "PRIVMSG %s :| unknown user: %s\r\n", nick, arg1);
+      match_done:
+      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "+admin") == 0) {
       /* +admin <name> <password> <usermask> */
@@ -789,7 +1036,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
       snprintf(m->mask, sizeof(m->mask), "%s", arg3);
       m->is_active = true; m->timestamp = now;
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Admin '%s' added with mask %s\r\n", nick, arg1, arg3);
 
@@ -812,7 +1059,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           state->mask_records[i].is_active = false;
           state->mask_records[i].timestamp = time(NULL);
         }
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Admin '%s' and all their masks removed.\r\n", nick, arg1);
 
@@ -853,7 +1100,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       snprintf(m2->uuid, sizeof(m2->uuid), "%s", new_uuid2);
       snprintf(m2->mask, sizeof(m2->mask), "%s", arg3);
       m2->is_active = true; m2->timestamp = now2;
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Oper '%s' added with mask %s\r\n", nick, arg1, arg3);
 
@@ -876,7 +1123,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           state->mask_records[i].is_active = false;
           state->mask_records[i].timestamp = time(NULL);
         }
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Oper '%s' and all their masks removed.\r\n", nick, arg1);
 
@@ -912,7 +1159,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       snprintf(nm->uuid, sizeof(nm->uuid), "%s", tum_uuid);
       snprintf(nm->mask, sizeof(nm->mask), "%s", arg2);
       nm->is_active = true; nm->timestamp = time(NULL);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Mask %s added to %s\r\n", nick, arg2, arg1);
 
@@ -940,7 +1187,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (!fdm) { irc_printf(state, "PRIVMSG %s :Error: mask '%s' not found for %s.\r\n", nick, arg2, arg1); return; }
       fdm->is_active = false;
       fdm->timestamp = time(NULL);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Mask %s removed from %s\r\n", nick, arg2, arg1);
 
@@ -956,7 +1203,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         if (!dup) return;
         state->server_list[state->server_count++] = dup;
         state->server_list[state->server_count] = NULL;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Added server '%s' and saved config.\r\n",
                    nick, arg1);
       } else
@@ -978,7 +1225,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           state->server_list[i] = state->server_list[i + 1];
         state->server_count--;
         state->server_list[state->server_count] = NULL;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state,
                    "PRIVMSG %s :Removed server '%s' and saved config.\r\n",
                    nick, arg1);
@@ -1006,7 +1253,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         char *dup = strdup(arg1);
         if (!dup) return;
         state->hub_list[state->hub_count++] = dup;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Added Hub: %s\r\n", nick, arg1);
       } else {
         irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
@@ -1039,7 +1286,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         for (int i = found; i < state->hub_count - 1; i++)
           state->hub_list[i] = state->hub_list[i + 1];
         state->hub_count--;
-        config_write(state, state->startup_password);
+        config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
 
         // If we disconnected and there are other hubs available, reconnect
@@ -1093,7 +1340,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
               EVP_PKEY_free(xp);
 
               snprintf(state->hub_key, sizeof(state->hub_key), "%s", arg1);
-              config_write(state, state->startup_password);
+              config_write_with_state_pass(state);
               irc_printf(state,
                          "PRIVMSG %s :✓ Curve25519 key set. Reconnecting...\r\n",
                          nick);
@@ -1142,7 +1389,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
       // Store UUID
       snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", sanitized);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       irc_printf(state,
                  "PRIVMSG %s :UUID set to: %s. Reconnecting to hub...\r\n",
                  nick, state->bot_uuid);
@@ -1169,7 +1416,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (!cp_target) { irc_printf(state, "PRIVMSG %s :Error: user '%s' not found.\r\n", nick, arg1); return; }
       snprintf(cp_target->password, sizeof(cp_target->password), "%s", arg2);
       cp_target->timestamp = time(NULL);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Password changed for %s\r\n", nick, arg1);
 
@@ -1177,7 +1424,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (!arg1) {
         irc_printf(state,
                    "PRIVMSG %s :Admin commands: die, jump, op, join, part, "
-                   "status, givenick, setnick, +server, -server, admins, opers, "
+                   "status, givenick, chnick, +server, -server, admins, opers, "
                    "+admin, -admin, +oper, -oper, +usermask, -usermask, chpass, "
                    "match, botpass, +bot, -bot, "
                    "+hub, -hub, sethubkey, setuuid, saveconf, setlog, getlog, "
@@ -1191,7 +1438,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         } else if (strcasecmp(arg1, "jump") == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Syntax: jump - Jump to the next irc server.\r\n",
+              "PRIVMSG %s :Syntax: jump [server] - Jump to the next IRC server, "
+              "or to a specific server by hostname (port-independent match).\r\n",
               nick);
         } else if (strcasecmp(arg1, "op") == 0) {
           irc_printf(state,
@@ -1208,10 +1456,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
               "to an alternate. Will try to regain primary nick after 20 "
               "seconds until it accomplishes the task.\r\n",
               nick);
-        } else if (strcasecmp(arg1, "setnick") == 0) {
+        } else if (strcasecmp(arg1, "chnick") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: setnick <nickname> - Changes the "
-                     "primary nickname of the bot.\r\n",
+                     "PRIVMSG %s :Syntax: chnick <oldnick> <newnick> - Renames "
+                     "a bot, admin, or oper. Nicks must be unique across all types. "
+                     "For bots, propagates the change via hub mesh.\r\n",
                      nick);
         } else if (strcasecmp(arg1, "+server") == 0) {
           irc_printf(state,
@@ -1352,9 +1601,23 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       snprintf(auth_user->password, sizeof(auth_user->password), "%s", arg2);
       auth_user->timestamp = time(NULL);
-      config_write(state, state->startup_password);
+      config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Your password has been changed.\r\n", nick);
+    } else if (strcasecmp(command, "help") == 0) {
+      if (!arg1) {
+        irc_printf(state, "PRIVMSG %s :Oper commands: op, chpass, help\r\n", nick);
+      } else {
+        if (strcasecmp(arg1, "op") == 0) {
+          irc_printf(state, "PRIVMSG %s :Syntax: op <#channel> - Get operator status on a channel.\r\n", nick);
+        } else if (strcasecmp(arg1, "chpass") == 0) {
+          irc_printf(state, "PRIVMSG %s :Syntax: chpass <yourname> <newpassword> - Change your own password.\r\n", nick);
+        } else if (strcasecmp(arg1, "help") == 0) {
+          irc_printf(state, "PRIVMSG %s :Syntax: help [command] - Show available commands.\r\n", nick);
+        } else {
+          irc_printf(state, "PRIVMSG %s :No help available for command '%s'.\r\n", nick, arg1);
+        }
+      }
     }
   }
 }

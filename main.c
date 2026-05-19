@@ -728,17 +728,18 @@ int main(int argc, char *argv[]) {
     memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
-  snprintf(state.startup_password, sizeof(state.startup_password), "%s",
-           startup_password);
-  memset(startup_password, 0, sizeof(startup_password));
   get_local_ip(&state);
   setup_signals();
 
-  if (!config_load(&state, state.startup_password, CONFIG_FILE)) {
+  if (!config_load(&state, startup_password, CONFIG_FILE)) {
     close(pid_fd);
     remove(PID_FILE);
+    memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
+  /* XOR-protect the password in memory after successful load */
+  bot_set_startup_pass(&state, startup_password);
+  memset(startup_password, 0, sizeof(startup_password));
   state.server_list[state.server_count] = NULL;
 
   // --- MAIN LOOP ---
@@ -804,7 +805,7 @@ int main(int argc, char *argv[]) {
   }
 
   // --- CLEANUP ---
-  config_write(&state, state.startup_password);
+  config_write_with_state_pass(&state);
   irc_disconnect(&state);
   if (state.hub_fd != -1)
     close(state.hub_fd);
