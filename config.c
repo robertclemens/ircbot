@@ -60,8 +60,14 @@ bool config_load(bot_state_t *state, const char *password,
   fclose(in_file);
 
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                 (unsigned char *)password, strlen(password), 1, key, NULL);
+  /* Try modern PBKDF2 first; fall back to the legacy single-iteration derivation
+   * so existing config files written before this migration can still be read.
+   * On a successful legacy-decrypt the caller re-encrypts with PBKDF2 below. */
+  bool legacy_format = false;
+  if (!crypto_derive_config_key(password, salt, key)) {
+    free(ciphertext);
+    return false;
+  }
 
   unsigned char *plaintext = malloc(ciphertext_len + 1);
   if (!plaintext)
@@ -71,6 +77,7 @@ bool config_load(bot_state_t *state, const char *password,
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   if (!ctx) {
+    secure_wipe(key, sizeof(key));
     free(ciphertext);
     free(plaintext);
     return false;
@@ -79,13 +86,50 @@ bool config_load(bot_state_t *state, const char *password,
       EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
                         ciphertext_len) != 1) {
     EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key, sizeof(key));
     free(ciphertext);
     free(plaintext);
     return false;
   }
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
 
-  if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) > 0) {
+  int final_rc = EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len);
+  if (final_rc <= 0) {
+    /* PBKDF2 didn't verify — try legacy KDF (one-shot EVP_BytesToKey). */
+    EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key, sizeof(key));
+    if (!crypto_derive_legacy_key(password, salt, key)) {
+      free(ciphertext);
+      free(plaintext);
+      return false;
+    }
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) {
+      secure_wipe(key, sizeof(key));
+      free(ciphertext);
+      free(plaintext);
+      return false;
+    }
+    plaintext_len = 0;
+    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+        EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
+                          ciphertext_len) != 1) {
+      EVP_CIPHER_CTX_free(ctx);
+      secure_wipe(key, sizeof(key));
+      free(ciphertext);
+      free(plaintext);
+      return false;
+    }
+    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
+    final_rc = EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len);
+    if (final_rc > 0) {
+      legacy_format = true;
+      log_message(L_INFO, state,
+                  "[CFG] Legacy KDF detected; will rewrite with PBKDF2.\n");
+    }
+  }
+
+  if (final_rc > 0) {
     plaintext_len += len;
     plaintext[plaintext_len] = '\0';
 
@@ -361,12 +405,15 @@ bool config_load(bot_state_t *state, const char *password,
         L_INFO, state,
         "[CFG] GCM decryption failed. Incorrect password or corrupt file.\n");
     EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key, sizeof(key));
     free(ciphertext);
     free(plaintext);
     return false;
   }
 
   EVP_CIPHER_CTX_free(ctx);
+  secure_wipe(key, sizeof(key));
+  secure_wipe(plaintext, (size_t)plaintext_len);
   free(ciphertext);
   free(plaintext);
 
@@ -506,6 +553,16 @@ bool config_load(bot_state_t *state, const char *password,
     config_write(state, password);
   }
 
+  /* If the loaded file was encrypted with the legacy single-iteration KDF,
+   * rewrite it with PBKDF2 now. The next save anywhere in the bot would
+   * already do this, but doing it eagerly closes the window. */
+  if (legacy_format) {
+    log_message(L_INFO, state,
+                "[CFG] Rewriting config with PBKDF2 (%d iterations).\n",
+                PBKDF2_ITERATIONS);
+    config_write_local(state, password);
+  }
+
   // Validation changed
   if (state->target_nick[0] == '\0' || state->server_count == 0 ||
       state->user[0] == '\0') {
@@ -597,36 +654,49 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   }
 
   unsigned char salt[SALT_SIZE];
-  RAND_bytes(salt, sizeof(salt));
+  if (RAND_bytes(salt, sizeof(salt)) != 1) {
+    fprintf(stderr, "[CFG] RAND_bytes failed for salt; aborting write.\n");
+    return;
+  }
 
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                 (unsigned char *)password, strlen(password), 1, key, NULL);
+  if (!crypto_derive_config_key(password, salt, key)) {
+    fprintf(stderr, "[CFG] PBKDF2 key derivation failed; aborting write.\n");
+    return;
+  }
 
   unsigned char iv[GCM_IV_LEN];
-  RAND_bytes(iv, sizeof(iv));
+  if (RAND_bytes(iv, sizeof(iv)) != 1) {
+    fprintf(stderr, "[CFG] RAND_bytes failed for IV; aborting write.\n");
+    secure_wipe(key, sizeof(key));
+    return;
+  }
 
   unsigned char tag[GCM_TAG_LEN];
   int plaintext_len = strlen(plaintext_overrides);
   unsigned char *ciphertext = malloc(plaintext_len);
-  if (!ciphertext)
+  if (!ciphertext) {
+    secure_wipe(key, sizeof(key));
     handle_fatal_error("malloc failed for ciphertext");
+  }
   int len, ciphertext_len;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) { free(ciphertext); return; }
+  if (!ctx) { secure_wipe(key, sizeof(key)); free(ciphertext); return; }
 
   if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
       EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len,
                         (unsigned char *)plaintext_overrides, plaintext_len) != 1 ||
-      EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1) {
+      EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
     EVP_CIPHER_CTX_free(ctx);
+    secure_wipe(key, sizeof(key));
     free(ciphertext);
     return;
   }
   ciphertext_len += len;
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
   EVP_CIPHER_CTX_free(ctx);
+  secure_wipe(key, sizeof(key));
 
   char temp_file[256];
   snprintf(temp_file, sizeof(temp_file), "%s.tmp", CONFIG_FILE);

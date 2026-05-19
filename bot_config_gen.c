@@ -10,44 +10,76 @@
 #include <stdlib.h>
 #include <string.h>
 #include <time.h>
+#include <sys/stat.h>
+#include <unistd.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 
-#define SALT_SIZE   16
-#define GCM_IV_LEN  12
-#define GCM_TAG_LEN 16
+#define SALT_SIZE          16
+#define GCM_IV_LEN         12
+#define GCM_TAG_LEN        16
+#define PBKDF2_ITERATIONS  100000
+
+static void secure_wipe_local(void *ptr, size_t len) {
+    volatile unsigned char *p = ptr;
+    while (len--) *p++ = 0;
+}
 
 static int write_config(const char *path, const char *pass, const char *plain) {
     int plen = (int)strlen(plain);
     unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN], key[32];
-    RAND_bytes(salt, SALT_SIZE);
-    RAND_bytes(iv,   GCM_IV_LEN);
-    EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                   (unsigned char *)pass, (int)strlen(pass), 1, key, NULL);
+    int rc = -1;
+    EVP_CIPHER_CTX *ctx = NULL;
+    unsigned char *ct = NULL;
 
-    unsigned char *ct = malloc((size_t)plen + 16);
-    if (!ct) return -1;
+    if (RAND_bytes(salt, SALT_SIZE) != 1 ||
+        RAND_bytes(iv,   GCM_IV_LEN)  != 1) {
+        fprintf(stderr, "RAND_bytes failed\n");
+        return -1;
+    }
+    if (PKCS5_PBKDF2_HMAC(pass, (int)strlen(pass), salt, SALT_SIZE,
+                          PBKDF2_ITERATIONS, EVP_sha256(), 32, key) != 1) {
+        fprintf(stderr, "PBKDF2 failed\n");
+        return -1;
+    }
+
+    ct = malloc((size_t)plen + 16);
+    if (!ct) goto done;
     int len, ctlen;
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL);
-    EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv);
-    EVP_EncryptUpdate(ctx, ct, &len, (unsigned char *)plain, plen);
+    ctx = EVP_CIPHER_CTX_new();
+    if (!ctx) goto done;
+    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+        EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL) != 1 ||
+        EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1 ||
+        EVP_EncryptUpdate(ctx, ct, &len, (unsigned char *)plain, plen) != 1) {
+        goto done;
+    }
     ctlen = len;
-    EVP_EncryptFinal_ex(ctx, ct + len, &len); ctlen += len;
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag);
-    EVP_CIPHER_CTX_free(ctx);
+    if (EVP_EncryptFinal_ex(ctx, ct + len, &len) != 1) goto done;
+    ctlen += len;
+    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1)
+        goto done;
 
     FILE *f = fopen(path, "wb");
-    if (!f) { free(ct); return -1; }
-    fwrite(salt, 1, SALT_SIZE,   f);
-    fwrite(iv,   1, GCM_IV_LEN,  f);
-    fwrite(tag,  1, GCM_TAG_LEN, f);
-    fwrite(ct,   1, ctlen,       f);
+    if (!f) goto done;
+    /* 0600: keep the encrypted config readable only by its owner. */
+    {
+        int fd = fileno(f);
+        if (fd >= 0) (void)fchmod(fd, 0600);
+    }
+    if (fwrite(salt, 1, SALT_SIZE,   f) == SALT_SIZE   &&
+        fwrite(iv,   1, GCM_IV_LEN,  f) == GCM_IV_LEN  &&
+        fwrite(tag,  1, GCM_TAG_LEN, f) == GCM_TAG_LEN &&
+        fwrite(ct,   1, (size_t)ctlen, f) == (size_t)ctlen) {
+        rc = 0;
+    }
     fclose(f);
-    free(ct);
-    memset(key, 0, sizeof(key));
-    return 0;
+
+done:
+    if (ctx) EVP_CIPHER_CTX_free(ctx);
+    if (ct) { secure_wipe_local(ct, (size_t)plen); free(ct); }
+    secure_wipe_local(key, sizeof(key));
+    return rc;
 }
 
 static void gen_uuid(char *out, size_t outlen) {

@@ -47,9 +47,11 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         memcpy(salt, decoded_data, SALT_SIZE);
 
         unsigned char key[32];
-        EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                       (const unsigned char *)state->bot_comm_pass,
-                       strlen(state->bot_comm_pass), 1, key, NULL);
+        if (!crypto_derive_config_key(state->bot_comm_pass, salt, key)) {
+          if (decoded_data) free(decoded_data);
+          if (tag) free(tag);
+          return;
+        }
 
         unsigned char *ciphertext_ptr = decoded_data + SALT_SIZE;
         int ciphertext_len = decoded_len - SALT_SIZE;
@@ -58,6 +60,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         if (decrypted_data) {
           int decrypted_len = crypto_aes_gcm_decrypt(
               ciphertext_ptr, ciphertext_len, key, decrypted_data, tag);
+
+          /* Legacy-format fallback for un-migrated peer bots. */
+          if (decrypted_len < 0 &&
+              crypto_derive_legacy_key(state->bot_comm_pass, salt, key)) {
+            decrypted_len = crypto_aes_gcm_decrypt(
+                ciphertext_ptr, ciphertext_len, key, decrypted_data, tag);
+          }
 
           if (decrypted_len >= 0) {
             decrypted_data[decrypted_len] = '\0';
@@ -130,8 +139,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
               }
             }
           }
+          secure_wipe(decrypted_data, (size_t)ciphertext_len + 1);
           free(decrypted_data);
         }
+        secure_wipe(key, sizeof(key));
       }
 
       if (decoded_data)

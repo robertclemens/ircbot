@@ -36,9 +36,11 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   unsigned char salt[SALT_SIZE];
   memcpy(salt, decoded_data, SALT_SIZE);
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                 (const unsigned char *)state->bot_comm_pass,
-                 strlen(state->bot_comm_pass), 1, key, NULL);
+  if (!crypto_derive_config_key(state->bot_comm_pass, salt, key)) {
+    free(decoded_data);
+    free(tag);
+    return;
+  }
 
   int ciphertext_len = decoded_len - SALT_SIZE;
   unsigned char *decrypted_data = malloc(ciphertext_len + 1);
@@ -46,6 +48,15 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
     int decrypted_len = crypto_aes_gcm_decrypt(decoded_data + SALT_SIZE,
                                                ciphertext_len, key,
                                                decrypted_data, tag);
+    /* Fall back to legacy single-iteration KDF so messages from un-migrated
+     * peer bots can still be decrypted. Once everyone has upgraded this can
+     * be removed. */
+    if (decrypted_len < 0 &&
+        crypto_derive_legacy_key(state->bot_comm_pass, salt, key)) {
+      decrypted_len = crypto_aes_gcm_decrypt(decoded_data + SALT_SIZE,
+                                             ciphertext_len, key,
+                                             decrypted_data, tag);
+    }
     if (decrypted_len >= 0) {
       decrypted_data[decrypted_len] = '\0';
       char *saveptr_bot;
@@ -98,8 +109,10 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
         }
       }
     }
+    secure_wipe(decrypted_data, (size_t)ciphertext_len + 1);
     free(decrypted_data);
   }
+  secure_wipe(key, sizeof(key));
   free(decoded_data);
   free(tag);
 }
@@ -138,9 +151,7 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   if (RAND_bytes(salt, sizeof(salt)) != 1) return;
 
   unsigned char key[32];
-  EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                 (const unsigned char *)state->bot_comm_pass,
-                 strlen(state->bot_comm_pass), 1, key, NULL);
+  if (!crypto_derive_config_key(state->bot_comm_pass, salt, key)) return;
 
   int plaintext_len = strlen(plaintext_message);
 
@@ -194,4 +205,6 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
     free(encoded_ciphertext);
     free(encoded_tag);
   }
+  secure_wipe(key, sizeof(key));
+  secure_wipe(plaintext_message, sizeof(plaintext_message));
 }

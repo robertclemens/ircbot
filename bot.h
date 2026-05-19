@@ -68,9 +68,9 @@
 #define MAX_ROSTER_SIZE                                                        \
   50 // Max channel roster size to store. Increase if in very large channels.
 #define MAX_SEEN_HASHES                                                        \
-  64 // Stores admin request hashes to protect against anti-replay attacks
+  4096 // Stores admin request hashes to protect against anti-replay attacks
 #define NONCE_CACHE_SIZE                                                       \
-  32 // Nonce cache for secure communication. Prevents replay attacks
+  4096 // Nonce cache for secure communication. Prevents replay attacks
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
 #define GCM_TAG_LEN                                                            \
   16 // 16 bytes (128 bits) is industry standard. Do not change
@@ -380,6 +380,17 @@ int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *salt, size_t salt_len,
                        const unsigned char *info, size_t info_len,
                        unsigned char *out, size_t out_len);
+/* Derive a 32-byte AES-256-GCM key from a password using PBKDF2-HMAC-SHA256
+ * with PBKDF2_ITERATIONS rounds. Returns true on success. */
+bool crypto_derive_config_key(const char *password, const unsigned char *salt,
+                              unsigned char out_key[32]);
+/* Legacy (single-iteration EVP_BytesToKey) key derivation, retained only so
+ * existing config and bot-comm payloads can still be decrypted during the
+ * one-time migration to PBKDF2. New writes never call this. */
+bool crypto_derive_legacy_key(const char *password, const unsigned char *salt,
+                              unsigned char out_key[32]);
+/* Volatile-pointer secure zero. Compiler may NOT elide. */
+void secure_wipe(void *ptr, size_t len);
 char *base64_encode(const unsigned char *input, int length);
 unsigned char *base64_decode(const char *input, int *out_len);
 void hub_client_init(bot_state_t *state);

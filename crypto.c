@@ -7,6 +7,31 @@
 
 #include "bot.h"
 
+void secure_wipe(void *ptr, size_t len) {
+    if (!ptr) return;
+    volatile unsigned char *p = ptr;
+    while (len--) *p++ = 0;
+}
+
+bool crypto_derive_config_key(const char *password, const unsigned char *salt,
+                              unsigned char out_key[32]) {
+    if (!password || !salt || !out_key) return false;
+    return PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
+                             salt, SALT_SIZE, PBKDF2_ITERATIONS,
+                             EVP_sha256(), 32, out_key) == 1;
+}
+
+bool crypto_derive_legacy_key(const char *password, const unsigned char *salt,
+                              unsigned char out_key[32]) {
+    if (!password || !salt || !out_key) return false;
+    /* Mirrors the pre-PBKDF2 derivation that wrote existing files:
+     * EVP_BytesToKey(EVP_aes_256_gcm, EVP_sha256, salt, pass, len, 1, key, NULL).
+     * Kept only for read-time migration. */
+    return EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
+                          (const unsigned char *)password,
+                          (int)strlen(password), 1, out_key, NULL) == 32;
+}
+
 int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *salt, size_t salt_len,
                        const unsigned char *info, size_t info_len,
