@@ -393,6 +393,23 @@ bool config_load(bot_state_t *state, const char *password,
         break;
       }
 
+      case 'j': { /* hub's long-term Ed25519 PUBLIC key (v2 hub-bot mutual auth).
+                   * 32 raw bytes, base64 = 44 chars. Used by the bot to verify
+                   * the signature the hub embeds in the handshake challenge. */
+        int dec_len = 0;
+        unsigned char *dec = base64_decode(data, &dec_len);
+        if (dec && dec_len == 32) {
+          memcpy(state->hub_remote_ed_pub, dec, 32);
+          state->hub_remote_ed_pub_set = true;
+        } else {
+          log_message(L_INFO, state,
+                      "[CFG] Hub Ed25519 pubkey ('j' line) is not 32 raw bytes — "
+                      "hub-bot mutual auth disabled until 'sethubpub' is run.\n");
+        }
+        if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
+        break;
+      }
+
       case 'i': // Bot UUID (bot-specific)
         snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", data);
         break;
@@ -642,6 +659,14 @@ static void config_write_file(const bot_state_t *state, const char *password) {
 
   if (state->hub_key[0] != '\0')
     CFG_WRITE("k|%s\n", state->hub_key);
+
+  if (state->hub_remote_ed_pub_set) {
+    char *jb64 = base64_encode(state->hub_remote_ed_pub, 32);
+    if (jb64) {
+      CFG_WRITE("j|%s\n", jb64);
+      free(jb64);
+    }
+  }
 
   if (state->bot_uuid[0] != '\0')
     CFG_WRITE("i|%s\n", state->bot_uuid);

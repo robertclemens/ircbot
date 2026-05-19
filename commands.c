@@ -1544,6 +1544,37 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
     }
 
+    else if (strcasecmp(command, "sethubpub") == 0) {
+      /* Set the hub's long-term Ed25519 PUBLIC key used by the bot to verify
+       * the hub's signature in the v2 handshake. Accepts either:
+       *   - 44-char base64 = raw 32-byte Ed25519 pubkey
+       *   - 88-char base64 = combined 64-byte Ed25519+X25519 pubkey
+       *     (we take the first 32 bytes — same format as hub_public.b64) */
+      if (!arg1) {
+        irc_printf(state,
+                   "PRIVMSG %s :Syntax: sethubpub <44-char or 88-char base64 hub pubkey>\r\n",
+                   nick);
+      } else {
+        int dec_len = 0;
+        unsigned char *dec = base64_decode(arg1, &dec_len);
+        if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
+          irc_printf(state,
+                     "PRIVMSG %s :ERROR: Need base64 of 32-byte Ed25519 pubkey "
+                     "or 64-byte combined Curve25519 pubkey.\r\n", nick);
+          if (dec) free(dec);
+        } else {
+          memcpy(state->hub_remote_ed_pub, dec, 32);
+          state->hub_remote_ed_pub_set = true;
+          memset(dec, 0, dec_len);
+          free(dec);
+          config_write_with_state_pass(state);
+          irc_printf(state,
+                     "PRIVMSG %s :✓ Hub Ed25519 pubkey saved. Next handshake "
+                     "will REQUIRE a valid hub signature.\r\n", nick);
+        }
+      }
+    }
+
     else if (strcasecmp(command, "setuuid") == 0) {
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s :Syntax: setuuid <uuid>\r\n", nick);

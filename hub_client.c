@@ -1325,10 +1325,18 @@ void hub_client_process(bot_state_t *state) {
   }
   if (!state->hub_authenticated) {
     if (auth_state == HUB_AUTH_SENT_UUID) {
-      // Hub sends exactly 64 bytes: challenge_32 || hub_eph_pub_32
-      if (packet_len != 64) {
+      /* v1 layout: challenge(32) || hub_eph_pub(32)                    (64 bytes)
+       * v2 layout: challenge(32) || hub_eph_pub(32) || hub_sig(64)    (128 bytes)
+       *
+       * v2's hub_sig is Ed25519_sign(hub_ed_priv,
+       *   "irchub-hub-auth-v2|" || bot_uuid || "|" || challenge || eph_pub).
+       * The bot verifies with state->hub_remote_ed_pub if set. When hub_pub
+       * is configured but the hub sent v1, we refuse — the operator opted in
+       * to mutual auth. When hub_pub is not configured, v1 is accepted with
+       * a warning. */
+      if (packet_len != 64 && packet_len != 128) {
         log_message(L_INFO, state,
-                    "[HUB] Expected 64-byte challenge packet, got %d bytes\n",
+                    "[HUB] Expected 64 or 128 byte challenge, got %d bytes\n",
                     packet_len);
         free(packet_body);
         hub_client_disconnect(state);
@@ -1336,6 +1344,67 @@ void hub_client_process(bot_state_t *state) {
       }
       const unsigned char *challenge   = packet_body;
       const unsigned char *hub_eph_pub = packet_body + 32;
+      const bool is_v2 = (packet_len == 128);
+
+      if (state->hub_remote_ed_pub_set && !is_v2) {
+        log_message(L_INFO, state,
+                    "[HUB] Refusing v1 challenge — hub pubkey is configured "
+                    "but the hub did not provide a signature. MITM risk.\n");
+        free(packet_body);
+        hub_client_disconnect(state);
+        return;
+      }
+
+      if (is_v2 && state->hub_remote_ed_pub_set) {
+        /* Verify the hub's signature before deriving the session key. */
+        const unsigned char *hub_sig = packet_body + 64;
+
+        size_t uuid_len = strlen(state->bot_uuid);
+        size_t tlen = strlen("irchub-hub-auth-v2|") + uuid_len + 1 + 32 + 32;
+        unsigned char *transcript = malloc(tlen);
+        if (!transcript) {
+          free(packet_body);
+          hub_client_disconnect(state);
+          return;
+        }
+        size_t off = 0;
+        memcpy(transcript + off, "irchub-hub-auth-v2|", 19); off += 19;
+        memcpy(transcript + off, state->bot_uuid, uuid_len); off += uuid_len;
+        transcript[off++] = '|';
+        memcpy(transcript + off, challenge, 32);   off += 32;
+        memcpy(transcript + off, hub_eph_pub, 32); off += 32;
+
+        EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(
+            EVP_PKEY_ED25519, NULL, state->hub_remote_ed_pub, 32);
+        EVP_MD_CTX *md = pk ? EVP_MD_CTX_new() : NULL;
+        bool sig_ok = false;
+        if (md && EVP_DigestVerifyInit(md, NULL, NULL, NULL, pk) == 1 &&
+            EVP_DigestVerify(md, hub_sig, 64, transcript, off) == 1) {
+          sig_ok = true;
+        }
+        if (md) EVP_MD_CTX_free(md);
+        if (pk) EVP_PKEY_free(pk);
+        memset(transcript, 0, off);
+        free(transcript);
+
+        if (!sig_ok) {
+          log_message(L_INFO, state,
+                      "[HUB] v2 hub signature INVALID — possible MITM. "
+                      "Disconnecting.\n");
+          free(packet_body);
+          hub_client_disconnect(state);
+          return;
+        }
+        log_message(L_INFO, state, "[HUB] v2 hub signature verified.\n");
+      } else if (is_v2) {
+        log_message(L_INFO, state,
+                    "[HUB] WARN: hub sent v2 challenge but no hub pubkey "
+                    "configured ('sethubpub'); signature NOT verified.\n");
+      } else {
+        log_message(L_INFO, state,
+                    "[HUB] WARN: legacy v1 (unsigned) challenge accepted. "
+                    "Configure 'sethubpub' to enable mutual auth.\n");
+      }
 
       // Derive session key from X25519 + HKDF before signing
       unsigned char session_key[32];
@@ -1372,14 +1441,45 @@ void hub_client_process(bot_state_t *state) {
         return;
       }
     } else if (auth_state == HUB_AUTH_SENT_SIGNATURE) {
-      // Hub sends a 1-byte ACK (0x01) — session_key already set in previous phase
+      /* Two ACK formats:
+       *   v1: 1-byte plaintext 0x01 (legacy)
+       *   v2: GCM-encrypted (IV || ciphertext || tag). On the wire that's
+       *       always at least GCM_IV_LEN + 1 + GCM_TAG_LEN bytes. */
       if (packet_len == 1 && packet_body[0] == 0x01) {
+        if (state->hub_remote_ed_pub_set) {
+          log_message(L_INFO, state,
+                      "[HUB] Refusing v1 plaintext ACK — hub pubkey configured.\n");
+          free(packet_body);
+          hub_client_disconnect(state);
+          return;
+        }
         state->hub_authenticated = true;
         auth_state = HUB_AUTH_COMPLETE;
         state->last_hub_activity = time(NULL);
         state->hub_connect_time = time(NULL);
-        log_message(L_INFO, state, "[HUB] Authenticated (Curve25519)!\n");
+        log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v1)!\n");
         hub_client_push_config(state);
+      } else if (packet_len >= GCM_IV_LEN + 1 + GCM_TAG_LEN) {
+        unsigned char ack_tag[GCM_TAG_LEN];
+        unsigned char ack_pt[8] = {0};
+        memcpy(ack_tag, packet_body + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
+        int ack_pl = crypto_aes_gcm_decrypt(
+            packet_body, packet_len - GCM_TAG_LEN,
+            state->hub_session_key, ack_pt, ack_tag);
+        if (ack_pl == 1 && ack_pt[0] == 0x01) {
+          state->hub_authenticated = true;
+          auth_state = HUB_AUTH_COMPLETE;
+          state->last_hub_activity = time(NULL);
+          state->hub_connect_time = time(NULL);
+          log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v2)!\n");
+          hub_client_push_config(state);
+        } else {
+          log_message(L_INFO, state,
+                      "[HUB] v2 ACK decrypt/parse failed (len=%d)\n", ack_pl);
+          free(packet_body);
+          hub_client_disconnect(state);
+          return;
+        }
       } else {
         log_message(L_INFO, state, "[HUB] Bad ACK from hub (len=%d)\n", packet_len);
         free(packet_body);

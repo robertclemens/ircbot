@@ -309,6 +309,13 @@ struct bot_state {
   // Hub Management
   char bot_uuid[64];
   char hub_key[MAX_HUB_KEY_SIZE]; // 88-char base64 of 64-byte Curve25519 combined key
+  /* v2 hub-bot mutual auth: the hub's long-term Ed25519 public key (32 raw
+   * bytes), set from the 'hp|' config line via 'sethubpub'. When _set is
+   * false the bot logs a one-time warning on each handshake and falls back
+   * to trusting whatever the hub sends — this matches pre-v2 behaviour and
+   * lets existing deployments upgrade in stages. */
+  unsigned char hub_remote_ed_pub[32];
+  bool          hub_remote_ed_pub_set;
   char *hub_list[MAX_SERVERS];
   int hub_count;
   int hub_fd;
