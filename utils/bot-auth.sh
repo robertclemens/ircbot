@@ -1,42 +1,39 @@
 #!/usr/bin/env bash
 #
-# bot-auth.sh — build a v1 (~A1) AES-256-GCM admin command payload for ircbot.
+# bot-auth.sh — build a v1c (~A1c) AES-256-CBC + HMAC-SHA256 admin command
+#               payload for ircbot. Uses ONLY openssl(1) and standard
+#               coreutils. No Python, no Perl modules, no helper binary.
 #
-# Usage:
-#   bot-auth.sh "<command line, including args>"
-#   echo "<password>" | bot-auth.sh -                     # password from stdin
-#
-# Prints a line of the form:
-#   ~A1 <base64-blob>
-#
-# Send it to the bot via IRC as:
-#   /quote PRIVMSG <bot_nick> :~A1 <base64-blob>
-#
-# Wire format (binary blob, base64-encoded above):
-#   salt(16) || iv(12) || ciphertext(N) || tag(16)
+# Wire format produced:
+#   ~A1c <base64( salt(16) || iv(16) || ciphertext || hmac(32) )>
 #
 # Key derivation:
-#   key = PBKDF2-HMAC-SHA256(admin_password, salt, 100000, 32)
+#   keys = PBKDF2-HMAC-SHA256(password, salt, 100000, 64)
+#   enc_key = keys[0..31]   mac_key = keys[32..63]
 #
-# Plaintext under the cipher:
-#   <unix_ts>:<nonce>:<command> [args...]
+# Plaintext under the AES-CBC:
+#   <unix_ts>:<nonce>:<command line>
 #
-# Requirements:
-#   - openssl (1.1.1+) with -aes-256-gcm support
-#   - GNU coreutils (od, base64, head)
+# Auth:
+#   hmac = HMAC-SHA256(mac_key, salt || iv || ciphertext)
+#   (encrypt-then-MAC — bot verifies HMAC BEFORE attempting to decrypt)
+#
+# Usage:
+#   BOT_AUTH_PASSWORD='hunter2' bot-auth.sh "die"
+#   bot-auth.sh "+admin alice s3cret alice!*@trusted.example"   # prompts
+#
+# Requirements: openssl 1.1.1+ (any modern Linux/macOS, Git-for-Windows,
+#               MSYS2, WSL). All other tools (xxd, base64, date) are in
+#               the standard coreutils set that ships with bash.
 
 set -euo pipefail
 
 usage() {
-    cat <<EOF
+    cat >&2 <<EOF
 Usage: $0 "<command line, with args>"
-
-Reads the admin/oper password from \$BOT_AUTH_PASSWORD or, if unset, prompts
-on the controlling tty with echo disabled.
-
-Examples:
-    BOT_AUTH_PASSWORD='hunter2' $0 "die"
-    $0 "+admin alice s3cret alice!*@trusted.example"
+Reads admin password from \$BOT_AUTH_PASSWORD or interactively.
+Prints "~A1c <base64-blob>" to stdout — send to bot via:
+    /quote PRIVMSG <bot_nick> :~A1c <base64-blob>
 EOF
     exit 1
 }
@@ -44,7 +41,6 @@ EOF
 [ "$#" -eq 1 ] || usage
 cmd_line="$1"
 
-# Read password
 if [ -n "${BOT_AUTH_PASSWORD:-}" ]; then
     password="$BOT_AUTH_PASSWORD"
 elif [ -t 0 ]; then
@@ -53,95 +49,64 @@ elif [ -t 0 ]; then
 else
     read -r password
 fi
-if [ -z "$password" ]; then
-    echo "Error: empty password" >&2
-    exit 2
-fi
+[ -n "$password" ] || { echo "Error: empty password" >&2; exit 2; }
 
 iterations=100000
 
-# 16 bytes salt, 12 bytes IV (GCM standard), 8 bytes nonce (uint64 decimal)
+# 16 bytes salt, 16 bytes IV (CBC standard), 8-byte nonce -> decimal
 salt_hex=$(openssl rand -hex 16)
-iv_hex=$(openssl rand -hex 12)
+iv_hex=$(openssl rand -hex 16)
+# 64-bit nonce, masked to int63 so the bot's strtoull -> int64 stays positive.
 nonce_hex=$(openssl rand -hex 8)
-
-# Derive 32-byte key via PBKDF2-HMAC-SHA256, hex-encoded
-key_hex=$(printf '%s' "$password" | \
-    openssl kdf -keylen 32 -kdfopt digest:SHA256 \
-                -kdfopt pass:"$password" \
-                -kdfopt hexsalt:"$salt_hex" \
-                -kdfopt iter:"$iterations" \
-                -binary PBKDF2 2>/dev/null | xxd -p -c 64 | tr -d '\n')
-
-# Older OpenSSL (1.1.1) lacks `openssl kdf`. Fall back to `openssl enc -pbkdf2`
-# which uses the same primitive internally.
-if [ -z "$key_hex" ]; then
-    key_hex=$(printf '%s' "$password" | \
-        openssl enc -aes-256-gcm -pbkdf2 -iter "$iterations" \
-                    -S "$salt_hex" -md sha256 -P 2>/dev/null \
-        | sed -n 's/^key=//p' | tr -d '\n')
-fi
-if [ -z "$key_hex" ] || [ "${#key_hex}" -ne 64 ]; then
-    echo "Error: PBKDF2 key derivation failed (need openssl >=1.1.1 with PBKDF2)." >&2
-    exit 3
-fi
-
-# Decimal nonce (drop the high bit so it fits in a positive int64 — matches
-# the bot's strtoull parsing; signed math anywhere downstream stays safe).
 nonce_dec=$(printf '%llu' "$((16#${nonce_hex} & 0x7FFFFFFFFFFFFFFF))")
 ts=$(date -u +%s)
-plaintext=$(printf '%s:%s:%s' "$ts" "$nonce_dec" "$cmd_line")
 
-# Encrypt. openssl enc emits ciphertext; we then need to extract the tag.
-# openssl enc with -aes-256-gcm does NOT output the tag separately in older
-# versions, so use openssl's evp via a small helper. We use openssl's pipeline:
-#   echo -n PLAINTEXT | openssl enc -aes-256-gcm -K <hex> -iv <hex> -nopad
-# but that omits the tag. Use openssl 3.x's `-aead` option or compute via
-# a Python/Perl one-liner. To keep this script dependency-light, use python3
-# if available, otherwise fall back to perl.
-
-encrypt_and_tag() {
-    if command -v python3 >/dev/null 2>&1; then
-        BOT_AUTH_PT="$plaintext" BOT_AUTH_KEY="$key_hex" BOT_AUTH_IV="$iv_hex" \
-            python3 - <<'PY'
-import binascii, os, sys
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-key = binascii.unhexlify(os.environ['BOT_AUTH_KEY'])
-iv  = binascii.unhexlify(os.environ['BOT_AUTH_IV'])
-pt  = os.environ['BOT_AUTH_PT'].encode('utf-8')
-ct_and_tag = AESGCM(key).encrypt(iv, pt, None)
-# ct_and_tag = ciphertext || tag(16)
-sys.stdout.write(binascii.hexlify(ct_and_tag).decode('ascii'))
-PY
-    elif command -v perl >/dev/null 2>&1 && perl -MCrypt::AuthEnc::GCM -e1 2>/dev/null; then
-        BOT_AUTH_PT="$plaintext" BOT_AUTH_KEY="$key_hex" BOT_AUTH_IV="$iv_hex" \
-            perl <<'PL'
-use strict;
-use warnings;
-use Crypt::AuthEnc::GCM qw(gcm_encrypt_authenticate);
-my $key = pack('H*', $ENV{BOT_AUTH_KEY});
-my $iv  = pack('H*', $ENV{BOT_AUTH_IV});
-my $pt  = $ENV{BOT_AUTH_PT};
-my ($ct, $tag) = gcm_encrypt_authenticate('AES', $key, $iv, '', $pt);
-print unpack('H*', $ct . $tag);
-PL
-    else
-        echo "Error: need either python3 with 'cryptography' or perl with CryptX." >&2
-        exit 4
-    fi
-}
-
-ct_tag_hex=$(encrypt_and_tag)
-if [ -z "$ct_tag_hex" ]; then
-    echo "Error: GCM encryption failed." >&2
-    exit 5
+# Derive 64 bytes via PBKDF2-HMAC-SHA256, output as hex.
+# OpenSSL 3.x has `openssl kdf PBKDF2`; OpenSSL 1.1.x can use the same
+# primitive through `openssl enc -pbkdf2 -P` (it prints the derived
+# key+IV; we want the full 64 bytes).
+keys_hex=$(openssl kdf -keylen 64 \
+                       -kdfopt digest:SHA256 \
+                       -kdfopt pass:"$password" \
+                       -kdfopt hexsalt:"$salt_hex" \
+                       -kdfopt iter:"$iterations" \
+                       -binary PBKDF2 2>/dev/null \
+          | xxd -p -c 256 | tr -d '\n')
+if [ -z "$keys_hex" ] || [ "${#keys_hex}" -ne 128 ]; then
+    cat >&2 <<EOF
+Error: 'openssl kdf -binary PBKDF2' did not produce 64 bytes.
+       Your openssl: $(openssl version)
+       This requires OpenSSL 3.0+. On older systems use the bot-auth helper
+       binary (build from utils/bot-auth.c) or install Git for Windows /
+       MSYS2 / a newer openssl package.
+EOF
+    exit 4
 fi
+enc_key="${keys_hex:0:64}"
+mac_key="${keys_hex:64:64}"
+unset keys_hex
 
-# Assemble blob = salt || iv || ciphertext || tag and base64-encode
+# Encrypt plaintext with AES-256-CBC.  openssl enc adds PKCS#7 padding by
+# default; with -K (hex key) and -iv (hex iv) it does NOT add the "Salted__"
+# header that openssl normally puts on password-derived encryption.
+ct_hex=$(printf '%s:%s:%s' "$ts" "$nonce_dec" "$cmd_line" \
+    | openssl enc -aes-256-cbc -K "$enc_key" -iv "$iv_hex" \
+    | xxd -p -c 4096 | tr -d '\n')
+[ -n "$ct_hex" ] || { echo "Error: AES-CBC encrypt failed" >&2; exit 6; }
+
+# HMAC-SHA256 over salt || iv || ciphertext, key = mac_key
+hmac_hex=$(printf '%s%s%s' "$salt_hex" "$iv_hex" "$ct_hex" \
+    | xxd -r -p \
+    | openssl dgst -sha256 -mac HMAC -macopt "hexkey:$mac_key" \
+    | awk '{print $NF}')
+[ "${#hmac_hex}" -eq 64 ] || { echo "Error: HMAC produced ${#hmac_hex} hex chars" >&2; exit 7; }
+
+# Assemble blob and base64 wrap.
 b64=$({
     printf '%s' "$salt_hex"
     printf '%s' "$iv_hex"
-    printf '%s' "$ct_tag_hex"
+    printf '%s' "$ct_hex"
+    printf '%s' "$hmac_hex"
 } | xxd -r -p | base64 -w0)
 
-printf '~A1 %s\n' "$b64"
+printf '~A1c %s\n' "$b64"

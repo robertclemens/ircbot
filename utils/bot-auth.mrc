@@ -1,22 +1,36 @@
-; bot-auth.mrc — mIRC script to generate a v1 (~A1) AES-256-GCM admin command
-;                payload for ircbot.
+; bot-auth.mrc — pure-script mIRC client for ircbot's v1c (~A1c) admin
+;                command protocol.  No compiled helper required.
 ;
-; Why a helper:
-;   mIRC's native $encode does not support AES-GCM (only AES-CBC).  This
-;   script shells out to the bash helper (bot-auth.sh) via /run, captures
-;   its output, and sends the resulting line via /quote.
+; Architecture:
+;   This script delegates all crypto orchestration to the companion
+;   batch file bot-auth.cmd, which itself is a thin wrapper around
+;   openssl.exe and PowerShell (both shipped with Windows 10+).
 ;
-; Setup:
-;   1) Install Git Bash, WSL, or any POSIX sh on Windows, plus python3 with
-;      'cryptography' (pip install cryptography) OR perl with CryptX.
-;   2) Place bot-auth.sh somewhere reachable, e.g. C:\ircbot\bot-auth.sh
-;   3) /set %bot_auth_helper c:\ircbot\bot-auth.sh
-;   4) /set %bot_auth_password <your admin password>          ; KEEP THIS SECRET
-;   5) /set %bot_auth_tmpdir   c:\Users\<you>\AppData\Local\Temp
+;   Why a .cmd helper instead of inline mIRC scripting?
+;   - mIRC's $encode does AES-CBC but uses an OpenSSL-incompatible
+;     "Salted__" envelope that we can't reshape into our wire format
+;     without per-byte construction.
+;   - mIRC has no native bytewise file write, no PBKDF2, no HMAC
+;     primitive that takes a raw key.
+;   - openssl.exe + PowerShell can do all of it in a couple of pipes.
+;
+; What you need installed:
+;   * Windows 10+ (PowerShell 5.1+ is built in)
+;   * Either:
+;       (a) "Git for Windows" — includes openssl.exe at
+;           C:\Program Files\Git\usr\bin\openssl.exe
+;       (b) Or any OpenSSL 3.x install with openssl.exe in PATH
+;
+; Setup (one time, in mIRC):
+;   /set %bot_auth_password your_admin_password
+;   /set %bot_auth_helper   C:\path\to\utils\bot-auth.cmd
+;   /set %bot_auth_openssl  C:\Program Files\Git\usr\bin\openssl.exe
+;   /set %bot_auth_tmpdir   $sysdir(temp)
 ;
 ; Usage:
-;   /botcmd <bot_nick> <command> [arguments]
-; e.g.:
+;   /botcmd <bot_nick> <command> [arguments...]
+;
+; Examples:
 ;   /botcmd mybot die
 ;   /botcmd mybot +admin alice s3cret alice!*@trusted.example
 
@@ -25,68 +39,80 @@ alias botcmd {
         echo -a Usage: /botcmd <bot_nick> <command> [arguments]
         return
     }
-    var %bot   = $1
-    var %cmd   = $2-
+    var %bot = $1
+    var %cmd = $2-
 
-    if (%bot_auth_helper == $null) {
-        echo -a Error: %%bot_auth_helper is not set. /set %%bot_auth_helper c:\path\to\bot-auth.sh
-        return
-    }
     if (%bot_auth_password == $null) {
-        echo -a Error: %%bot_auth_password is not set. /set %%bot_auth_password your_admin_password
+        echo -a Error: /set %%bot_auth_password your_admin_password
         return
     }
-    var %tmpdir = $iif(%bot_auth_tmpdir != $null, %bot_auth_tmpdir, $sysdir(temp))
-    var %outfile = %tmpdir $+ \botauth- $+ $ticks $+ - $+ $rand(1,99999) $+ .txt
+    if (%bot_auth_helper == $null) {
+        echo -a Error: /set %%bot_auth_helper C:\path\to\utils\bot-auth.cmd
+        return
+    }
+    var %tmpdir  = $iif(%bot_auth_tmpdir != $null, %bot_auth_tmpdir, $sysdir(temp))
+    var %tag     = $+(botauth-, $ticks, -, $rand(1,999999))
+    var %outfile = $+(%tmpdir, \, %tag, .out.txt)
 
-    ; Build the helper invocation. We export the password via env so it
-    ; never appears in argv.  Helper writes "~A1 <b64>" to stdout, we
-    ; redirect into %outfile, then read and quote it.
-    var %quoted_cmd = $qt(%cmd)
-    var %sh = bash -c "export BOT_AUTH_PASSWORD=' $+ %bot_auth_password $+ '; ' $+ %bot_auth_helper $+ ' " $+ %quoted_cmd $+ " > ' $+ %outfile $+ '"
+    ; Pass both the password (via env) and the command (via argv).  We use
+    ; cmd /c so we can both set the env var AND redirect stdout into a file
+    ; the mIRC script can read.  Password lives only in the spawned cmd's
+    ; environment block, never on argv.
+    var %openssl_set = $iif(%bot_auth_openssl != $null, set BOT_AUTH_OPENSSL= $+ %bot_auth_openssl $+  & , )
+    .run -nh cmd /c "set BOT_AUTH_PASSWORD= $+ %bot_auth_password $+ & %openssl_set $+ "" $+ %bot_auth_helper $+ "" "" $+ %cmd $+ "" > "" $+ %outfile $+ """
 
-    ; /run is fire-and-forget; we wait briefly then read the file.
-    .run -h cmd /c %sh
-    .timer 1 1 botcmd.send %bot %outfile
+    ; PBKDF2 at 100 000 iterations takes ~200 ms on commodity hardware.
+    ; Poll for the output file up to ~5 s.
+    .timer 1 1 botcmd.try %bot %outfile 1
 }
 
-alias -l botcmd.send {
+alias -l botcmd.try {
     var %bot     = $1
     var %outfile = $2
-    var %line    = $read(%outfile, n, 1)
-    if (%line == $null) {
-        ; retry once after a slightly longer wait — Windows /run can lag
-        .timer 1 2 botcmd.send.retry %bot %outfile
-        return
-    }
-    .remove %outfile
-    if ($left(%line,4) != ~A1 ) {
-        echo -a Error: helper produced unexpected output: %line
-        return
-    }
-    .quote PRIVMSG %bot : $+ %line
-    echo -a Sent ~A1 command to %bot via helper.
-}
+    var %attempt = $3
 
-alias -l botcmd.send.retry {
-    var %bot     = $1
-    var %outfile = $2
-    var %line    = $read(%outfile, n, 1)
-    .remove %outfile
+    var %line
+    if ($exists(%outfile)) {
+        ; The .cmd file may emit a stray blank line before the ~A1c line;
+        ; scan for the first non-empty line that starts with ~A1c.
+        var %n = $lines(%outfile)
+        var %i = 1
+        while (%i <= %n) {
+            var %candidate = $read(%outfile, n, %i)
+            if ($left(%candidate, 5) == ~A1c ) {
+                var %line = %candidate
+                break
+            }
+            inc %i
+        }
+    }
+
     if (%line == $null) {
-        echo -a Error: helper produced no output. Check %%bot_auth_helper.
+        if (%attempt < 20) {
+            .timer 1 1 botcmd.try %bot %outfile $calc(%attempt + 1)
+            return
+        }
+        echo -a Error: bot-auth.cmd produced no ~A1c output after 5s.
+        echo -a Check %%bot_auth_helper and %%bot_auth_openssl paths.
+        if ($exists(%outfile)) {
+            echo -a -- helper output (first line) --
+            echo -a $read(%outfile, n, 1)
+        }
+        .remove %outfile
         return
     }
-    if ($left(%line,4) != ~A1 ) {
-        echo -a Error: helper produced unexpected output: %line
-        return
-    }
+
+    .remove %outfile
     .quote PRIVMSG %bot : $+ %line
-    echo -a Sent ~A1 command to %bot via helper.
+    echo -a Sent ~A1c command to %bot.
 }
 
 on *:LOAD: {
-    echo -a bot-auth.mrc loaded — use /botcmd <bot> <command> [args]
-    echo -a Required mIRC variables: %%bot_auth_helper (path to bot-auth.sh)
-    echo -a                          %%bot_auth_password (your admin pass)
+    echo -a -- bot-auth.mrc (v4.0, pure script + openssl CLI) loaded --
+    echo -a Required:
+    echo -a   /set %%bot_auth_password your_admin_password
+    echo -a   /set %%bot_auth_helper   C:\path\to\utils\bot-auth.cmd
+    echo -a Optional:
+    echo -a   /set %%bot_auth_openssl  C:\Program Files\Git\usr\bin\openssl.exe
+    echo -a Use:  /botcmd <bot> <command> [args]
 }

@@ -5,54 +5,86 @@ this file when installing a crontab.
 
 
 
-/* bot-auth.sh */
+// Admin command transports
 
-bot-auth.sh builds a v1 (~A1) AES-256-GCM admin command payload and prints it
-to stdout in the form:
+The bot accepts TWO equivalent encrypted wire formats for admin commands:
 
-    ~A1 <base64-blob>
+  ~A1   AES-256-GCM (single tag)
+  ~A1c  AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC)
 
-Where <base64-blob> = base64( salt(16) || iv(12) || ciphertext || tag(16) ),
-the cipher is AES-256-GCM, and the key is PBKDF2-HMAC-SHA256(password, salt,
-100000, 32).  The plaintext under the tag is "<unix_ts>:<nonce>:<command...>".
+Both derive their keys with PBKDF2-HMAC-SHA256(password, salt, 100000, ...).
+Both protect the same plaintext envelope "<unix_ts>:<nonce>:<command...>".
+Both are accepted equally — pick whichever your client can produce.
 
-The bot rejects payloads older than 30 seconds, replays of any nonce in the
-in-memory ring (4096 entries), or any mask that does not currently match an
-active admin/oper record.
+Use ~A1c when you want NO compiled helpers and NO CPAN modules: openssl(1)
+alone can produce it.  Use ~A1 when you do have the compiled bot-auth helper
+(or Python/CryptX) and want the slightly cleaner AEAD wire format.
 
-Usage:
+
+
+/* bot-auth.sh  (~A1c, pure openssl CLI) */
+
+Builds a ~A1c payload using ONLY openssl(1) and standard coreutils.  No
+Python, no Perl modules, no compiled helpers.
+
     BOT_AUTH_PASSWORD='hunter2' ./bot-auth.sh "die"
-    ./bot-auth.sh "+admin alice s3cret alice!*@trusted.example"     # prompts
+    ./bot-auth.sh "+admin alice s3cret alice!*@trusted.example"   # prompts
 
-The output line can be sent to the bot via:
-    /quote PRIVMSG <bot_nick> :~A1 <base64>
-
-Requires: openssl 1.1.1+, plus either python3 with the 'cryptography' module
-or perl with CryptX (for AES-GCM, which openssl(1) does not expose cleanly).
+Requires: openssl 3.0+ (for `openssl kdf -binary PBKDF2`).
 
 
 
-/* bot_auth.pl */
+/* bot-auth.cmd  (~A1c, Windows batch + openssl + PowerShell) */
 
-bot_auth.pl is an irssi script that wraps the same v1 (~A1) format above.
-Drop it into ~/.irssi/scripts/autorun/ and run:
+Windows-native batch counterpart to bot-auth.sh.  Uses openssl.exe (ships
+with Git for Windows or any OpenSSL 3.x install) and PowerShell (built into
+Windows 10+).  No compiled helper, no Python, no Perl.
+
+    set BOT_AUTH_PASSWORD=hunter2
+    bot-auth.cmd "die"
+
+Sends the output to the bot:
+    /quote PRIVMSG <bot> :~A1c <base64>
+
+
+
+/* bot_auth.pl  (~A1c, Irssi, no CPAN modules) */
+
+Irssi script.  Uses Digest::SHA (CORE Perl module, no install) for PBKDF2
+and HMAC; shells out to openssl(1) for AES-256-CBC.  CryptX is no longer
+required.
 
     /set bot_auth_password your_admin_password
     /botcmd <bot_nick> <command> [args]
 
-Requires CryptX from CPAN:  cpan CryptX
 
 
+/* bot-auth.mrc  (~A1c, mIRC) */
 
-/* bot-auth.mrc */
+mIRC wrapper.  Delegates the openssl + PowerShell orchestration to
+bot-auth.cmd.  No compiled helper, no Python, no Perl.
 
-bot-auth.mrc is the mIRC counterpart.  mIRC's native crypto does not support
-AES-GCM, so this script shells out to bot-auth.sh via /run and forwards the
-helper's "~A1 ..." line via /quote.
-
-Setup variables before use:
-    /set %bot_auth_helper   c:\ircbot\bot-auth.sh
     /set %bot_auth_password your_admin_password
+    /set %bot_auth_helper   C:\path\to\utils\bot-auth.cmd
+    /set %bot_auth_openssl  C:\Program Files\Git\usr\bin\openssl.exe   ; optional
+    /botcmd <bot> <command> [args]
+
+
+
+/* bot-auth.c  (~A1, compiled helper, optional) */
+
+A small native helper that produces the ~A1 (AES-256-GCM) format.  Build
+with:
+
+    gcc -O2 -Wall -o bot-auth bot-auth.c -lcrypto
+
+On Windows, in MSYS2 MinGW 64-bit shell:
+    pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+    gcc -O2 -Wall -o bot-auth.exe bot-auth.c -lcrypto -static
+
+Reads BOT_AUTH_PASSWORD from env (or stdin in "-" mode) and prints
+"~A1 <base64>" to stdout.  Useful if you want a single tool with no
+runtime dependencies on openssl.exe / PowerShell.
 
 
 

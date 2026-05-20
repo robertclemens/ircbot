@@ -2,6 +2,7 @@
 #include <math.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
+#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
@@ -152,16 +153,29 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
   }
   /* --- Block 2: Admin/Op Logic --- */
-  /* Two accepted formats:
-   *   v1 (new, default):   "~A1 <base64-blob>"
+  /* Three accepted formats:
+   *   v1   (default):      "~A1 <base64-blob>"
    *     blob = salt(16) || iv(12) || ciphertext(N) || tag(16)
    *     key  = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 32)
-   *     plaintext = "<timestamp>:<nonce>:<command> [args...]"
+   *     cipher = AES-256-GCM
+   *
+   *   v1c  (openssl-CLI friendly): "~A1c <base64-blob>"
+   *     blob = salt(16) || iv(16) || ciphertext(N) || hmac(32)
+   *     keys = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 64)
+   *     enc_key = keys[0..31], mac_key = keys[32..63]
+   *     cipher = AES-256-CBC (PKCS#7 padded)
+   *     hmac   = HMAC-SHA256(mac_key, salt || iv || ciphertext)
+   *     Verification is encrypt-then-MAC: HMAC verified BEFORE decrypt.
+   *     Exists so clients with no AES-GCM support (mIRC's $encode,
+   *     OpenSSL's `enc` CLI, pure-Perl with Digest::SHA + openssl CLI)
+   *     can still produce a valid frame.
+   *
    *   legacy (deprecated): "<nonce>:<hash> <command> [args...]"
    *     hash = sha256(password ":" minute ":" nonce)
    *
-   * Both formats end up populating the same dispatch variables and fall
-   * through to the existing command tree below. */
+   * Plaintext under both v1 and v1c is "<timestamp>:<nonce>:<command> [args]".
+   * All formats populate the same dispatch variables and fall through to
+   * the existing command tree below. */
 
   char message_copy[MAX_BUFFER];     /* legacy parser working buffer */
   char v1_plaintext[MAX_BUFFER];     /* v1 decrypted-payload working buffer */
@@ -172,7 +186,167 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   char *command = NULL, *arg1 = NULL, *arg2 = NULL, *arg3 = NULL;
   uint64_t nonce_val = 0;
 
-  if (strncmp(message, "~A1 ", 4) == 0) {
+  if (strncmp(message, "~A1c ", 5) == 0) {
+    /* ---- v1c: AES-256-CBC + HMAC-SHA256 encrypt-then-MAC admin command ----
+     * Exists for clients that can't produce AES-GCM (mIRC, openssl(1) CLI).
+     * Security is equivalent to v1 — both achieve AEAD over the same key
+     * derivation and the same nonce / timestamp envelope. */
+    used_v1 = true;
+    const char *b64 = message + 5;
+    int blob_len = 0;
+    unsigned char *blob = base64_decode(b64, &blob_len);
+    const int min_len = SALT_SIZE + 16 + 16 + 32;  /* salt + iv + 1 AES block + hmac */
+    if (!blob || blob_len < min_len) {
+      if (blob) { secure_wipe(blob, (size_t)(blob_len > 0 ? blob_len : 0)); free(blob); }
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: malformed blob from %s\n", user_host);
+      return;
+    }
+    int ct_len = blob_len - SALT_SIZE - 16 - 32;
+    if (ct_len <= 0 || (ct_len % 16) != 0) {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: ct_len %d not a multiple of 16\n", ct_len);
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    unsigned char salt_v1c[SALT_SIZE], iv_v1c[16], hmac_v1c[32];
+    memcpy(salt_v1c, blob,                                       SALT_SIZE);
+    memcpy(iv_v1c,   blob + SALT_SIZE,                           16);
+    memcpy(hmac_v1c, blob + blob_len - 32,                       32);
+
+    time_t now_auth = time(NULL);
+    user_record_t *candidate = auth_find_user(state, user_host, now_auth);
+    if (!candidate || !candidate->is_active || candidate->password[0] == '\0') {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: no matching active user for %s\n", user_host);
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    /* Derive 64 bytes: enc_key(32) || mac_key(32) */
+    unsigned char keys[64];
+    if (PKCS5_PBKDF2_HMAC(candidate->password, (int)strlen(candidate->password),
+                          salt_v1c, SALT_SIZE, PBKDF2_ITERATIONS,
+                          EVP_sha256(), 64, keys) != 1) {
+      log_message(L_CMD, state, "[CMD] v1c auth: PBKDF2 failed\n");
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    /* Verify HMAC over salt || iv || ciphertext BEFORE decrypting. */
+    unsigned int hmac_calc_len = 0;
+    unsigned char hmac_calc[32];
+    /* The first (blob_len - 32) bytes of `blob` are exactly salt||iv||ct. */
+    if (!HMAC(EVP_sha256(), keys + 32, 32,
+              blob, (size_t)(blob_len - 32),
+              hmac_calc, &hmac_calc_len) ||
+        hmac_calc_len != 32 ||
+        CRYPTO_memcmp(hmac_calc, hmac_v1c, 32) != 0) {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: HMAC FAILED for %s (wrong password?)\n",
+                  user_host);
+      secure_wipe(keys, sizeof(keys));
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+
+    /* HMAC ok — AES-CBC decrypt the ciphertext. */
+    unsigned char *plain = malloc((size_t)ct_len + 1);
+    if (!plain) {
+      secure_wipe(keys, sizeof(keys));
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+    EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
+    int plain_len = 0, final_len = 0;
+    if (!cctx ||
+        EVP_DecryptInit_ex(cctx, EVP_aes_256_cbc(), NULL, keys, iv_v1c) != 1 ||
+        EVP_DecryptUpdate(cctx, plain, &plain_len,
+                          blob + SALT_SIZE + 16, ct_len) != 1 ||
+        EVP_DecryptFinal_ex(cctx, plain + plain_len, &final_len) != 1) {
+      log_message(L_CMD, state, "[CMD] v1c auth: AES-CBC decrypt failed\n");
+      if (cctx) EVP_CIPHER_CTX_free(cctx);
+      secure_wipe(keys, sizeof(keys));
+      secure_wipe(plain, (size_t)ct_len + 1);
+      free(plain);
+      secure_wipe(blob, (size_t)blob_len);
+      free(blob);
+      return;
+    }
+    EVP_CIPHER_CTX_free(cctx);
+    plain_len += final_len;
+    plain[plain_len] = '\0';
+    secure_wipe(keys, sizeof(keys));
+    secure_wipe(blob, (size_t)blob_len);
+    free(blob);
+
+    if ((size_t)plain_len >= sizeof(v1_plaintext)) {
+      secure_wipe(plain, (size_t)plain_len);
+      free(plain);
+      return;
+    }
+    memcpy(v1_plaintext, plain, (size_t)plain_len);
+    v1_plaintext[plain_len] = '\0';
+    secure_wipe(plain, (size_t)plain_len);
+    free(plain);
+
+    /* Parse: <timestamp>:<nonce>:<command> [args] — same envelope as v1. */
+    char *sp_v1c;
+    char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1c);
+    char *nonce_str = strtok_r(NULL,         ":", &sp_v1c);
+    char *cmd_line  = strtok_r(NULL,         "",  &sp_v1c);
+    if (!ts_str || !nonce_str || !cmd_line) {
+      log_message(L_CMD, state, "[CMD] v1c auth: malformed plaintext\n");
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+    time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
+    if (llabs((long long)(now_auth - client_ts)) > 30) {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: timestamp skew %lds (max 30) from %s\n",
+                  (long)(now_auth - client_ts), user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+    nonce_val = strtoull(nonce_str, NULL, 10);
+    bool replay_v1c = false;
+    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
+      if (state->admin_nonces[_ri] == nonce_val) { replay_v1c = true; break; }
+    }
+    if (replay_v1c) {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: replay (nonce=%llu) from %s\n",
+                  (unsigned long long)nonce_val, user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+    state->admin_nonces[state->admin_nonce_idx] = nonce_val;
+    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+
+    char *sp_cmd;
+    command = strtok_r(cmd_line, " ", &sp_cmd);
+    arg1    = strtok_r(NULL,     " ", &sp_cmd);
+    arg2    = strtok_r(NULL,     " ", &sp_cmd);
+    arg3    = strtok_r(NULL,     " ", &sp_cmd);
+    if (!command) {
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+    auth_user = candidate;
+    if (candidate->type == 'a') is_admin = true;
+    if (candidate->type == 'o') is_op    = true;
+
+    log_message(L_DEBUG, state,
+                "[CMD_DEBUG] v1c Parsed: Cmd='%s' Arg1='%s' User='%s' Type=%c\n",
+                command, (arg1 ? arg1 : "NULL"),
+                candidate->name, candidate->type);
+  } else if (strncmp(message, "~A1 ", 4) == 0) {
     /* ---- v1: AES-256-GCM-protected admin command ---- */
     used_v1 = true;
     const char *b64 = message + 4;
