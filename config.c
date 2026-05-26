@@ -1,4 +1,5 @@
 #include <errno.h>
+#include <fcntl.h>
 #include <openssl/err.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -13,6 +14,11 @@
 
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {
+  struct stat cfg_st;
+  if (stat(filename, &cfg_st) == 0 && (cfg_st.st_mode & 0177) != 0)
+    log_message(L_INFO, state,
+                "[CFG] WARN: %s has insecure permissions %04o — should be 0600\n",
+                filename, (unsigned)(cfg_st.st_mode & 0777));
   FILE *in_file = fopen(filename, "rb");
   if (!in_file) {
     return false;
@@ -60,10 +66,6 @@ bool config_load(bot_state_t *state, const char *password,
   fclose(in_file);
 
   unsigned char key[32];
-  /* Try modern PBKDF2 first; fall back to the legacy single-iteration derivation
-   * so existing config files written before this migration can still be read.
-   * On a successful legacy-decrypt the caller re-encrypts with PBKDF2 below. */
-  bool legacy_format = false;
   if (!crypto_derive_config_key(password, salt, key)) {
     free(ciphertext);
     return false;
@@ -87,6 +89,7 @@ bool config_load(bot_state_t *state, const char *password,
                         ciphertext_len) != 1) {
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
+    secure_wipe(plaintext, (size_t)ciphertext_len);
     free(ciphertext);
     free(plaintext);
     return false;
@@ -94,38 +97,42 @@ bool config_load(bot_state_t *state, const char *password,
   EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
 
   int final_rc = EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len);
+  EVP_CIPHER_CTX_free(ctx);
+  bool migrated_from_legacy = false;
   if (final_rc <= 0) {
-    /* PBKDF2 didn't verify — try legacy KDF (one-shot EVP_BytesToKey). */
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    if (!crypto_derive_legacy_key(password, salt, key)) {
-      free(ciphertext);
-      free(plaintext);
-      return false;
+    /* PBKDF2 key failed GCM tag check — try legacy EVP_BytesToKey for
+     * one-time migration of configs written before the PBKDF2 upgrade.
+     * On success the config is immediately re-written with PBKDF2. */
+    secure_wipe(plaintext, (size_t)ciphertext_len);
+    unsigned char legacy_key[32];
+    if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
+                       (unsigned char *)password, (int)strlen(password),
+                       1, legacy_key, NULL) > 0) {
+      EVP_CIPHER_CTX *lctx = EVP_CIPHER_CTX_new();
+      if (lctx) {
+        int lpl = 0, ll = 0;
+        if (EVP_DecryptInit_ex(lctx, EVP_aes_256_gcm(), NULL, legacy_key, iv) == 1 &&
+            EVP_DecryptUpdate(lctx, plaintext, &lpl, ciphertext, ciphertext_len) == 1) {
+          EVP_CIPHER_CTX_ctrl(lctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
+          int lrc = EVP_DecryptFinal_ex(lctx, plaintext + lpl, &ll);
+          if (lrc > 0) {
+            plaintext_len = lpl + ll;
+            migrated_from_legacy = true;
+            final_rc = 1;
+          } else {
+            secure_wipe(plaintext, (size_t)ciphertext_len);
+          }
+        }
+        EVP_CIPHER_CTX_free(lctx);
+      }
+      secure_wipe(legacy_key, sizeof(legacy_key));
     }
-    ctx = EVP_CIPHER_CTX_new();
-    if (!ctx) {
+    if (final_rc <= 0) {
+      log_message(L_INFO, state, "[CFG] Decryption failed (wrong password?).\n");
       secure_wipe(key, sizeof(key));
       free(ciphertext);
       free(plaintext);
       return false;
-    }
-    plaintext_len = 0;
-    if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
-        EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
-                          ciphertext_len) != 1) {
-      EVP_CIPHER_CTX_free(ctx);
-      secure_wipe(key, sizeof(key));
-      free(ciphertext);
-      free(plaintext);
-      return false;
-    }
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
-    final_rc = EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len);
-    if (final_rc > 0) {
-      legacy_format = true;
-      log_message(L_INFO, state,
-                  "[CFG] Legacy KDF detected; will rewrite with PBKDF2.\n");
     }
   }
 
@@ -383,13 +390,14 @@ bool config_load(bot_state_t *state, const char *password,
         unsigned char *dec = base64_decode(data, &dec_len);
         if (dec && dec_len == 64) {
           snprintf(state->hub_key, sizeof(state->hub_key), "%s", data);
+          memcpy(state->hub_key_raw, dec, 64);
         } else {
           log_message(L_INFO, state,
                       "[CFG] Hub key in config is not a valid 64-byte "
                       "Curve25519 key (legacy RSA?). Run 'sethubkey' "
                       "with a new Curve25519 key from the hub admin.\n");
         }
-        if (dec) free(dec);
+        if (dec) { secure_wipe(dec, 64); free(dec); }
         break;
       }
 
@@ -417,18 +425,8 @@ bool config_load(bot_state_t *state, const char *password,
 
       line = strtok_r(NULL, "\n", &saveptr1);
     }
-  } else {
-    log_message(
-        L_INFO, state,
-        "[CFG] GCM decryption failed. Incorrect password or corrupt file.\n");
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    free(ciphertext);
-    free(plaintext);
-    return false;
   }
 
-  EVP_CIPHER_CTX_free(ctx);
   secure_wipe(key, sizeof(key));
   secure_wipe(plaintext, (size_t)plaintext_len);
   free(ciphertext);
@@ -566,18 +564,15 @@ bool config_load(bot_state_t *state, const char *password,
     memcpy(state->mask_records, new_masks, sizeof(new_masks));
     state->mask_record_count = nm;
 
+    if (migrated_from_legacy)
+      log_message(L_INFO, state,
+                  "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
     /* Write migrated config immediately */
     config_write(state, password);
-  }
-
-  /* If the loaded file was encrypted with the legacy single-iteration KDF,
-   * rewrite it with PBKDF2 now. The next save anywhere in the bot would
-   * already do this, but doing it eagerly closes the window. */
-  if (legacy_format) {
+  } else if (migrated_from_legacy) {
     log_message(L_INFO, state,
-                "[CFG] Rewriting config with PBKDF2 (%d iterations).\n",
-                PBKDF2_ITERATIONS);
-    config_write_local(state, password);
+                "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
+    config_write(state, password);
   }
 
   // Validation changed
@@ -726,8 +721,10 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   char temp_file[256];
   snprintf(temp_file, sizeof(temp_file), "%s.tmp", CONFIG_FILE);
 
-  FILE *out_file = fopen(temp_file, "wb");
+  int tmp_fd = open(temp_file, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  FILE *out_file = (tmp_fd >= 0) ? fdopen(tmp_fd, "wb") : NULL;
   if (!out_file) {
+    if (tmp_fd >= 0) close(tmp_fd);
     fprintf(stderr, "[CFG] Failed to open %s for writing: %s\n",
             temp_file, strerror(errno));
     free(ciphertext);
@@ -750,8 +747,6 @@ static void config_write_file(const bot_state_t *state, const char *password) {
     remove(temp_file);
     return;
   }
-
-  chmod(temp_file, S_IRUSR | S_IWUSR);
 
   if (rename(temp_file, CONFIG_FILE) != 0) {
     fprintf(stderr, "[CFG] Failed to rename %s to %s: %s\n",

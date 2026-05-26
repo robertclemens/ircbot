@@ -45,12 +45,15 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
 
   uint64_t nonce = strtoull(nonce_str, NULL, 10);
 
-  for (int i = 0; i < MAX_SEEN_HASHES; i++) {
-    if (state->admin_nonces[i] == nonce) {
-      log_message(L_DEBUG, state,
-                  "[DEBUG_AUTH] FAIL: Replay detected (Nonce %" PRIu64 ").\n",
-                  nonce);
-      return false;
+  { time_t _now = time(NULL);
+    for (int i = 0; i < MAX_SEEN_HASHES; i++) {
+      if (state->admin_nonces[i].nonce == nonce &&
+          _now - state->admin_nonces[i].ts <= NONCE_TTL_SECONDS) {
+        log_message(L_DEBUG, state,
+                    "[DEBUG_AUTH] FAIL: Replay detected (Nonce %" PRIu64 ").\n",
+                    nonce);
+        return false;
+      }
     }
   }
 
@@ -75,28 +78,7 @@ bool auth_verify_password(bot_state_t *state, const char *nonce_str,
 
   if (strlen(hash_attempt) == 64 &&
       CRYPTO_memcmp(hash_attempt, hex, 64) == 0) {
-    state->admin_nonces[state->admin_nonce_idx] = nonce;
-    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-    OPENSSL_cleanse(to_hash, sizeof(to_hash));
-    return true;
-  }
-
-  // Time Window 2 (Previous Minute - allowing clock skew/lag)
-  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64, stored_password,
-           (min - 1), nonce);
-  SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
-
-  offset = 0;
-  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-    offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
-  }
-
-  log_message(L_DEBUG, state,
-              "[DEBUG_AUTH] Check 2 (Min %ld)\n", (min - 1));
-
-  if (strlen(hash_attempt) == 64 &&
-      CRYPTO_memcmp(hash_attempt, hex, 64) == 0) {
-    state->admin_nonces[state->admin_nonce_idx] = nonce;
+    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce, time(NULL) };
     state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
     OPENSSL_cleanse(to_hash, sizeof(to_hash));
     return true;
@@ -149,21 +131,19 @@ bool auth_verify_password_record(const user_record_t *user,
   uint64_t nonce = strtoull(nonce_str, NULL, 10);
   long min = (long)(time(NULL) / 60);
 
-  for (int window = 0; window <= 1; window++) {
-    char to_hash[512];
-    char hex[65];
-    unsigned char raw[SHA256_DIGEST_LENGTH];
-    snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
-             user->password, min - window, nonce);
-    SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
-    int off = 0;
-    for (int k = 0; k < SHA256_DIGEST_LENGTH; k++)
-      off += snprintf(hex + off, sizeof(hex) - off, "%02x", raw[k]);
-    OPENSSL_cleanse(to_hash, sizeof(to_hash));
-    if (strlen(hash_attempt) == 64 &&
-        CRYPTO_memcmp(hash_attempt, hex, 64) == 0)
-      return true;
-  }
+  char to_hash[512];
+  char hex[65];
+  unsigned char raw[SHA256_DIGEST_LENGTH];
+  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
+           user->password, min, nonce);
+  SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
+  int off = 0;
+  for (int k = 0; k < SHA256_DIGEST_LENGTH; k++)
+    off += snprintf(hex + off, sizeof(hex) - off, "%02x", raw[k]);
+  OPENSSL_cleanse(to_hash, sizeof(to_hash));
+  if (strlen(hash_attempt) == 64 &&
+      CRYPTO_memcmp(hash_attempt, hex, 64) == 0)
+    return true;
   return false;
 }
 

@@ -1,9 +1,11 @@
+#include <fcntl.h>
 #include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <sys/stat.h>
 #include <time.h>
+#include <unistd.h>
 
 #include "bot.h"
 
@@ -62,8 +64,10 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   printf("%s", full_log_line);
 #endif
 
-  FILE *stream = fopen(LOGFILE, "a");
+  int log_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND, 0600);
+  FILE *stream = (log_fd >= 0) ? fdopen(log_fd, "a") : NULL;
   if (!stream) {
+    if (log_fd >= 0) close(log_fd);
     perror("Failed to open log file");
   } else {
     fprintf(stream, "%s\n", full_log_line);

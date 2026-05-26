@@ -39,46 +39,84 @@ void hub_client_on_connect(bot_state_t *state) {
   }
 }
 
-// Decode the 88-char base64 combined key (64 bytes) into separate halves
+/* Copy the raw key halves from the pre-decoded, mlock'd hub_key_raw buffer.
+ * Avoids repeated base64 decoding and keeps the key out of new heap regions. */
 static bool hub_key_decode(bot_state_t *state, unsigned char ed_priv[32],
                            unsigned char x_priv[32]) {
+  /* Zero check: if hub_key_raw was never populated, fall back to base64 decode
+   * (handles the first handshake before a config reload sets hub_key_raw). */
+  bool raw_set = false;
+  for (int i = 0; i < HUB_KEY_RAW_LEN; i++) {
+    if (state->hub_key_raw[i]) { raw_set = true; break; }
+  }
+  if (raw_set) {
+    memcpy(ed_priv, state->hub_key_raw,      32);
+    memcpy(x_priv,  state->hub_key_raw + 32, 32);
+    return true;
+  }
+  /* Fallback: first-run wizard path where config hasn't been saved yet. */
   int dec_len = 0;
   unsigned char *dec = base64_decode(state->hub_key, &dec_len);
   if (!dec || dec_len != HUB_KEY_RAW_LEN) {
     log_message(L_INFO, state, "[HUB] hub_key is not a valid 64-byte Curve25519 key\n");
-    if (dec) free(dec);
+    if (dec) { secure_wipe(dec, HUB_KEY_RAW_LEN); free(dec); }
     return false;
   }
   memcpy(ed_priv, dec,      32);
   memcpy(x_priv,  dec + 32, 32);
-  memset(dec, 0, 64);
+  /* Cache into hub_key_raw for subsequent calls. */
+  memcpy(state->hub_key_raw, dec, HUB_KEY_RAW_LEN);
+  secure_wipe(dec, HUB_KEY_RAW_LEN);
   free(dec);
   return true;
 }
 
-// Sign a 32-byte challenge with the Ed25519 private key; sig_out is 64 bytes
+/* Sign a domain-separated challenge with the Ed25519 private key.
+ * msg = "irchub-bot-challenge-v1|UUID|" + hub_eph_pub(32) + challenge(32)
+ * sig_out is 64 bytes. */
 static bool ed25519_sign_challenge(bot_state_t *state,
                                    const unsigned char *challenge,
+                                   const unsigned char *hub_eph_pub,
                                    unsigned char sig_out[64]) {
   unsigned char ed_priv[32], x_priv[32];
   if (!hub_key_decode(state, ed_priv, x_priv)) return false;
-  memset(x_priv, 0, 32);
+  secure_wipe(x_priv, 32);
 
   EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, ed_priv, 32);
-  memset(ed_priv, 0, 32);
+  secure_wipe(ed_priv, 32);
   if (!pk) {
     log_message(L_INFO, state, "[HUB] Failed to load Ed25519 private key\n");
     return false;
   }
+
+  /* Build: "irchub-bot-challenge-v1|UUID|" + hub_eph_pub(32) + challenge(32) */
+  size_t uuid_len = strlen(state->bot_uuid);
+  size_t prefix_len = 24 + uuid_len + 1;  /* "irchub-bot-challenge-v1|" + uuid + "|" */
+  size_t msg_len = prefix_len + 32 + 32;
+  unsigned char *msg = malloc(msg_len);
+  if (!msg) {
+    EVP_PKEY_free(pk);
+    log_message(L_INFO, state, "[HUB] OOM building challenge transcript\n");
+    return false;
+  }
+  size_t off = 0;
+  memcpy(msg + off, "irchub-bot-challenge-v1|", 24); off += 24;
+  memcpy(msg + off, state->bot_uuid, uuid_len);       off += uuid_len;
+  msg[off++] = '|';
+  memcpy(msg + off, hub_eph_pub, 32);                 off += 32;
+  memcpy(msg + off, challenge, 32);                   off += 32;
+
   EVP_MD_CTX *md = EVP_MD_CTX_new();
   bool ok = false;
   size_t siglen = 64;
   if (md && EVP_DigestSignInit(md, NULL, NULL, NULL, pk) == 1
-         && EVP_DigestSign(md, sig_out, &siglen, challenge, 32) == 1
+         && EVP_DigestSign(md, sig_out, &siglen, msg, msg_len) == 1
          && siglen == 64)
     ok = true;
   if (md) EVP_MD_CTX_free(md);
   EVP_PKEY_free(pk);
+  secure_wipe(msg, msg_len);
+  free(msg);
   if (!ok) log_message(L_INFO, state, "[HUB] Ed25519 signing failed\n");
   return ok;
 }
@@ -90,12 +128,12 @@ static bool x25519_derive_session_key(bot_state_t *state,
                                       unsigned char session_key_out[32]) {
   unsigned char ed_priv[32], x_priv[32];
   if (!hub_key_decode(state, ed_priv, x_priv)) return false;
-  memset(ed_priv, 0, 32);
+  secure_wipe(ed_priv, 32);
 
   // X25519 ECDH
   EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, x_priv, 32);
   EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, hub_eph_pub, 32);
-  memset(x_priv, 0, 32);
+  secure_wipe(x_priv, 32);
   bool ok = false;
   unsigned char shared[32];
 
@@ -112,6 +150,7 @@ static bool x25519_derive_session_key(bot_state_t *state,
   if (priv) EVP_PKEY_free(priv);
   if (peer) EVP_PKEY_free(peer);
   if (!ok) {
+    secure_wipe(shared, 32);
     log_message(L_INFO, state, "[HUB] X25519 derive failed\n");
     return false;
   }
@@ -123,7 +162,7 @@ static bool x25519_derive_session_key(bot_state_t *state,
   int rc = crypto_hkdf_sha256(shared, 32, challenge, 32,
                                info, (size_t)info_len,
                                session_key_out, 32);
-  memset(shared, 0, 32);
+  secure_wipe(shared, 32);
   if (rc != 0) {
     log_message(L_INFO, state, "[HUB] HKDF failed\n");
     return false;
@@ -142,7 +181,7 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_connecting = false;
   state->hub_connect_time = 0;
   auth_state = HUB_AUTH_NONE;
-  memset(state->hub_session_key, 0, 32);
+  secure_wipe(state->hub_session_key, 32);
   state->current_hub[0] = '\0'; // Clear current hub tracking
   state->last_hub_connect_attempt = time(NULL);
   last_pong_sent = 0;
@@ -1325,18 +1364,15 @@ void hub_client_process(bot_state_t *state) {
   }
   if (!state->hub_authenticated) {
     if (auth_state == HUB_AUTH_SENT_UUID) {
-      /* v1 layout: challenge(32) || hub_eph_pub(32)                    (64 bytes)
-       * v2 layout: challenge(32) || hub_eph_pub(32) || hub_sig(64)    (128 bytes)
+      /* v2 layout: challenge(32) || hub_eph_pub(32) || hub_sig(64)    (128 bytes)
        *
-       * v2's hub_sig is Ed25519_sign(hub_ed_priv,
+       * hub_sig = Ed25519_sign(hub_ed_priv,
        *   "irchub-hub-auth-v2|" || bot_uuid || "|" || challenge || eph_pub).
-       * The bot verifies with state->hub_remote_ed_pub if set. When hub_pub
-       * is configured but the hub sent v1, we refuse — the operator opted in
-       * to mutual auth. When hub_pub is not configured, v1 is accepted with
-       * a warning. */
-      if (packet_len != 64 && packet_len != 128) {
+       * Verified against state->hub_remote_ed_pub (required — bot refuses to
+       * connect if not set; see hub_client_connect precondition). */
+      if (packet_len != 128) {
         log_message(L_INFO, state,
-                    "[HUB] Expected 64 or 128 byte challenge, got %d bytes\n",
+                    "[HUB] Expected 128-byte v2 challenge, got %d bytes\n",
                     packet_len);
         free(packet_body);
         hub_client_disconnect(state);
@@ -1344,18 +1380,8 @@ void hub_client_process(bot_state_t *state) {
       }
       const unsigned char *challenge   = packet_body;
       const unsigned char *hub_eph_pub = packet_body + 32;
-      const bool is_v2 = (packet_len == 128);
 
-      if (state->hub_remote_ed_pub_set && !is_v2) {
-        log_message(L_INFO, state,
-                    "[HUB] Refusing v1 challenge — hub pubkey is configured "
-                    "but the hub did not provide a signature. MITM risk.\n");
-        free(packet_body);
-        hub_client_disconnect(state);
-        return;
-      }
-
-      if (is_v2 && state->hub_remote_ed_pub_set) {
+      if (state->hub_remote_ed_pub_set) {
         /* Verify the hub's signature before deriving the session key. */
         const unsigned char *hub_sig = packet_body + 64;
 
@@ -1396,14 +1422,15 @@ void hub_client_process(bot_state_t *state) {
           return;
         }
         log_message(L_INFO, state, "[HUB] v2 hub signature verified.\n");
-      } else if (is_v2) {
-        log_message(L_INFO, state,
-                    "[HUB] WARN: hub sent v2 challenge but no hub pubkey "
-                    "configured ('sethubpub'); signature NOT verified.\n");
       } else {
+        /* hub_remote_ed_pub_set is false — mutual auth is not configured.
+         * Refuse to connect: run 'sethubpub <hub-ed25519-pubkey>' first. */
         log_message(L_INFO, state,
-                    "[HUB] WARN: legacy v1 (unsigned) challenge accepted. "
-                    "Configure 'sethubpub' to enable mutual auth.\n");
+                    "[HUB] ERROR: hub pubkey not configured. "
+                    "Run 'sethubpub <44-char-base64>' before connecting.\n");
+        free(packet_body);
+        hub_client_disconnect(state);
+        return;
       }
 
       // Derive session key from X25519 + HKDF before signing
@@ -1415,11 +1442,11 @@ void hub_client_process(bot_state_t *state) {
         return;
       }
       memcpy(state->hub_session_key, session_key, 32);
-      memset(session_key, 0, 32);
+      secure_wipe(session_key, 32);
 
-      // Sign the challenge with Ed25519
+      // Sign the domain-separated challenge with Ed25519
       unsigned char sig[64];
-      if (!ed25519_sign_challenge(state, challenge, sig)) {
+      if (!ed25519_sign_challenge(state, challenge, hub_eph_pub, sig)) {
         log_message(L_INFO, state, "[HUB] Failed to sign challenge\n");
         free(packet_body);
         hub_client_disconnect(state);
@@ -1441,25 +1468,7 @@ void hub_client_process(bot_state_t *state) {
         return;
       }
     } else if (auth_state == HUB_AUTH_SENT_SIGNATURE) {
-      /* Two ACK formats:
-       *   v1: 1-byte plaintext 0x01 (legacy)
-       *   v2: GCM-encrypted (IV || ciphertext || tag). On the wire that's
-       *       always at least GCM_IV_LEN + 1 + GCM_TAG_LEN bytes. */
-      if (packet_len == 1 && packet_body[0] == 0x01) {
-        if (state->hub_remote_ed_pub_set) {
-          log_message(L_INFO, state,
-                      "[HUB] Refusing v1 plaintext ACK — hub pubkey configured.\n");
-          free(packet_body);
-          hub_client_disconnect(state);
-          return;
-        }
-        state->hub_authenticated = true;
-        auth_state = HUB_AUTH_COMPLETE;
-        state->last_hub_activity = time(NULL);
-        state->hub_connect_time = time(NULL);
-        log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v1)!\n");
-        hub_client_push_config(state);
-      } else if (packet_len >= GCM_IV_LEN + 1 + GCM_TAG_LEN) {
+      if (packet_len >= GCM_IV_LEN + 1 + GCM_TAG_LEN) {
         unsigned char ack_tag[GCM_TAG_LEN];
         unsigned char ack_pt[8] = {0};
         memcpy(ack_tag, packet_body + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);

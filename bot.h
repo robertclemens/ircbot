@@ -71,6 +71,8 @@
   4096 // Stores admin request hashes to protect against anti-replay attacks
 #define NONCE_CACHE_SIZE                                                       \
   4096 // Nonce cache for secure communication. Prevents replay attacks
+#define NONCE_TTL_SECONDS 60 // Entries older than this are treated as empty
+typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
 #define GCM_TAG_LEN                                                            \
   16 // 16 bytes (128 bits) is industry standard. Do not change
@@ -285,17 +287,24 @@ struct bot_state {
   char ignored_default_mask[MAX_MASK_LEN];
   int ignored_chan_count;
   int chan_count;
+  /* startup_password holds the plaintext config-file password for the
+   * lifetime of the process (needed on every config write).  It is mlock'd
+   * so the OS cannot page it to swap, and OPENSSL_cleanse'd at shutdown.
+   *
+   * Threat model: mlock prevents swap-file / hibernate leaks.  Root with
+   * ptrace or /proc/<pid>/mem CAN still read this while the bot is running —
+   * that is unavoidable without hardware-backed key storage.  Real defences
+   * are OS-level (ptrace_scope, process isolation, 0600 file permissions). */
   char startup_password[MAX_PASS];
-  unsigned char startup_pass_key[MAX_PASS];
   char bot_comm_pass[MAX_PASS];
   time_t bot_comm_pass_ts;
   char *trusted_bots[MAX_TRUSTED_BOTS + 1];
   int trusted_bot_count;
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
   char who_request_channel[MAX_CHAN];
-  uint64_t recent_nonces[NONCE_CACHE_SIZE];
+  nonce_entry_t recent_nonces[NONCE_CACHE_SIZE];
   int nonce_idx;
-  uint64_t admin_nonces[MAX_SEEN_HASHES];
+  nonce_entry_t admin_nonces[MAX_SEEN_HASHES];
   int admin_nonce_idx;
   log_buffer_t in_memory_logs[NUM_LOG_LEVELS];
 
@@ -308,7 +317,8 @@ struct bot_state {
 
   // Hub Management
   char bot_uuid[64];
-  char hub_key[MAX_HUB_KEY_SIZE]; // 88-char base64 of 64-byte Curve25519 combined key
+  char hub_key[MAX_HUB_KEY_SIZE];    // 88-char base64 — used for config serialization only
+  unsigned char hub_key_raw[HUB_KEY_RAW_LEN]; // decoded key; mlock'd and cleansed on exit
   /* v2 hub-bot mutual auth: the hub's long-term Ed25519 public key (32 raw
    * bytes), set from the 'hp|' config line via 'sethubpub'. When _set is
    * false the bot logs a one-time warning on each handshake and falls back
@@ -400,11 +410,6 @@ int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
 /* Derive a 32-byte AES-256-GCM key from a password using PBKDF2-HMAC-SHA256
  * with PBKDF2_ITERATIONS rounds. Returns true on success. */
 bool crypto_derive_config_key(const char *password, const unsigned char *salt,
-                              unsigned char out_key[32]);
-/* Legacy (single-iteration EVP_BytesToKey) key derivation, retained only so
- * existing config and bot-comm payloads can still be decrypted during the
- * one-time migration to PBKDF2. New writes never call this. */
-bool crypto_derive_legacy_key(const char *password, const unsigned char *salt,
                               unsigned char out_key[32]);
 /* Volatile-pointer secure zero. Compiler may NOT elide. */
 void secure_wipe(void *ptr, size_t len);

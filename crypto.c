@@ -21,16 +21,6 @@ bool crypto_derive_config_key(const char *password, const unsigned char *salt,
                              EVP_sha256(), 32, out_key) == 1;
 }
 
-bool crypto_derive_legacy_key(const char *password, const unsigned char *salt,
-                              unsigned char out_key[32]) {
-    if (!password || !salt || !out_key) return false;
-    /* Mirrors the pre-PBKDF2 derivation that wrote existing files:
-     * EVP_BytesToKey(EVP_aes_256_gcm, EVP_sha256, salt, pass, len, 1, key, NULL).
-     * Kept only for read-time migration. */
-    return EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                          (const unsigned char *)password,
-                          (int)strlen(password), 1, out_key, NULL) == 32;
-}
 
 int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *salt, size_t salt_len,
@@ -235,6 +225,8 @@ int crypto_aes_gcm_decrypt(const unsigned char *input_buffer, int input_len,
 
 err:
     if (ctx) EVP_CIPHER_CTX_free(ctx);
+    if (ciphertext_len > 0)
+        secure_wipe(plaintext, (size_t)ciphertext_len);
     return -1;
 }
 

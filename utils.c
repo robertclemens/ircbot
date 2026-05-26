@@ -4,9 +4,11 @@
 #include <curl/curl.h>
 #endif
 #include <netdb.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <openssl/sha.h>
+#include <sys/mman.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -17,38 +19,36 @@
 #include "bot.h"
 
 void bot_set_startup_pass(bot_state_t *s, const char *pass) {
-  RAND_bytes(s->startup_pass_key, MAX_PASS);
+  /* Store plaintext and lock the page into RAM so it cannot be swapped.
+   * See the threat-model comment on bot_state_t.startup_password in bot.h. */
   size_t n = pass ? strlen(pass) : 0;
   if (n >= MAX_PASS) n = MAX_PASS - 1;
-  for (int i = 0; i < MAX_PASS; i++)
-    s->startup_password[i] = (char)((unsigned char)(i < (int)n ? pass[i] : '\0')
-                                     ^ s->startup_pass_key[i]);
+  memcpy(s->startup_password, pass ? pass : "", n);
+  memset(s->startup_password + n, 0, MAX_PASS - n);
+  mlock(s->startup_password, MAX_PASS);
 }
 
 void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]) {
-  for (int i = 0; i < MAX_PASS; i++)
-    out[i] = (char)((unsigned char)s->startup_password[i] ^ s->startup_pass_key[i]);
+  memcpy(out, s->startup_password, MAX_PASS);
   out[MAX_PASS - 1] = '\0';
 }
 
 bool bot_has_startup_pass(const bot_state_t *s) {
-  for (int i = 0; i < MAX_PASS; i++)
-    if (s->startup_pass_key[i]) return true;
-  return false;
+  return s->startup_password[0] != '\0';
 }
 
 void config_write_with_state_pass(bot_state_t *s) {
   char pass[MAX_PASS];
   bot_get_startup_pass(s, pass);
   config_write(s, pass);
-  memset(pass, 0, MAX_PASS);
+  OPENSSL_cleanse(pass, MAX_PASS);
 }
 
 void config_write_local_with_state_pass(bot_state_t *s) {
   char pass[MAX_PASS];
   bot_get_startup_pass(s, pass);
   config_write_local(s, pass);
-  memset(pass, 0, MAX_PASS);
+  OPENSSL_cleanse(pass, MAX_PASS);
 }
 
 void handle_fatal_error(const char *message) {

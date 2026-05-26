@@ -17,14 +17,15 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   char msg_copy[MAX_BUFFER];
   snprintf(msg_copy, sizeof(msg_copy), "%s", payload);
 
-  /* New (v2) payload layout from hub-relayed CMD_BOT_MSG:
+  /* Hub-relayed CMD_BOT_MSG layout:
    *     <sender_uuid>|<b64_cipher>:<b64_tag>
-   * Old (PRIVMSG / legacy hub) layout:
+   * Direct PRIVMSG (hub-less) layout:
    *     <b64_cipher>:<b64_tag>
    *
-   * If we see a '|' before the first ':' we treat the part before '|' as a
-   * UUID the hub has attested to, and pass it as AAD to the GCM verify.
-   * Otherwise we fall back to legacy decrypt with empty AAD. */
+   * If we see a '|' before the first ':' we treat the prefix as the
+   * hub-attested sender UUID and bind it into GCM AAD for sender verification.
+   * Without a UUID prefix (PRIVMSG path) AAD is empty — payload authenticity
+   * is verified but sender identity is not. */
   const char *sender_uuid_aad = NULL;
   int sender_uuid_aad_len = 0;
 
@@ -70,31 +71,10 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
         decoded_data + SALT_SIZE, ciphertext_len,
         (const unsigned char *)sender_uuid_aad, sender_uuid_aad_len,
         key, decrypted_data, tag);
-    /* If AAD verification failed and we tried with the hub-supplied sender
-     * UUID, also try without — handles the IRC PRIVMSG fallback path where
-     * the sender didn't include a UUID prefix.  Likewise fall back to the
-     * legacy KDF for un-migrated peers. */
-    if (decrypted_len < 0 && sender_uuid_aad) {
-      decrypted_len = crypto_aes_gcm_decrypt_aad(
-          decoded_data + SALT_SIZE, ciphertext_len, NULL, 0,
-          key, decrypted_data, tag);
-    }
-    if (decrypted_len < 0 &&
-        crypto_derive_legacy_key(state->bot_comm_pass, salt, key)) {
-      decrypted_len = crypto_aes_gcm_decrypt_aad(
-          decoded_data + SALT_SIZE, ciphertext_len,
-          (const unsigned char *)sender_uuid_aad, sender_uuid_aad_len,
-          key, decrypted_data, tag);
-      if (decrypted_len < 0 && sender_uuid_aad) {
-        decrypted_len = crypto_aes_gcm_decrypt_aad(
-            decoded_data + SALT_SIZE, ciphertext_len, NULL, 0,
-            key, decrypted_data, tag);
-      }
-    }
     if (decrypted_len >= 0) {
       if (sender_uuid_aad)
         log_message(L_DEBUG, state,
-                    "[BOT-COMM] Sender UUID verified via AAD: %s\n",
+                    "[BOT-COMM] Sender UUID AAD-verified: %s\n",
                     sender_uuid_aad);
       decrypted_data[decrypted_len] = '\0';
       char *saveptr_bot;
@@ -106,14 +86,15 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
         uint64_t received_nonce = strtoull(non_str, NULL, 10);
         if (fabs(difftime(time(NULL), received_time)) <= 60) {
           bool nonce_is_reused = false;
-          for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
-            if (state->recent_nonces[i] == received_nonce) {
-              nonce_is_reused = true;
-              break;
+          { time_t _now = time(NULL);
+            for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
+              if (state->recent_nonces[i].nonce == received_nonce &&
+                  _now - state->recent_nonces[i].ts <= NONCE_TTL_SECONDS)
+                { nonce_is_reused = true; break; }
             }
           }
           if (!nonce_is_reused) {
-            state->recent_nonces[state->nonce_idx] = received_nonce;
+            state->recent_nonces[state->nonce_idx] = (nonce_entry_t){ received_nonce, time(NULL) };
             state->nonce_idx = (state->nonce_idx + 1) % NONCE_CACHE_SIZE;
             char *saveptr_cmd;
             char *bot_command = strtok_r(cmd_str, " ", &saveptr_cmd);

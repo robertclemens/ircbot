@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
 #include <pwd.h>
@@ -45,6 +46,10 @@ static void state_destroy(bot_state_t *state) {
   for (int i = 0; i < state->hub_count; i++)
     free(state->hub_list[i]);
   channel_list_destroy(state);
+  OPENSSL_cleanse(state->hub_key_raw,     sizeof(state->hub_key_raw));
+  munlock(state->hub_key_raw,             sizeof(state->hub_key_raw));
+  OPENSSL_cleanse(state->startup_password, MAX_PASS);
+  munlock(state->startup_password,         MAX_PASS);
 }
 
 static void flush_stdin_if_needed(const char *buffer, size_t len) {
@@ -544,6 +549,15 @@ static void run_config_wizard(void) {
       // Store in state
       snprintf(state.bot_uuid, sizeof(state.bot_uuid), "%s", uuid_input);
       snprintf(state.hub_key, sizeof(state.hub_key), "%s", privkey_input);
+      {
+        int dec_len = 0;
+        unsigned char *dec = base64_decode(privkey_input, &dec_len);
+        if (dec && dec_len == HUB_KEY_RAW_LEN) {
+          memcpy(state.hub_key_raw, dec, HUB_KEY_RAW_LEN);
+          OPENSSL_cleanse(dec, HUB_KEY_RAW_LEN);
+        }
+        if (dec) free(dec);
+      }
 
       if (state.hub_count < MAX_SERVERS) {
         state.hub_list[state.hub_count++] = strdup(hub_addr);
@@ -737,6 +751,8 @@ int main(int argc, char *argv[]) {
     memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
+  /* Lock the raw key material into RAM so it cannot be swapped to disk. */
+  mlock(state.hub_key_raw, sizeof(state.hub_key_raw));
   /* XOR-protect the password in memory after successful load */
   bot_set_startup_pass(&state, startup_password);
   memset(startup_password, 0, sizeof(startup_password));

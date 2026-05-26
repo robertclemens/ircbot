@@ -62,13 +62,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           int decrypted_len = crypto_aes_gcm_decrypt(
               ciphertext_ptr, ciphertext_len, key, decrypted_data, tag);
 
-          /* Legacy-format fallback for un-migrated peer bots. */
-          if (decrypted_len < 0 &&
-              crypto_derive_legacy_key(state->bot_comm_pass, salt, key)) {
-            decrypted_len = crypto_aes_gcm_decrypt(
-                ciphertext_ptr, ciphertext_len, key, decrypted_data, tag);
-          }
-
           if (decrypted_len >= 0) {
             decrypted_data[decrypted_len] = '\0';
 
@@ -84,14 +77,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
               if (fabs(difftime(time(NULL), received_time)) <= 60) {
                 bool nonce_is_reused = false;
-                for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
-                  if (state->recent_nonces[i] == received_nonce) {
-                    nonce_is_reused = true;
-                    break;
+                { time_t _now = time(NULL);
+                  for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
+                    if (state->recent_nonces[i].nonce == received_nonce &&
+                        _now - state->recent_nonces[i].ts <= NONCE_TTL_SECONDS)
+                      { nonce_is_reused = true; break; }
                   }
                 }
                 if (!nonce_is_reused) {
-                  state->recent_nonces[state->nonce_idx] = received_nonce;
+                  state->recent_nonces[state->nonce_idx] = (nonce_entry_t){ received_nonce, time(NULL) };
                   state->nonce_idx = (state->nonce_idx + 1) % NONCE_CACHE_SIZE;
 
                   char *saveptr_cmd;
@@ -177,7 +171,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
    * All formats populate the same dispatch variables and fall through to
    * the existing command tree below. */
 
-  char message_copy[MAX_BUFFER];     /* legacy parser working buffer */
   char v1_plaintext[MAX_BUFFER];     /* v1 decrypted-payload working buffer */
   bool used_v1 = false;
   bool is_admin = false;
@@ -316,8 +309,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
     nonce_val = strtoull(nonce_str, NULL, 10);
     bool replay_v1c = false;
-    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-      if (state->admin_nonces[_ri] == nonce_val) { replay_v1c = true; break; }
+    { time_t _now = time(NULL);
+      for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
+        if (state->admin_nonces[_ri].nonce == nonce_val &&
+            _now - state->admin_nonces[_ri].ts <= NONCE_TTL_SECONDS)
+          { replay_v1c = true; break; }
+      }
     }
     if (replay_v1c) {
       log_message(L_CMD, state,
@@ -326,7 +323,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       secure_wipe(v1_plaintext, sizeof(v1_plaintext));
       return;
     }
-    state->admin_nonces[state->admin_nonce_idx] = nonce_val;
+    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce_val, time(NULL) };
     state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
 
     char *sp_cmd;
@@ -467,8 +464,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     /* Replay check against the shared admin_nonces ring. */
     nonce_val = strtoull(nonce_str, NULL, 10);
     bool replay_v1 = false;
-    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-      if (state->admin_nonces[_ri] == nonce_val) { replay_v1 = true; break; }
+    { time_t _now = time(NULL);
+      for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
+        if (state->admin_nonces[_ri].nonce == nonce_val &&
+            _now - state->admin_nonces[_ri].ts <= NONCE_TTL_SECONDS)
+          { replay_v1 = true; break; }
+      }
     }
     if (replay_v1) {
       log_message(L_CMD, state,
@@ -477,7 +478,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       secure_wipe(v1_plaintext, sizeof(v1_plaintext));
       return;
     }
-    state->admin_nonces[state->admin_nonce_idx] = nonce_val;
+    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce_val, time(NULL) };
     state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
 
     /* Tokenize the command line, in place, the same way the legacy path does. */
@@ -499,54 +500,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                 "[CMD_DEBUG] v1 Parsed: Cmd='%s' Arg1='%s' User='%s' Type=%c\n",
                 command, (arg1 ? arg1 : "NULL"),
                 candidate->name, candidate->type);
-  } else {
-    /* ---- Legacy: "<nonce>:<hash> <command> [args]" ---- */
-    snprintf(message_copy, sizeof(message_copy), "%s", message);
-
-    char *saveptr_adm;
-    char *auth_token = strtok_r(message_copy, " ", &saveptr_adm);
-    if (!auth_token)
-      return;
-
-    char *saveptr_token;
-    char *nonce_str = strtok_r(auth_token, ":", &saveptr_token);
-    char *hash_str  = strtok_r(NULL,       "",  &saveptr_token);
-
-    if (!nonce_str || !hash_str)
-      return;
-
-    command = strtok_r(NULL, " ", &saveptr_adm);
-    if (!command)
-      return;
-    arg1 = strtok_r(NULL, " ", &saveptr_adm);
-    arg2 = strtok_r(NULL, " ", &saveptr_adm);
-    arg3 = strtok_r(NULL, " ", &saveptr_adm);
-
-    log_message(L_DEBUG, state,
-                "[CMD_DEBUG] legacy Parsed: Cmd='%s' Arg1='%s' Nonce='%s'\n",
-                command, (arg1 ? arg1 : "NULL"), nonce_str);
-
-    /* Anti-replay: check nonce before mask lookup */
-    nonce_val = strtoull(nonce_str, NULL, 10);
-    bool replay = false;
-    for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-      if (state->admin_nonces[_ri] == nonce_val) { replay = true; break; }
-    }
-
-    if (!replay) {
-      time_t now_auth = time(NULL);
-      user_record_t *candidate = auth_find_user(state, user_host, now_auth);
-      if (candidate && auth_verify_password_record(candidate, nonce_str, hash_str)) {
-        state->admin_nonces[state->admin_nonce_idx] = nonce_val;
-        state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-        if (candidate->type == 'a') { is_admin = true; auth_user = candidate; }
-        if (candidate->type == 'o') { is_op   = true; auth_user = candidate; }
-        log_message(L_CMD, state,
-                    "[CMD] DEPRECATED legacy SHA256-hash auth used by %s — "
-                    "upgrade your client to the AES-GCM (~A1) format.\n",
-                    user_host);
-      }
-    }
   }
 
   if (!is_admin && !is_op) {

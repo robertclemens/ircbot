@@ -1,12 +1,14 @@
 #include <openssl/err.h>
 #include <openssl/evp.h>
+#include <openssl/sha.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 
-#define SALT_SIZE 16 // Do not edit. This must match bot.h defines.
-#define GCM_IV_LEN 12 // Do not edit. This must match bot.h defines and is industry standard.
-#define GCM_TAG_LEN 16 // Do not edit. This must match bot.h defines and is industry standard.
+#define SALT_SIZE 16     // Do not edit. This must match bot.h defines.
+#define GCM_IV_LEN 12    // Do not edit. This must match bot.h defines and is industry standard.
+#define GCM_TAG_LEN 16   // Do not edit. This must match bot.h defines and is industry standard.
+#define PBKDF2_ITERATIONS 100000  // Do not edit. This must match bot.h defines.
 
 void handle_crypto_errors(void) {
     ERR_print_errors_fp(stderr);
@@ -65,11 +67,12 @@ int main(int argc, char *argv[]) {
     fclose(in_file);
 
     unsigned char key[32];
-    if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                       (unsigned char *)password, strlen(password), 1, key,
-                       NULL) == 0) {
+    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
+                           salt, SALT_SIZE, PBKDF2_ITERATIONS,
+                           EVP_sha256(), 32, key) != 1) {
         fprintf(stderr, "Error: Failed to derive key from password.\n");
-        handle_crypto_errors();
+        free(ciphertext);
+        return 1;
     }
 
     EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
