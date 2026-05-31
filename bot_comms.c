@@ -82,7 +82,7 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
       char *non_str = strtok_r(NULL, ":", &saveptr_bot);
       char *cmd_str = strtok_r(NULL, "", &saveptr_bot);
       if (ts_str && non_str && cmd_str) {
-        time_t received_time = atol(ts_str);
+        time_t received_time = atoll(ts_str);
         uint64_t received_nonce = strtoull(non_str, NULL, 10);
         if (fabs(difftime(time(NULL), received_time)) <= 60) {
           bool nonce_is_reused = false;
@@ -163,8 +163,8 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   uint64_t nonce;
   if (RAND_bytes((unsigned char *)&nonce, sizeof(nonce)) != 1) return;
 
-  snprintf(plaintext_message, sizeof(plaintext_message), "%ld:%llu:%s",
-           current_time, (unsigned long long)nonce, command_part);
+  snprintf(plaintext_message, sizeof(plaintext_message), "%lld:%llu:%s",
+           (long long)current_time, (unsigned long long)nonce, command_part);
 
   unsigned char salt[SALT_SIZE];
   if (RAND_bytes(salt, sizeof(salt)) != 1) return;

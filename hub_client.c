@@ -658,28 +658,28 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     case 'c': // Channel
     {
       char chan[MAX_CHAN], key[MAX_KEY], op[8];
-      long ts;
+      long long ts;
       int parsed;
       int modes_val = 0;
 
       /* Try new 5-field format: chan|key|modes|op|ts */
-      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%ld",
+      parsed = sscanf(data, "%64[^|]|%30[^|]|%d|%7[^|]|%lld",
                       chan, key, &modes_val, op, &ts);
       if (parsed < 5) {
         /* Try new 5-field without key: chan||modes|op|ts */
         modes_val = 0;
-        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%ld",
+        parsed = sscanf(data, "%64[^|]||%d|%7[^|]|%lld",
                         chan, &modes_val, op, &ts);
         if (parsed >= 4) {
           key[0] = '\0';
         } else {
           /* Fall back to old 4-field: chan|key|op|ts */
           modes_val = 0;
-          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%ld",
+          parsed = sscanf(data, "%64[^|]|%30[^|]|%7[^|]|%lld",
                           chan, key, op, &ts);
           if (parsed < 3) {
             /* Old 4-field without key: chan||op|ts */
-            parsed = sscanf(data, "%64[^|]||%7[^|]|%ld", chan, op, &ts);
+            parsed = sscanf(data, "%64[^|]||%7[^|]|%lld", chan, op, &ts);
             key[0] = '\0';
           }
         }
@@ -689,7 +689,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         bool is_add = (strcmp(op, "add") == 0);
         chan_t *c = channel_find(state, chan);
 
-        log_message(L_DEBUG, state, "[HUB-SYNC] Channel %s: hub_ts=%ld local_ts=%ld op=%s\n",
+        log_message(L_DEBUG, state, "[HUB-SYNC] Channel %s: hub_ts=%lld local_ts=%ld op=%s\n",
                     chan, ts, c ? (long)c->timestamp : 0, op);
 
         if (!c && is_add) {
@@ -743,7 +743,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               }
             }
           } else {
-            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%ld <= local_ts=%ld\n",
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%lld <= local_ts=%ld\n",
                         chan, ts, (long)c->timestamp);
           }
         } else if (!c && !is_add) {
@@ -763,11 +763,11 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
         if (p1&&p2&&p3&&p4) {
           char uuid[37], mask_s[MAX_MASK_LEN], act[8];
-          long last_used, ts;
+          long long last_used, ts;
           snprintf(uuid,   sizeof(uuid),   "%.*s",(int)(p1-data),data);
           snprintf(mask_s, sizeof(mask_s), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(act,    sizeof(act),    "%.*s",(int)(p3-p2-1),p2+1);
-          last_used = atol(p3+1); ts = atol(p4+1);
+          last_used = atoll(p3+1); ts = atoll(p4+1);
           bool is_active = (strncmp(act,"add",3)==0);
           mask_record_t *found_m = NULL;
           for (int mi=0; mi<state->mask_record_count; mi++) {
@@ -807,19 +807,19 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         if (p1&&p2&&p3&&p4&&p5) {
           char uuid[37], uname[64], upass[MAX_PASS], act[8];
           char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
-          long last_seen, ts;
+          long long last_seen, ts;
           snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
           snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
           snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
-          last_seen = atol(p4+1);
+          last_seen = atoll(p4+1);
           if (p6) {
             char ts_buf[32];
             snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-            ts = atol(ts_buf);
+            ts = atoll(ts_buf);
             snprintf(incoming_pub, sizeof(incoming_pub), "%s", p6+1);
           } else {
-            ts = atol(p5+1);
+            ts = atoll(p5+1);
           }
           bool is_active = (strncmp(act,"add",3)==0);
           user_record_t *found_u = NULL;
@@ -855,8 +855,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     case 'O': /* Network opt flags pushed by hub: O|<letters>|<ts> */
     {
       char flags[MAX_OPT_FLAGS + 1] = {0};
-      long ts = 0;
-      if (sscanf(data, "%32[^|]|%ld", flags, &ts) >= 1) {
+      long long ts = 0;
+      if (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1) {
         if (ts >= state->opt_flags_ts) {
           int w = 0;
           for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
@@ -877,22 +877,22 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     case 'p': // Bot password: p|password|timestamp
     {
       char pass[MAX_PASS];
-      long ts = 0;
-      int parsed = sscanf(data, "%127[^|]|%ld", pass, &ts);
+      long long ts = 0;
+      int parsed = sscanf(data, "%127[^|]|%lld", pass, &ts);
       if (parsed < 1) {
         snprintf(pass, sizeof(pass), "%s", data);
         ts = 0;
       }
-      log_message(L_DEBUG, state, "[HUB-SYNC] BotPass: hub_ts=%ld local_ts=%ld\n",
+      log_message(L_DEBUG, state, "[HUB-SYNC] BotPass: hub_ts=%lld local_ts=%ld\n",
                   ts, (long)state->bot_comm_pass_ts);
       // Only update if hub has newer timestamp
       if (ts > state->bot_comm_pass_ts || state->bot_comm_pass[0] == '\0') {
         snprintf(state->bot_comm_pass, sizeof(state->bot_comm_pass), "%s", pass);
         state->bot_comm_pass_ts = ts;
         updates++;
-        log_message(L_INFO, state, "[HUB] Updated bot password (ts=%ld)\n", ts);
+        log_message(L_INFO, state, "[HUB] Updated bot password (ts=%lld)\n", ts);
       } else {
-        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected bot password: hub_ts=%ld <= local_ts=%ld\n",
+        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected bot password: hub_ts=%lld <= local_ts=%ld\n",
                     ts, (long)state->bot_comm_pass_ts);
       }
     } break;
@@ -902,15 +902,15 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       // hub_generate_bot_payload sends: b|<hostmask>|<uuid>|<ts>
       char hostmask[MAX_MASK_LEN];
       char uuid[64];
-      long ts = 0;
+      long long ts = 0;
       hostmask[0] = '\0';
       uuid[0] = '\0';
 
       log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line\n");
 
-      int parsed = sscanf(data, "%255[^|]|%63[^|]|%ld", hostmask, uuid, &ts);
+      int parsed = sscanf(data, "%255[^|]|%63[^|]|%lld", hostmask, uuid, &ts);
       log_message(L_DEBUG, state,
-                  "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%ld\n",
+                  "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%lld\n",
                   parsed, hostmask, uuid, ts);
       if (parsed < 1) {
         snprintf(hostmask, sizeof(hostmask), "%s", data);
@@ -955,11 +955,11 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         }
 
         if (existing_idx != -1) {
-          long old_ts = 0;
-          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%ld", &old_ts);
+          long long old_ts = 0;
+          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%lld", &old_ts);
           if (ts > old_ts) {
             char full_entry[256];
-            snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid, ts);
+            snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld", hostmask, uuid, ts);
             char *new_entry = strdup(full_entry);
             if (!new_entry) break;
             free(state->trusted_bots[existing_idx]);
@@ -969,7 +969,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           }
         } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
           char full_entry[256];
-          snprintf(full_entry, sizeof(full_entry), "%s|%s|%ld", hostmask, uuid, ts);
+          snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld", hostmask, uuid, ts);
           char *new_entry = strdup(full_entry);
           if (!new_entry) break;
           state->trusted_bots[state->trusted_bot_count++] = new_entry;
@@ -983,8 +983,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     {
       // cutoff == 0: purge all tombstones
       // cutoff  > 0: purge tombstones older than cutoff
-      long cutoff_val;
-      if (sscanf(data, "URGE|%ld", &cutoff_val) == 1) {
+      long long cutoff_val;
+      if (sscanf(data, "URGE|%lld", &cutoff_val) == 1) {
         time_t cutoff = (time_t)cutoff_val;
         int purged = 0;
 

@@ -338,7 +338,7 @@ void irc_check_status(bot_state_t *state) {
 
   if (!state->pong_pending &&
       (now - state->last_pong_time > CHECK_LAG_TIMEOUT)) {
-    irc_printf(state, "PING :%ld\r\n", now);
+    irc_printf(state, "PING :%lld\r\n", (long long)now);
     state->pong_pending = true;
   }
 
@@ -357,8 +357,8 @@ void irc_check_status(bot_state_t *state) {
           }
         } else {
           log_message(L_INFO, state,
-                      "[INFO] Nick reclaim on hold. %ld seconds remaining.\n",
-                      NICK_TAKE_TIME - (now - state->nick_release_time));
+                      "[INFO] Nick reclaim on hold. %lld seconds remaining.\n",
+                      (long long)(NICK_TAKE_TIME - (now - state->nick_release_time)));
         }
       }
     } else {

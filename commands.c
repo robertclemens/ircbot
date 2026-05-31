@@ -72,7 +72,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             char *command_part = strtok_r(NULL, "", &saveptr_bot);
 
             if (received_timestamp_str && received_nonce_str && command_part) {
-              time_t received_time = atol(received_timestamp_str);
+              time_t received_time = atoll(received_timestamp_str);
               uint64_t received_nonce = strtoull(received_nonce_str, NULL, 10);
 
               if (fabs(difftime(time(NULL), received_time)) <= 60) {
@@ -1058,10 +1058,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         for (int i = 0; i < state->trusted_bot_count; i++) {
           char bnick[MAX_NICK] = "", bmask[MAX_MASK_LEN] = "";
           char buuid[64] = "";
-          long bts = 0;
+          long long bts = 0;
           sscanf(state->trusted_bots[i], "%9[^!]", bnick);
           if (strcasecmp(bnick, arg1) != 0) continue;
-          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%ld",
+          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%lld",
                  bmask, buuid, &bts);
           /* Replace the nick part of the mask (up to '!') */
           char newmask[MAX_MASK_LEN] = "";
@@ -1304,8 +1304,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (shown == 0 && !match_all) {
         for (int i = 0; i < state->trusted_bot_count; i++) {
           char bot_mask[256] = "", bot_uuid[64] = "";
-          long bot_ts = 0;
-          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%ld",
+          long long bot_ts = 0;
+          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%lld",
                  bot_mask, bot_uuid, &bot_ts);
           char bot_nick[MAX_NICK] = "";
           sscanf(bot_mask, "%9[^!]", bot_nick);

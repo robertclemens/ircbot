@@ -179,17 +179,19 @@ bool config_load(bot_state_t *state, const char *password,
       case 'c': // Channel (global, with timestamp)
       {
         char chan[MAX_CHAN], chan_key[MAX_KEY], op[16];
+        long long ts_ll = 0;
         time_t ts = 0;
 
         // Parse: channel|key|add/del|timestamp
         int parsed =
-            sscanf(data, "%64[^|]|%30[^|]|%15[^|]|%ld", chan, chan_key, op, &ts);
+            sscanf(data, "%64[^|]|%30[^|]|%15[^|]|%lld", chan, chan_key, op, &ts_ll);
 
         // Fallback for empty key: channel||add/del|timestamp
         if (parsed < 3) {
-          parsed = sscanf(data, "%64[^|]||%15[^|]|%ld", chan, op, &ts);
+          parsed = sscanf(data, "%64[^|]||%15[^|]|%lld", chan, op, &ts_ll);
           chan_key[0] = '\0';
         }
+        ts = (time_t)ts_ll;
 
         if (parsed >= 2) { // Need at least chan, op (key can be empty)
           // If fallback matched 3 items (chan, op, ts) or first matched 4
@@ -235,8 +237,8 @@ bool config_load(bot_state_t *state, const char *password,
             snprintf(m->uuid,  sizeof(m->uuid),  "%.*s",(int)(p1-data),data);
             snprintf(m->mask,  sizeof(m->mask),  "%.*s",(int)(p2-p1-1),p1+1);
             m->is_active = (strncmp(p2+1,"add",3)==0);
-            m->last_used = (time_t)atol(p3+1);
-            m->timestamp = (time_t)atol(p4+1);
+            m->last_used = (time_t)atoll(p3+1);
+            m->timestamp = (time_t)atoll(p4+1);
             state->mask_record_count++;
           }
         } else if (!is_new && state->mask_record_count < MAX_USER_MASKS) {
@@ -244,8 +246,9 @@ bool config_load(bot_state_t *state, const char *password,
           mask_record_t *m = &state->mask_records[state->mask_record_count];
           memset(m, 0, sizeof(*m));
           snprintf(m->uuid, sizeof(m->uuid), "MIGRATE");
-          char mask[MAX_MASK_LEN], op[16]; time_t ts = 0;
-          if (sscanf(data, "%255[^|]|%15[^|]|%ld", mask, op, &ts) >= 2) {
+          char mask[MAX_MASK_LEN], op[16]; long long ts_ll = 0; time_t ts = 0;
+          if (sscanf(data, "%255[^|]|%15[^|]|%lld", mask, op, &ts_ll) >= 2) {
+            ts = (time_t)ts_ll;
             snprintf(m->mask, sizeof(m->mask), "%s", mask);
             m->is_active = (strcmp(op,"del") != 0);
             m->timestamp = (ts > 0) ? ts : time(NULL);
@@ -277,15 +280,15 @@ bool config_load(bot_state_t *state, const char *password,
             snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
             u->type      = 'o';
             u->is_active = (strncmp(p3+1,"add",3)==0);
-            u->last_seen = (time_t)atol(p4+1);
+            u->last_seen = (time_t)atoll(p4+1);
             if (p6) {
               char ts_buf[32];
               snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-              u->timestamp = (time_t)atol(ts_buf);
+              u->timestamp = (time_t)atoll(ts_buf);
               snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
               u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
             } else {
-              u->timestamp = (time_t)atol(p5+1);
+              u->timestamp = (time_t)atoll(p5+1);
             }
             state->user_record_count++;
           }
@@ -295,8 +298,9 @@ bool config_load(bot_state_t *state, const char *password,
           memset(u, 0, sizeof(*u));
           snprintf(u->uuid, sizeof(u->uuid), "MIGRATE_O");
           u->type = 'o';
-          char mask[MAX_MASK_LEN], pass[MAX_PASS], op[16]; time_t ts = 0;
-          if (sscanf(data,"%255[^|]|%127[^|]|%15[^|]|%ld",mask,pass,op,&ts)>=3) {
+          char mask[MAX_MASK_LEN], pass[MAX_PASS], op[16]; long long ts_ll = 0; time_t ts = 0;
+          if (sscanf(data,"%255[^|]|%127[^|]|%15[^|]|%lld",mask,pass,op,&ts_ll)>=3) {
+            ts = (time_t)ts_ll;
             /* Store mask in name temporarily; real name derived at migration */
             snprintf(u->name,     sizeof(u->name),     "%.63s", mask);
             snprintf(u->password, sizeof(u->password), "%s", pass);
@@ -330,15 +334,15 @@ bool config_load(bot_state_t *state, const char *password,
             snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
             u->type      = 'a';
             u->is_active = (strncmp(p3+1,"add",3)==0);
-            u->last_seen = (time_t)atol(p4+1);
+            u->last_seen = (time_t)atoll(p4+1);
             if (p6) {
               char ts_buf[32];
               snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-              u->timestamp = (time_t)atol(ts_buf);
+              u->timestamp = (time_t)atoll(ts_buf);
               snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
               u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
             } else {
-              u->timestamp = (time_t)atol(p5+1);
+              u->timestamp = (time_t)atoll(p5+1);
             }
             state->user_record_count++;
           }
@@ -348,8 +352,9 @@ bool config_load(bot_state_t *state, const char *password,
           memset(u, 0, sizeof(*u));
           snprintf(u->uuid, sizeof(u->uuid), "MIGRATE");
           u->type = 'a';
-          char pass[MAX_PASS]; time_t ts = 0;
-          if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
+          char pass[MAX_PASS]; long long ts_ll = 0; time_t ts = 0;
+          if (sscanf(data, "%127[^|]|%lld", pass, &ts_ll) >= 1) {
+            ts = (time_t)ts_ll;
             snprintf(u->password, sizeof(u->password), "%s", pass);
             u->timestamp = (ts > 0) ? ts : time(NULL);
           } else {
@@ -363,8 +368,10 @@ bool config_load(bot_state_t *state, const char *password,
       case 'p': // Bot password (global, no operation field)
       {
         char pass[MAX_PASS];
+        long long ts_ll = 0;
         time_t ts = 0;
-        if (sscanf(data, "%127[^|]|%ld", pass, &ts) >= 1) {
+        if (sscanf(data, "%127[^|]|%lld", pass, &ts_ll) >= 1) {
+          ts = (time_t)ts_ll;
           snprintf(state->bot_comm_pass, MAX_PASS, "%s", pass);
           state->bot_comm_pass_ts = (ts > 0) ? ts : time(NULL);
         } else {
@@ -476,8 +483,8 @@ bool config_load(bot_state_t *state, const char *password,
                  * cannot collide with the existing 'o' oper record line.) */
       {
         char flags[MAX_OPT_FLAGS + 1] = {0};
-        long ts = 0;
-        if (sscanf(data, "%32[^|]|%ld", flags, &ts) >= 1) {
+        long long ts = 0;
+        if (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1) {
           /* Sanitize: keep only [a-zA-Z0-9] */
           int w = 0;
           for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
@@ -696,28 +703,28 @@ static void config_write_file(const bot_state_t *state, const char *password) {
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     const char *key = (c->key[0] != '\0') ? c->key : "";
-    CFG_WRITE("c|%s|%s|%s|%ld\n",
-              c->name, key, c->is_managed ? "add" : "del", (long)c->timestamp);
+    CFG_WRITE("c|%s|%s|%s|%lld\n",
+              c->name, key, c->is_managed ? "add" : "del", (long long)c->timestamp);
   }
 
   for (int i = 0; i < state->user_record_count; i++) {
     const user_record_t *u = &state->user_records[i];
-    CFG_WRITE("%c|%s|%s|%s|%s|%ld|%ld|%s\n",
+    CFG_WRITE("%c|%s|%s|%s|%s|%lld|%lld|%s\n",
               u->type, u->uuid, u->name, u->password,
               u->is_active ? "add" : "del",
-              (long)u->last_seen, (long)u->timestamp,
+              (long long)u->last_seen, (long long)u->timestamp,
               u->has_pubkey ? u->pubkey_b64 : "");
   }
 
   for (int i = 0; i < state->mask_record_count; i++) {
     const mask_record_t *m = &state->mask_records[i];
-    CFG_WRITE("m|%s|%s|%s|%ld|%ld\n",
+    CFG_WRITE("m|%s|%s|%s|%lld|%lld\n",
               m->uuid, m->mask, m->is_active ? "add" : "del",
-              (long)m->last_used, (long)m->timestamp);
+              (long long)m->last_used, (long long)m->timestamp);
   }
 
   if (state->bot_comm_pass[0] != '\0')
-    CFG_WRITE("p|%s|%ld\n", state->bot_comm_pass, (long)state->bot_comm_pass_ts);
+    CFG_WRITE("p|%s|%lld\n", state->bot_comm_pass, (long long)state->bot_comm_pass_ts);
 
   for (int i = 0; i < state->trusted_bot_count; i++)
     CFG_WRITE("b|%s\n", state->trusted_bots[i]);
@@ -755,7 +762,7 @@ static void config_write_file(const bot_state_t *state, const char *password) {
     CFG_WRITE("i|%s\n", state->bot_uuid);
 
   if (state->opt_flags[0] != '\0')
-    CFG_WRITE("O|%s|%ld\n", state->opt_flags, (long)state->opt_flags_ts);
+    CFG_WRITE("O|%s|%lld\n", state->opt_flags, (long long)state->opt_flags_ts);
 
 #undef CFG_WRITE
 
