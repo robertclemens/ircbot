@@ -510,6 +510,34 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   if (is_admin) {
     log_message(L_CMD, state, "[CMD_ADMIN] Executing Admin Command...\n");
 
+    /* opt 'h' (OPT_HUB_ONLY_MUTATIONS): when set by the network, the bot
+     * refuses local mutation of hub-authoritative records.  These commands
+     * must be performed via hub_admin instead.  Help text also hides them. */
+    if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
+      static const char * const HUB_ONLY_CMDS[] = {
+        "+admin", "-admin", "+oper", "-oper",
+        "+usermask", "-usermask",
+        "+bot", "-bot",
+        "join", "part",
+        "botpass", "chpass",
+        /* +hub / -hub are intentionally NOT here: hub membership is a
+         * bot-local connection concern (the hub-only-mutation boundary
+         * covers mesh-replicated records, not which hubs this bot dials),
+         * and with per-hub keypairs adding a hub must work even under
+         * opt 'h'. */
+        NULL
+      };
+      for (int i = 0; HUB_ONLY_CMDS[i]; i++) {
+        if (strcasecmp(command, HUB_ONLY_CMDS[i]) == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Error: '%s' is disabled — network is in "
+                     "hub-only-mutation mode (opt 'h'). Use hub_admin.\r\n",
+                     nick, HUB_ONLY_CMDS[i]);
+          return;
+        }
+      }
+    }
+
     if (strcasecmp(command, "die") == 0) {
       irc_printf(state, "QUIT :Sayonara.\r\n");
       state->status |= S_DIE;
@@ -884,10 +912,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         {
           char hubs_line[300] = ""; int hoff = 0;
           for (int i = 0; i < state->hub_count; i++) {
-            int hlen = (int)strlen(state->hub_list[i]);
+            int hlen = (int)strlen(state->hubs[i].addr);
             if (hoff) { hubs_line[hoff++] = ','; hubs_line[hoff++] = ' '; }
             if (hoff + hlen < (int)sizeof(hubs_line) - 1) {
-              memcpy(hubs_line + hoff, state->hub_list[i], hlen);
+              memcpy(hubs_line + hoff, state->hubs[i].addr, hlen);
               hoff += hlen; hubs_line[hoff] = '\0';
             }
           }
@@ -1180,7 +1208,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           snprintf(ts_buf, sizeof(ts_buf), "never");
         } else {
           struct tm *tm = gmtime(&u->last_seen);
-          strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
+          if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
+          else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
         }
         char del_tag[16] = "";
         if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
@@ -1212,7 +1241,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           snprintf(ts_buf, sizeof(ts_buf), "never");
         } else {
           struct tm *tm = gmtime(&u->last_seen);
-          strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
+          if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
+          else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
         }
         char del_tag[16] = "";
         if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
@@ -1246,7 +1276,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           snprintf(ts_buf, sizeof(ts_buf), "never");
         } else {
           struct tm *tm_utc = gmtime(&u->last_seen);
-          strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+          if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+          else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
         }
         irc_printf(state, "PRIVMSG %s :| [%c] %-20s  (last seen: %s)\r\n",
                    nick, u->type, u->name, ts_buf);
@@ -1260,7 +1291,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
             snprintf(used_buf, sizeof(used_buf), "never");
           } else {
             struct tm *tm_used = gmtime(&m->last_used);
-            strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tm_used);
+            if (tm_used) strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tm_used);
+            else         snprintf(used_buf, sizeof(used_buf), "invalid");
           }
           irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
                      nick, m->mask, used_buf);
@@ -1285,7 +1317,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           } else {
             time_t bts = (time_t)bot_ts;
             struct tm *tm_utc = gmtime(&bts);
-            strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+            if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+            else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
           }
           irc_printf(state, "PRIVMSG %s :| [b] %-20s  (last seen: %s)\r\n",
                      nick, bot_nick, ts_buf);
@@ -1550,36 +1583,75 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       else
         updater_check_for_updates(state, nick);
     } else if (strcasecmp(command, "+hub") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: +hub <ip:port>\r\n", nick);
+      /* +hub <host:port> <pubkey-b64>
+       * The pubkey is the hub's pinned long-term Ed25519 public key — either
+       * 44-char base64 (raw 32-byte Ed25519) or 88-char base64 (combined
+       * 64-byte Curve25519 pubkey, first 32 bytes used; same as the hub's
+       * hub_public.b64). Per-hub keypairs mean the pinned key is REQUIRED:
+       * the bot refuses to connect to a hub it can't authenticate. This
+       * folds in the old 'sethubpub' behaviour per hub. */
+      if (!arg1 || !arg2) {
+        irc_printf(state,
+                   "PRIVMSG %s :Syntax: +hub <host:port> <pubkey-b64>\r\n",
+                   nick);
         return;
       }
-      // Check for duplicates
+      /* Validate address has a host and a numeric port. */
+      const char *colon = strrchr(arg1, ':');
+      if (!colon || colon == arg1 || atoi(colon + 1) <= 0) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: address must be HOST:PORT (e.g. "
+                   "hub.example.com:7000).\r\n", nick);
+        return;
+      }
+      /* Duplicate check (by address). */
       for (int i = 0; i < state->hub_count; i++) {
-        if (strcmp(state->hub_list[i], arg1) == 0) {
+        if (strcmp(state->hubs[i].addr, arg1) == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Error: Hub '%s' already exists.\r\n",
-                     nick, arg1);
+                     "PRIVMSG %s :Error: Hub '%s' already exists. Remove it "
+                     "with -hub first to change its key.\r\n", nick, arg1);
           return;
         }
       }
-      if (state->hub_count < MAX_SERVERS) {
-        char *dup = strdup(arg1);
-        if (!dup) return;
-        state->hub_list[state->hub_count++] = dup;
-        config_write_with_state_pass(state);
-        irc_printf(state, "PRIVMSG %s :Added Hub: %s\r\n", nick, arg1);
-      } else {
+      if (state->hub_count >= MAX_SERVERS) {
         irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
+        return;
+      }
+      /* Validate + decode the pinned pubkey. */
+      int dec_len = 0;
+      unsigned char *dec = base64_decode(arg2, &dec_len);
+      if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: pubkey must be base64 of a 32-byte "
+                   "Ed25519 key (44 chars) or 64-byte combined Curve25519 "
+                   "key (88 chars).\r\n", nick);
+        if (dec) free(dec);
+        return;
+      }
+      hub_entry_t *he = &state->hubs[state->hub_count];
+      memset(he, 0, sizeof(*he));
+      snprintf(he->addr, sizeof(he->addr), "%s", arg1);
+      memcpy(he->ed_pub, dec, 32);
+      he->ed_pub_set = true;
+      secure_wipe(dec, (size_t)dec_len);
+      free(dec);
+      state->hub_count++;
+      config_write_with_state_pass(state);
+      irc_printf(state,
+                 "PRIVMSG %s :Added Hub: %s (pubkey pinned)\r\n", nick, arg1);
+      /* If we are not connected to any hub yet, try the new one now. */
+      if (state->hub_fd == -1) {
+        state->last_hub_connect_attempt = 0;
+        hub_client_connect(state);
       }
     } else if (strcasecmp(command, "-hub") == 0) {
       if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: -hub <ip:port>\r\n", nick);
+        irc_printf(state, "PRIVMSG %s :Syntax: -hub <host:port>\r\n", nick);
         return;
       }
       int found = -1;
       for (int i = 0; i < state->hub_count; i++)
-        if (strcmp(state->hub_list[i], arg1) == 0) {
+        if (strcmp(state->hubs[i].addr, arg1) == 0) {
           found = i;
           break;
         }
@@ -1595,11 +1667,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           hub_client_disconnect(state);
         }
 
-        // Remove the hub from the list
-        free(state->hub_list[found]);
+        // Remove the hub from the list (shift entries down, wiping the key)
+        secure_wipe(state->hubs[found].ed_pub, sizeof(state->hubs[found].ed_pub));
         for (int i = found; i < state->hub_count - 1; i++)
-          state->hub_list[i] = state->hub_list[i + 1];
+          state->hubs[i] = state->hubs[i + 1];
         state->hub_count--;
+        memset(&state->hubs[state->hub_count], 0,
+               sizeof(state->hubs[state->hub_count]));
         config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
 
@@ -1612,138 +1686,92 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s :No other hubs available to connect to.\r\n",
                      nick);
         }
-      }
-    } else if (strcasecmp(command, "sethubkey") == 0) {
-      if (!arg1) {
-        irc_printf(state,
-                   "PRIVMSG %s :Syntax: sethubkey <88-char-base64-Curve25519-key>\r\n",
-                   nick);
       } else {
-        // Reject legacy multipart syntax
-        if (strchr(arg1, '/') && strchr(arg1, ':')) {
-          irc_printf(state,
-                     "PRIVMSG %s :ERROR: Multipart keys no longer needed. "
-                     "Curve25519 keys fit in one IRC message (88 chars).\r\n",
-                     nick);
-        } else {
-          // Validate: decode base64 → must be exactly 64 bytes
-          int dec_len = 0;
-          unsigned char *dec = base64_decode(arg1, &dec_len);
-
-          if (!dec || dec_len != HUB_KEY_RAW_LEN) {
-            irc_printf(state,
-                       "PRIVMSG %s :ERROR: Invalid key. Need 88-char base64 "
-                       "that decodes to exactly 64 bytes (Curve25519).\r\n",
-                       nick);
-            if (dec) free(dec);
-          } else {
-            // Validate Ed25519 and X25519 halves can be loaded
-            EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, dec, 32);
-            EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, dec + 32, 32);
-            memset(dec, 0, 64);
-            free(dec);
-
-            if (!ep || !xp) {
-              irc_printf(state,
-                         "PRIVMSG %s :ERROR: Invalid Curve25519 key material.\r\n",
-                         nick);
-              if (ep) EVP_PKEY_free(ep);
-              if (xp) EVP_PKEY_free(xp);
-            } else {
-              EVP_PKEY_free(ep);
-              EVP_PKEY_free(xp);
-
-              snprintf(state->hub_key, sizeof(state->hub_key), "%s", arg1);
-              config_write_with_state_pass(state);
-              irc_printf(state,
-                         "PRIVMSG %s :✓ Curve25519 key set. Reconnecting...\r\n",
-                         nick);
-
-              if (state->hub_fd != -1) {
-                close(state->hub_fd);
-                state->hub_fd = -1;
-              }
-              state->last_hub_connect_attempt = 0;
-              hub_client_connect(state);
-            }
-          }
-        }
+        irc_printf(state, "PRIVMSG %s :Error: Hub '%s' not found.\r\n",
+                   nick, arg1);
       }
-    }
-
-    else if (strcasecmp(command, "sethubpub") == 0) {
-      /* Set the hub's long-term Ed25519 PUBLIC key used by the bot to verify
-       * the hub's signature in the v2 handshake. Accepts either:
-       *   - 44-char base64 = raw 32-byte Ed25519 pubkey
-       *   - 88-char base64 = combined 64-byte Ed25519+X25519 pubkey
-       *     (we take the first 32 bytes — same format as hub_public.b64) */
-      if (!arg1) {
+    } else if (strcasecmp(command, "rekey") == 0) {
+      /* Rotate the bot's own Curve25519 identity keypair.
+       *
+       * Trust model: the bot generates the new keypair locally (the private
+       * key never leaves this host) and pushes only the new PUBLIC key to the
+       * hub. The push rides the CURRENT authenticated session, so possession
+       * of the OLD private key authorises the rotation — only the legitimate
+       * bot can rekey itself, and only its own record (the hub keys the entry
+       * by the authenticated client UUID). The hub is the source of trust: it
+       * stores the new pub, re-verifies us against it on reconnect, and fans
+       * it out to peer hubs. The UUID is unchanged.
+       *
+       * Ordering is fail-safe: we push the new pub FIRST and only commit the
+       * new private key locally if that send succeeds, so an interrupted
+       * rekey can never leave us holding a key the hub has never seen. */
+      if (state->hub_count == 0) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: sethubpub <44-char or 88-char base64 hub pubkey>\r\n",
-                   nick);
-      } else {
-        int dec_len = 0;
-        unsigned char *dec = base64_decode(arg1, &dec_len);
-        if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
-          irc_printf(state,
-                     "PRIVMSG %s :ERROR: Need base64 of 32-byte Ed25519 pubkey "
-                     "or 64-byte combined Curve25519 pubkey.\r\n", nick);
-          if (dec) free(dec);
-        } else {
-          memcpy(state->hub_remote_ed_pub, dec, 32);
-          state->hub_remote_ed_pub_set = true;
-          memset(dec, 0, dec_len);
-          free(dec);
-          config_write_with_state_pass(state);
-          irc_printf(state,
-                     "PRIVMSG %s :✓ Hub Ed25519 pubkey saved. Next handshake "
-                     "will REQUIRE a valid hub signature.\r\n", nick);
-        }
-      }
-    }
-
-    else if (strcasecmp(command, "setuuid") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: setuuid <uuid>\r\n", nick);
-        return;
-      }
-
-      // Sanitize UUID - remove spaces, convert to lowercase
-      char sanitized[64] = {0};
-      int out_idx = 0;
-      for (int i = 0; arg1[i] && out_idx < 63; i++) {
-        char c = arg1[i];
-        // Allow hex chars (0-9, a-f, A-F) and dashes
-        if ((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
-            (c >= 'A' && c <= 'F') || c == '-') {
-          sanitized[out_idx++] = tolower(c);
-        }
-      }
-      sanitized[out_idx] = '\0';
-
-      // Validate UUID format: xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx (36 chars)
-      if (strlen(sanitized) != 36 || sanitized[8] != '-' ||
-          sanitized[13] != '-' || sanitized[18] != '-' ||
-          sanitized[23] != '-') {
-        irc_printf(state,
-                   "PRIVMSG %s :Invalid UUID format. Expected: "
-                   "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx\r\n",
+                   "PRIVMSG %s :Error: no hub configured; nothing to rekey.\r\n",
                    nick);
         return;
       }
+      if (!state->hub_authenticated || state->hub_fd == -1) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: not authenticated to a hub. Rekey needs "
+                   "an active session so the new key is pushed under the old "
+                   "one. Try again once connected.\r\n", nick);
+        return;
+      }
 
-      // Store UUID
-      snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", sanitized);
+      unsigned char new_priv[HUB_KEY_RAW_LEN], new_pub[HUB_KEY_RAW_LEN];
+      if (!crypto_generate_combined_keypair(new_priv, new_pub)) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: keypair generation failed.\r\n", nick);
+        return;
+      }
+      char *new_priv_b64 = base64_encode(new_priv, HUB_KEY_RAW_LEN);
+      char *new_pub_b64  = base64_encode(new_pub,  HUB_KEY_RAW_LEN);
+      if (!new_priv_b64 || !new_pub_b64) {
+        if (new_priv_b64) { secure_wipe(new_priv_b64, strlen(new_priv_b64)); free(new_priv_b64); }
+        if (new_pub_b64) free(new_pub_b64);
+        secure_wipe(new_priv, sizeof(new_priv));
+        secure_wipe(new_pub, sizeof(new_pub));
+        irc_printf(state, "PRIVMSG %s :Error: base64 encode failed.\r\n", nick);
+        return;
+      }
+
+      /* 1) Push the new PUBLIC key to the hub under the current session. */
+      if (!hub_client_push_delta(state, "pub", new_pub_b64, time(NULL))) {
+        secure_wipe(new_priv, sizeof(new_priv));
+        secure_wipe(new_pub, sizeof(new_pub));
+        secure_wipe(new_priv_b64, strlen(new_priv_b64));
+        free(new_priv_b64);
+        free(new_pub_b64);
+        irc_printf(state,
+                   "PRIVMSG %s :Error: failed to push new pubkey to hub; key "
+                   "left UNCHANGED.\r\n", nick);
+        return;
+      }
+
+      /* 2) Commit the new PRIVATE key locally: mlock'd raw cache, the base64
+       *    serialization field, and the encrypted config on disk. */
+      OPENSSL_cleanse(state->hub_key_raw, sizeof(state->hub_key_raw));
+      memcpy(state->hub_key_raw, new_priv, HUB_KEY_RAW_LEN);
+      secure_wipe(state->hub_key, sizeof(state->hub_key));
+      snprintf(state->hub_key, sizeof(state->hub_key), "%s", new_priv_b64);
       config_write_with_state_pass(state);
-      irc_printf(state,
-                 "PRIVMSG %s :UUID set to: %s. Reconnecting to hub...\r\n",
-                 nick, state->bot_uuid);
 
-      // Force Hub Reconnect
-      if (state->hub_fd != -1) {
-        close(state->hub_fd);
-        state->hub_fd = -1;
-      }
+      irc_printf(state,
+                 "PRIVMSG %s :✓ Rekeyed. New pubkey pushed to hub; "
+                 "reconnecting with new key.\r\n", nick);
+      log_message(L_INFO, state,
+                  "[HUB] Rekey: generated new identity, pushed new pub to hub, "
+                  "reconnecting.\n");
+
+      secure_wipe(new_priv, sizeof(new_priv));
+      secure_wipe(new_pub, sizeof(new_pub));
+      secure_wipe(new_priv_b64, strlen(new_priv_b64));
+      free(new_priv_b64);
+      free(new_pub_b64);
+
+      /* 3) Reconnect so the hub re-verifies us against the new pub. */
+      hub_client_disconnect(state);
       state->last_hub_connect_attempt = 0;
       hub_client_connect(state);
     } else if (strcasecmp(command, "chpass") == 0) {
@@ -1767,14 +1795,22 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
     } else if (strcasecmp(command, "help") == 0) {
       if (!arg1) {
-        irc_printf(state,
-                   "PRIVMSG %s :Admin commands: die, jump, op, join, part, "
-                   "status, givenick, chnick, +server, -server, admins, opers, "
-                   "+admin, -admin, +oper, -oper, +usermask, -usermask, chpass, "
-                   "match, botpass, +bot, -bot, "
-                   "+hub, -hub, sethubkey, setuuid, saveconf, setlog, getlog, "
-                   "update, help\r\n",
-                   nick);
+        irc_printf(state, "PRIVMSG %s : | " BOT_NAME " " BOT_VERSION " help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : +----------------------------------------------------------------------------\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : | \r\n", nick);
+        if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
+          irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers, match\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help\r\n", nick);
+        } else {
+          irc_printf(state, "PRIVMSG %s : |   die, jump, op, join, part, status, givenick, chnick\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chpass, match\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   botpass, +bot, -bot, +hub, -hub, rekey\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   saveconf, setlog, getlog, update, help\r\n", nick);
+        }
+        irc_printf(state, "PRIVMSG %s : |\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
       } else {
         if (strcasecmp(arg1, "die") == 0) {
           irc_printf(state,
@@ -1907,19 +1943,23 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         } else if (strcasecmp(arg1, "+hub") == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Syntax: +hub <ip:port> - Add a Hub server.\r\n",
+              "PRIVMSG %s :Syntax: +hub <host:port> <pubkey-b64> - Add a hub "
+              "and pin its Ed25519 pubkey (44 or 88 char base64 from the "
+              "hub's hub_public.b64).\r\n",
               nick);
-        } else if (strcasecmp(arg1, "sethubkey") == 0) {
+        } else if (strcasecmp(arg1, "-hub") == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Syntax: sethubkey <88-char-b64> - Set Curve25519 key from hub admin.\r\n",
+              "PRIVMSG %s :Syntax: -hub <host:port> - Remove a configured "
+              "hub.\r\n",
               nick);
-        } else if (strcasecmp(arg1, "setuuid") == 0) {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: setuuid <uuid> - Set the UUID "
-                     "identifier for HUB connections. Expected: "
-                     "xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx.\r\n",
-                     nick);
+        } else if (strcasecmp(arg1, "rekey") == 0) {
+          irc_printf(
+              state,
+              "PRIVMSG %s :Syntax: rekey - Generate a new Curve25519 identity "
+              "keypair locally, push the new public key to the hub, and "
+              "reconnect. UUID is unchanged. Requires an active hub session.\r\n",
+              nick);
         } else {
           irc_printf(state,
                      "PRIVMSG %s :No help available for command '%s'.\r\n",
@@ -1951,7 +1991,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :Your password has been changed.\r\n", nick);
     } else if (strcasecmp(command, "help") == 0) {
       if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Oper commands: op, chpass, help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : | " BOT_NAME " " BOT_VERSION " help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : +----------------------------------------------------------------------------\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : | \r\n", nick);
+        irc_printf(state, "PRIVMSG %s : |   op, chpass, help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : |\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
       } else {
         if (strcasecmp(arg1, "op") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: op <#channel> - Get operator status on a channel.\r\n", nick);

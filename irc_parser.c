@@ -331,7 +331,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
                                             chan_name)) {
           for (int tb = 0; tb < state->trusted_bot_count; tb++) {
             char tb_nick[MAX_NICK];
-            if (sscanf(state->trusted_bots[tb], "%63[^!]", tb_nick) == 1) {
+            /* %9 not %63: tb_nick is MAX_NICK(10); a longer nick in a
+             * (mesh-synced) trusted_bots entry would overflow the stack. */
+            if (sscanf(state->trusted_bots[tb], "%9[^!]", tb_nick) == 1) {
               bot_comms_send_command(state, tb_nick,
                                      "INVITE %s %s",
                                      chan_name, state->current_nick);

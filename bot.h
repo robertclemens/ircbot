@@ -34,6 +34,16 @@
 #define BOT_UPDATE_URL                                                         \
   "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
   "releases.txt"
+// Detached Ed25519 signature for releases.txt (raw 64-byte sig, base64-encoded).
+#define BOT_UPDATE_SIG_URL                                                     \
+  "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
+  "releases.txt.sig"
+// Base64 of the 32-byte raw Ed25519 PUBLIC key that signs releases.txt.
+// MUST be set to enable the self-updater; an empty value DISABLES updates
+// (fail-closed).  Generate the keypair, publish releases.txt.sig, and paste the
+// 44-char base64 public key here.  Full procedure: docs/security.md ->
+// "Signed Release Process (Ed25519 detached signatures)".
+#define BOT_UPDATE_PUBKEY_B64 ""
 // End of edit section
 
 // You should not edit below this line. While some of the macros may be
@@ -92,6 +102,11 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define MAX_HUB_KEY_SIZE  128  // 88 chars base64 + null + headroom (Curve25519)
 #define HUB_KEY_RAW_LEN   64  // 32-byte Ed25519 + 32-byte X25519
 #define COMBINED_KEY_B64  88  // base64 of 64-byte combined key
+#define MAX_OPT_FLAGS     32  // characters in opt| string (alnum letters)
+
+/* Network-controlled options synced from hub via the 'opt|' record.
+ * Each option is a single letter [a-zA-Z0-9].  See is_opt_set() helper. */
+#define OPT_HUB_ONLY_MUTATIONS 'h'   // refuse local mutations of hub-authoritative records
 
 #define CMD_PING 0x01
 #define CMD_CONFIG_PUSH 0x02
@@ -198,6 +213,11 @@ typedef struct chan_t chan_t;
 typedef struct {
   char   uuid[37];
   char   name[64];
+  /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
+   * (88 chars + NUL).  Empty when no key on file.  Bots never need to use
+   * the pubkey themselves but they replicate the field via mesh sync. */
+  char   pubkey_b64[COMBINED_KEY_B64 + 1];
+  bool   has_pubkey;
   char   password[MAX_PASS];
   char   type;         /* 'a' = admin, 'o' = oper */
   bool   is_active;    /* false when action == "del" */
@@ -251,6 +271,17 @@ struct chan_t {
   int op_request_retry_count;
   chan_t *next;
 };
+
+/* One configured hub: its "host:port" address plus the hub's pinned
+ * long-term Ed25519 public key (32 raw bytes). Per-hub pinning replaced the
+ * old single global hub pubkey: each hub now has its own keypair, so the
+ * pinned key must travel with the address it authenticates. Set via
+ * '+hub <host:port> <pubkey-b64>' (or the -setup wizard). */
+typedef struct {
+  char addr[256];               /* "host:port" */
+  unsigned char ed_pub[32];     /* hub's pinned Ed25519 public key */
+  bool ed_pub_set;
+} hub_entry_t;
 
 struct bot_state {
   int server_fd;
@@ -315,18 +346,21 @@ struct bot_state {
   int mask_record_count;
   bool config_dirty;   // true when last_used/last_seen needs flushing
 
+  // Network options (opt| record, hub-pushed)
+  char opt_flags[MAX_OPT_FLAGS + 1];
+  time_t opt_flags_ts;
+
   // Hub Management
   char bot_uuid[64];
   char hub_key[MAX_HUB_KEY_SIZE];    // 88-char base64 — used for config serialization only
   unsigned char hub_key_raw[HUB_KEY_RAW_LEN]; // decoded key; mlock'd and cleansed on exit
-  /* v2 hub-bot mutual auth: the hub's long-term Ed25519 public key (32 raw
-   * bytes), set from the 'hp|' config line via 'sethubpub'. When _set is
-   * false the bot logs a one-time warning on each handshake and falls back
-   * to trusting whatever the hub sends — this matches pre-v2 behaviour and
-   * lets existing deployments upgrade in stages. */
+  /* hub_remote_ed_pub holds the pinned pubkey of the hub currently being
+   * connected to: it is copied from hubs[idx].ed_pub at connect time so the
+   * handshake-verification code has a single place to read from. The
+   * authoritative per-hub keys live in hubs[]. */
   unsigned char hub_remote_ed_pub[32];
   bool          hub_remote_ed_pub_set;
-  char *hub_list[MAX_SERVERS];
+  hub_entry_t hubs[MAX_SERVERS];
   int hub_count;
   int hub_fd;
   char current_hub[256]; // Track currently connected hub (ip:port)
@@ -378,7 +412,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *dest, char *message);
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...);
-void handle_fatal_error(const char *message);
+_Noreturn void handle_fatal_error(const char *message);
 void get_local_ip(bot_state_t *state);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
@@ -411,6 +445,12 @@ int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
  * with PBKDF2_ITERATIONS rounds. Returns true on success. */
 bool crypto_derive_config_key(const char *password, const unsigned char *salt,
                               unsigned char out_key[32]);
+bool crypto_generate_combined_keypair(unsigned char priv_out[HUB_KEY_RAW_LEN],
+                                       unsigned char pub_out[HUB_KEY_RAW_LEN]);
+/* Verify a 64-byte detached Ed25519 signature over msg with a 32-byte pubkey. */
+bool crypto_ed25519_verify(const unsigned char pub[32],
+                           const unsigned char *msg, size_t msg_len,
+                           const unsigned char sig[64]);
 /* Volatile-pointer secure zero. Compiler may NOT elide. */
 void secure_wipe(void *ptr, size_t len);
 char *base64_encode(const unsigned char *input, int length);
@@ -421,7 +461,7 @@ void hub_client_process(bot_state_t *state);
 void hub_client_promote_local_config(bot_state_t *state);
 void hub_client_push_config(bot_state_t *state);
 void hub_client_push_admin_delta(bot_state_t *state);
-void hub_client_push_delta(bot_state_t *state, const char *key,
+bool hub_client_push_delta(bot_state_t *state, const char *key,
                            const char *value, time_t ts);
 void hub_client_push_channel(bot_state_t *state, chan_t *chan);
 void hub_client_sync_hostmask(bot_state_t *state);
@@ -445,6 +485,14 @@ void config_write_local_with_state_pass(bot_state_t *s);
 static inline bool is_valid_bot_nick(const char *nick) {
   return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&
          strchr(nick, '|') == NULL;
+}
+
+/* Returns true if option letter `c` is present in the network-pushed
+ * opt_flags string.  `c` is matched as-is; flag letters are case-sensitive
+ * (uppercase and lowercase are independent options). */
+static inline bool is_opt_set(const bot_state_t *state, char c) {
+  if (!state || !state->opt_flags[0]) return false;
+  return strchr(state->opt_flags, c) != NULL;
 }
 
 #ifdef DEBUG

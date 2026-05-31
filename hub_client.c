@@ -226,16 +226,16 @@ void hub_client_sync_hostmask(bot_state_t *state) {
  * This is a targeted update that the hub fans out as one DELTA per peer,
  * instead of the full config push which fans out ~50 lines.  Falls back to
  * hub_client_push_config if ts == 0 or key is empty. */
-void hub_client_push_delta(bot_state_t *state, const char *key,
+bool hub_client_push_delta(bot_state_t *state, const char *key,
                            const char *value, time_t ts) {
-  if (!key || key[0] == '\0') return;
+  if (!key || key[0] == '\0') return false;
   if (state->hub_count == 0 || state->hub_fd == -1 ||
-      !state->hub_authenticated) return;
+      !state->hub_authenticated) return false;
 
   char payload[MAX_BUFFER];
   int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%ld",
                          key, value ? value : "", (long)(ts ? ts : time(NULL)));
-  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return false;
 
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_BOT_DELTA;
@@ -255,11 +255,14 @@ void hub_client_push_delta(bot_state_t *state, const char *key,
     if (send(state->hub_fd, cipher, total, 0) == total) {
       log_message(L_DEBUG, state, "[HUB] Delta pushed: %s=%s ts=%ld\n",
                   key, value ? value : "", (long)ts);
+      return true;
     } else {
       log_message(L_INFO, state, "[HUB] Delta push failed, falling back\n");
       hub_client_disconnect(state);
+      return false;
     }
   }
+  return false;
 }
 
 /**
@@ -790,8 +793,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'o': // Oper user record (new: uuid|name|pass|add/del|last_seen|ts)
-    case 'a': // Admin user record (new: uuid|name|pass|add/del|last_seen|ts)
+    case 'o': // Oper user record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64])
+    case 'a': // Admin user record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64])
     {
       char first_ua[40] = {0};
       char *pfua = strchr(data, '|');
@@ -800,15 +803,24 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       if (is_new_ua) {
         char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
         char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-        char *p5=p4?strchr(p4+1,'|'):NULL;
+        char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
         if (p1&&p2&&p3&&p4&&p5) {
           char uuid[37], uname[64], upass[MAX_PASS], act[8];
+          char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
           long last_seen, ts;
           snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
           snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
           snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
           snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
-          last_seen = atol(p4+1); ts = atol(p5+1);
+          last_seen = atol(p4+1);
+          if (p6) {
+            char ts_buf[32];
+            snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
+            ts = atol(ts_buf);
+            snprintf(incoming_pub, sizeof(incoming_pub), "%s", p6+1);
+          } else {
+            ts = atol(p5+1);
+          }
           bool is_active = (strncmp(act,"add",3)==0);
           user_record_t *found_u = NULL;
           for (int ui=0; ui<state->user_record_count; ui++) {
@@ -828,9 +840,36 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             found_u->is_active = is_active;
             if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
             found_u->timestamp = ts;
+            if (incoming_pub[0] && strlen(incoming_pub) == COMBINED_KEY_B64) {
+              snprintf(found_u->pubkey_b64, sizeof(found_u->pubkey_b64),
+                       "%s", incoming_pub);
+              found_u->has_pubkey = true;
+            }
             updates++;
             log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s)\n", uname, type, act);
           }
+        }
+      }
+    } break;
+
+    case 'O': /* Network opt flags pushed by hub: O|<letters>|<ts> */
+    {
+      char flags[MAX_OPT_FLAGS + 1] = {0};
+      long ts = 0;
+      if (sscanf(data, "%32[^|]|%ld", flags, &ts) >= 1) {
+        if (ts >= state->opt_flags_ts) {
+          int w = 0;
+          for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
+            char c = flags[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9'))
+              state->opt_flags[w++] = c;
+          }
+          state->opt_flags[w] = '\0';
+          state->opt_flags_ts = (ts > 0) ? (time_t)ts : time(NULL);
+          log_message(L_INFO, state, "[HUB-SYNC] opt flags updated -> '%s'\n",
+                      state->opt_flags);
+          updates++;
         }
       }
     } break;
@@ -1058,38 +1097,13 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     break;
 
   case CMD_BOT_KEY_UPDATE:
-    // Hub sent us a new private key during rekey operation
-    if (payload && payload_len > 0) {
-      log_message(L_INFO, state,
-                  "[HUB] Received new private key from hub (%d bytes)\n",
-                  payload_len);
-
-      // Validate: must be exactly COMBINED_KEY_B64 chars (Curve25519 key)
-      if (payload_len == COMBINED_KEY_B64) {
-        memset(state->hub_key, 0, sizeof(state->hub_key));
-        memcpy(state->hub_key, payload, payload_len);
-        state->hub_key[payload_len] = '\0';
-
-        log_message(L_INFO, state, "[HUB] Updated Curve25519 key in memory\n");
-
-        // Save the new key to config file immediately
-        if (bot_has_startup_pass(state)) {
-          config_write_with_state_pass(state);
-          log_message(L_INFO, state,
-                      "[HUB] Saved new private key to config file\n");
-          log_message(L_INFO, state,
-                      "[HUB] Key update complete - waiting for hub to disconnect\n");
-        } else {
-          log_message(L_INFO, state,
-                      "[HUB] WARNING: Cannot save config (no password), key update "
-                      "will be lost on restart\n");
-        }
-      } else {
-        log_message(L_INFO, state,
-                    "[HUB] ERROR: New key wrong length (%d, need %d chars)\n",
-                    payload_len, COMBINED_KEY_B64);
-      }
-    }
+    /* v3: independent per-bot keys.  The bot's private key must never
+     * arrive over the wire — reject any inbound "here's your new priv"
+     * attempt from the hub.  Rekey is bot-local (see admin command 'rekey'). */
+    log_message(L_INFO, state,
+                "[HUB] Rejected CMD_BOT_KEY_UPDATE: per-bot independent keys; "
+                "private keys do not cross the wire.\n");
+    (void)payload; (void)payload_len;
     break;
 
   case CMD_OP_GRANT: {
@@ -1184,7 +1198,8 @@ void hub_client_connect(bot_state_t *state) {
     return;
   if (state->bot_uuid[0] == '\0') {
     log_message(L_INFO, state,
-                "[HUB] Cannot connect: UUID not set. Use 'setuuid' command.\n");
+                "[HUB] Cannot connect: UUID not set (it is generated at bot "
+                "creation — re-run 'ircbot -setup').\n");
     state->last_hub_connect_attempt =
         time(NULL) + 3600; // Don't retry for 1 hour
     return;
@@ -1195,18 +1210,19 @@ void hub_client_connect(bot_state_t *state) {
       state->bot_uuid[13] != '-' || state->bot_uuid[18] != '-' ||
       state->bot_uuid[23] != '-') {
     log_message(L_INFO, state,
-                "[HUB] Cannot connect: Invalid UUID format (%s). Use 'setuuid' "
-                "command.\n",
+                "[HUB] Cannot connect: Invalid UUID format (%s). Re-run "
+                "'ircbot -setup' to regenerate identity.\n",
                 state->bot_uuid);
     state->last_hub_connect_attempt = time(NULL) + 3600;
     return;
   }
 
-  // Check 2: Hub key must be present and reasonable length
+  // Check 2: Bot's own keypair must be present and the right length
   if (state->hub_key[0] == '\0') {
     log_message(
         L_INFO, state,
-        "[HUB] Cannot connect: Hub key not set. Use 'sethubkey' command.\n");
+        "[HUB] Cannot connect: bot keypair not set (generated at creation — "
+        "re-run 'ircbot -setup').\n");
     state->last_hub_connect_attempt = time(NULL) + 3600;
     return;
   }
@@ -1215,18 +1231,19 @@ void hub_client_connect(bot_state_t *state) {
   size_t key_len = strlen(state->hub_key);
   if (key_len != COMBINED_KEY_B64) {
     log_message(L_INFO, state,
-                "[HUB] Cannot connect: Hub key length wrong (%zu chars, need %d). "
-                "Use 'sethubkey <88-char-base64>' to set a Curve25519 key.\n",
+                "[HUB] Cannot connect: bot key length wrong (%zu chars, need "
+                "%d). Re-run 'ircbot -setup' to regenerate identity.\n",
                 key_len, COMBINED_KEY_B64);
     state->last_hub_connect_attempt = time(NULL) + 3600;
     return;
   }
 
   // Check 3: Hub list must have at least one entry
-  if (state->hub_list[0] == NULL || state->hub_list[0][0] == '\0') {
+  if (state->hubs[0].addr[0] == '\0') {
     log_message(
         L_INFO, state,
-        "[HUB] Cannot connect: No hubs configured. Use '+hub' command.\n");
+        "[HUB] Cannot connect: No hubs configured. Use '+hub <host:port> "
+        "<pubkey>'.\n");
     state->last_hub_connect_attempt = time(NULL) + 3600;
     return;
   }
@@ -1240,9 +1257,27 @@ void hub_client_connect(bot_state_t *state) {
   state->hub_connecting = true;
   char hub_tmp[256];
   char hub_original[256]; // Save original hub string for later
-  snprintf(hub_tmp, sizeof(hub_tmp), "%s",
-           state->hub_list[rand() % state->hub_count]);
+  int hub_idx = rand() % state->hub_count;
+  snprintf(hub_tmp, sizeof(hub_tmp), "%s", state->hubs[hub_idx].addr);
   snprintf(hub_original, sizeof(hub_original), "%s", hub_tmp);
+
+  /* Load this hub's pinned pubkey so the handshake-verification code (which
+   * reads hub_remote_ed_pub) authenticates against the right per-hub key.
+   * If the selected hub has no pinned key we refuse: the bot must be able to
+   * verify the hub's signature. */
+  if (state->hubs[hub_idx].ed_pub_set) {
+    memcpy(state->hub_remote_ed_pub, state->hubs[hub_idx].ed_pub, 32);
+    state->hub_remote_ed_pub_set = true;
+  } else {
+    state->hub_remote_ed_pub_set = false;
+    log_message(L_INFO, state,
+                "[HUB] Cannot connect to %s: no pinned pubkey. Re-add with "
+                "'+hub %s <pubkey>'.\n", hub_tmp, hub_tmp);
+    state->hub_connecting = false;
+    __sync_lock_release(&lock);
+    state->last_hub_connect_attempt = time(NULL) + 60;
+    return;
+  }
   char *p = strchr(hub_tmp, ':');
   if (!p) {
     state->hub_connecting = false;
@@ -1423,11 +1458,13 @@ void hub_client_process(bot_state_t *state) {
         }
         log_message(L_INFO, state, "[HUB] v2 hub signature verified.\n");
       } else {
-        /* hub_remote_ed_pub_set is false — mutual auth is not configured.
-         * Refuse to connect: run 'sethubpub <hub-ed25519-pubkey>' first. */
+        /* hub_remote_ed_pub_set is false — no pinned key for this hub.
+         * (The connect path normally refuses earlier; this is defensive.)
+         * Re-add the hub with its pubkey: '+hub <host:port> <pubkey>'. */
         log_message(L_INFO, state,
-                    "[HUB] ERROR: hub pubkey not configured. "
-                    "Run 'sethubpub <44-char-base64>' before connecting.\n");
+                    "[HUB] ERROR: hub pubkey not pinned. "
+                    "Re-add with '+hub <host:port> <pubkey>' before "
+                    "connecting.\n");
         free(packet_body);
         hub_client_disconnect(state);
         return;

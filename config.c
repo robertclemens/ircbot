@@ -254,7 +254,7 @@ bool config_load(bot_state_t *state, const char *password,
         }
       } break;
 
-      case 'o': // Oper record (new: uuid|name|pass|add/del|last_seen|ts  old: mask|pass|add/del|ts)
+      case 'o': // Oper record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64]; old: mask|pass|add/del|ts)
       {
         char first[40] = {0};
         char *p = strchr(data, '|');
@@ -270,7 +270,7 @@ bool config_load(bot_state_t *state, const char *password,
           memset(u, 0, sizeof(*u));
           char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
           char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-          char *p5=p4?strchr(p4+1,'|'):NULL;
+          char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
           if (p1&&p2&&p3&&p4&&p5) {
             snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
             snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
@@ -278,7 +278,15 @@ bool config_load(bot_state_t *state, const char *password,
             u->type      = 'o';
             u->is_active = (strncmp(p3+1,"add",3)==0);
             u->last_seen = (time_t)atol(p4+1);
-            u->timestamp = (time_t)atol(p5+1);
+            if (p6) {
+              char ts_buf[32];
+              snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
+              u->timestamp = (time_t)atol(ts_buf);
+              snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
+              u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
+            } else {
+              u->timestamp = (time_t)atol(p5+1);
+            }
             state->user_record_count++;
           }
         } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
@@ -299,7 +307,7 @@ bool config_load(bot_state_t *state, const char *password,
         }
       } break;
 
-      case 'a': // Admin record (new: uuid|name|pass|add/del|last_seen|ts  old: pass|ts)
+      case 'a': // Admin record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64]; old: pass|ts)
       {
         char first[40] = {0};
         char *p = strchr(data, '|');
@@ -315,7 +323,7 @@ bool config_load(bot_state_t *state, const char *password,
           memset(u, 0, sizeof(*u));
           char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
           char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-          char *p5=p4?strchr(p4+1,'|'):NULL;
+          char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
           if (p1&&p2&&p3&&p4&&p5) {
             snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
             snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
@@ -323,7 +331,15 @@ bool config_load(bot_state_t *state, const char *password,
             u->type      = 'a';
             u->is_active = (strncmp(p3+1,"add",3)==0);
             u->last_seen = (time_t)atol(p4+1);
-            u->timestamp = (time_t)atol(p5+1);
+            if (p6) {
+              char ts_buf[32];
+              snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
+              u->timestamp = (time_t)atol(ts_buf);
+              snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
+              u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
+            } else {
+              u->timestamp = (time_t)atol(p5+1);
+            }
             state->user_record_count++;
           }
         } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
@@ -379,9 +395,38 @@ bool config_load(bot_state_t *state, const char *password,
         snprintf(state->vhost, sizeof(state->vhost), "%s", data);
         break;
 
-      case 'h': // Hub list (bot-specific)
+      case 'h': /* Hub entry (bot-specific): h|<host:port>[|<pubkey_b64>]
+                 * The optional pubkey is the hub's pinned Ed25519 public key,
+                 * either 44-char base64 (raw 32 bytes) or 88-char base64
+                 * (combined 64-byte Curve25519 pubkey — we take the first 32,
+                 * matching hub_public.b64). Lines with no pubkey are accepted
+                 * for migration; the post-load pass below fills them from a
+                 * legacy global 'j|' key if one was present. */
         if (state->hub_count < MAX_SERVERS) {
-          state->hub_list[state->hub_count++] = strdup(data);
+          hub_entry_t *he = &state->hubs[state->hub_count];
+          memset(he, 0, sizeof(*he));
+          char *bar = strchr(data, '|');
+          if (bar) {
+            size_t al = (size_t)(bar - data);
+            if (al >= sizeof(he->addr)) al = sizeof(he->addr) - 1;
+            memcpy(he->addr, data, al);
+            he->addr[al] = '\0';
+            int dl = 0;
+            unsigned char *dec = base64_decode(bar + 1, &dl);
+            if (dec && (dl == 32 || dl == HUB_KEY_RAW_LEN)) {
+              memcpy(he->ed_pub, dec, 32);
+              he->ed_pub_set = true;
+            } else {
+              log_message(L_INFO, state,
+                          "[CFG] Hub '%s' pubkey is not a valid Ed25519/"
+                          "Curve25519 key — re-add with '+hub %s <pubkey>'.\n",
+                          he->addr, he->addr);
+            }
+            if (dec) { secure_wipe(dec, (size_t)(dl > 0 ? dl : 0)); free(dec); }
+          } else {
+            snprintf(he->addr, sizeof(he->addr), "%s", data);
+          }
+          state->hub_count++;
         }
         break;
 
@@ -393,17 +438,20 @@ bool config_load(bot_state_t *state, const char *password,
           memcpy(state->hub_key_raw, dec, 64);
         } else {
           log_message(L_INFO, state,
-                      "[CFG] Hub key in config is not a valid 64-byte "
-                      "Curve25519 key (legacy RSA?). Run 'sethubkey' "
-                      "with a new Curve25519 key from the hub admin.\n");
+                      "[CFG] Bot key in config is not a valid 64-byte "
+                      "Curve25519 key (legacy RSA?). Re-run 'ircbot -setup' "
+                      "to regenerate the bot's identity.\n");
         }
         if (dec) { secure_wipe(dec, 64); free(dec); }
         break;
       }
 
-      case 'j': { /* hub's long-term Ed25519 PUBLIC key (v2 hub-bot mutual auth).
-                   * 32 raw bytes, base64 = 44 chars. Used by the bot to verify
-                   * the signature the hub embeds in the handshake challenge. */
+      case 'j': { /* LEGACY single global hub Ed25519 PUBLIC key. Superseded by
+                   * per-hub pinning on the 'h|' line. Still parsed so existing
+                   * configs migrate: the post-load pass copies this into any
+                   * hub entry that lacks its own pinned key, after which it is
+                   * dropped (no 'j|' is written back out).
+                   * 32 raw bytes, base64 = 44 chars. */
         int dec_len = 0;
         unsigned char *dec = base64_decode(data, &dec_len);
         if (dec && dec_len == 32) {
@@ -411,8 +459,9 @@ bool config_load(bot_state_t *state, const char *password,
           state->hub_remote_ed_pub_set = true;
         } else {
           log_message(L_INFO, state,
-                      "[CFG] Hub Ed25519 pubkey ('j' line) is not 32 raw bytes — "
-                      "hub-bot mutual auth disabled until 'sethubpub' is run.\n");
+                      "[CFG] Legacy 'j|' hub pubkey is not 32 raw bytes — "
+                      "ignored. Pin per-hub keys with '+hub <host:port> "
+                      "<pubkey>'.\n");
         }
         if (dec) { secure_wipe(dec, (size_t)(dec_len > 0 ? dec_len : 0)); free(dec); }
         break;
@@ -421,6 +470,26 @@ bool config_load(bot_state_t *state, const char *password,
       case 'i': // Bot UUID (bot-specific)
         snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", data);
         break;
+
+      case 'O': /* Network options string: O|<letters>|<timestamp>
+                 * (Stored under the 'O' line — single capital letter so it
+                 * cannot collide with the existing 'o' oper record line.) */
+      {
+        char flags[MAX_OPT_FLAGS + 1] = {0};
+        long ts = 0;
+        if (sscanf(data, "%32[^|]|%ld", flags, &ts) >= 1) {
+          /* Sanitize: keep only [a-zA-Z0-9] */
+          int w = 0;
+          for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
+            char c = flags[i];
+            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+                (c >= '0' && c <= '9'))
+              state->opt_flags[w++] = c;
+          }
+          state->opt_flags[w] = '\0';
+          state->opt_flags_ts = (ts > 0) ? (time_t)ts : time(NULL);
+        }
+      } break;
       }
 
       line = strtok_r(NULL, "\n", &saveptr1);
@@ -431,6 +500,18 @@ bool config_load(bot_state_t *state, const char *password,
   secure_wipe(plaintext, (size_t)plaintext_len);
   free(ciphertext);
   free(plaintext);
+
+  /* Migration: a legacy 'j|' global hub pubkey applies to every hub that did
+   * not carry its own pinned key on the 'h|' line. Fill them in so the next
+   * config write emits per-hub 'h|addr|pub' lines and drops the global 'j|'. */
+  if (state->hub_remote_ed_pub_set) {
+    for (int i = 0; i < state->hub_count; i++) {
+      if (!state->hubs[i].ed_pub_set) {
+        memcpy(state->hubs[i].ed_pub, state->hub_remote_ed_pub, 32);
+        state->hubs[i].ed_pub_set = true;
+      }
+    }
+  }
 
   /* Migration: convert old-format MIGRATE sentinel records to new typed records */
   bool needs_migration = false;
@@ -621,10 +702,11 @@ static void config_write_file(const bot_state_t *state, const char *password) {
 
   for (int i = 0; i < state->user_record_count; i++) {
     const user_record_t *u = &state->user_records[i];
-    CFG_WRITE("%c|%s|%s|%s|%s|%ld|%ld\n",
+    CFG_WRITE("%c|%s|%s|%s|%s|%ld|%ld|%s\n",
               u->type, u->uuid, u->name, u->password,
               u->is_active ? "add" : "del",
-              (long)u->last_seen, (long)u->timestamp);
+              (long)u->last_seen, (long)u->timestamp,
+              u->has_pubkey ? u->pubkey_b64 : "");
   }
 
   for (int i = 0; i < state->mask_record_count; i++) {
@@ -649,22 +731,31 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   if (state->vhost[0] != '\0')
     CFG_WRITE("v|%s\n", state->vhost);
 
-  for (int i = 0; i < state->hub_count; i++)
-    CFG_WRITE("h|%s\n", state->hub_list[i]);
+  /* Per-hub entries: h|<host:port>[|<pinned-pubkey-b64>]. The pinned key is
+   * the hub's 32-byte Ed25519 pubkey; the legacy global 'j|' line is no longer
+   * written (its value was migrated into the per-hub keys at load time). */
+  for (int i = 0; i < state->hub_count; i++) {
+    if (state->hubs[i].ed_pub_set) {
+      char *pb = base64_encode(state->hubs[i].ed_pub, 32);
+      if (pb) {
+        CFG_WRITE("h|%s|%s\n", state->hubs[i].addr, pb);
+        free(pb);
+      } else {
+        CFG_WRITE("h|%s\n", state->hubs[i].addr);
+      }
+    } else {
+      CFG_WRITE("h|%s\n", state->hubs[i].addr);
+    }
+  }
 
   if (state->hub_key[0] != '\0')
     CFG_WRITE("k|%s\n", state->hub_key);
 
-  if (state->hub_remote_ed_pub_set) {
-    char *jb64 = base64_encode(state->hub_remote_ed_pub, 32);
-    if (jb64) {
-      CFG_WRITE("j|%s\n", jb64);
-      free(jb64);
-    }
-  }
-
   if (state->bot_uuid[0] != '\0')
     CFG_WRITE("i|%s\n", state->bot_uuid);
+
+  if (state->opt_flags[0] != '\0')
+    CFG_WRITE("O|%s|%ld\n", state->opt_flags, (long)state->opt_flags_ts);
 
 #undef CFG_WRITE
 

@@ -14,6 +14,7 @@
 #include <string.h>
 #include <strings.h>
 #include <sys/stat.h>
+#include <fcntl.h>
 #include <unistd.h>
 
 #include "bot.h"
@@ -51,7 +52,7 @@ void config_write_local_with_state_pass(bot_state_t *s) {
   OPENSSL_cleanse(pass, MAX_PASS);
 }
 
-void handle_fatal_error(const char *message) {
+_Noreturn void handle_fatal_error(const char *message) {
   perror(message);
   exit(EXIT_FAILURE);
 }
@@ -294,15 +295,85 @@ static bool validate_url(const char *url) {
   return true;
 }
 
+/* Fetch the release manifest AND its detached Ed25519 signature, then verify
+ * the signature against the compiled-in public key (BOT_UPDATE_PUBKEY_B64)
+ * over the EXACT manifest bytes received.  Returns the verified, NUL-terminated
+ * manifest text on success (caller frees); returns NULL on ANY failure and
+ * sets *err to a short human-readable reason.  Fail-closed: an unconfigured,
+ * unreachable, or invalid signature all yield NULL so no unauthenticated
+ * manifest is ever parsed, downloaded from, or executed. */
+static char *fetch_verified_manifest(const char **err) {
+  *err = NULL;
+
+  /* Empty pinned key = updater intentionally disabled. */
+  if (BOT_UPDATE_PUBKEY_B64[0] == '\0') {
+    *err = "self-updater disabled (no signing key configured)";
+    return NULL;
+  }
+
+  /* Decode the compiled-in Ed25519 public key (must be exactly 32 raw bytes). */
+  int publen = 0;
+  unsigned char *pub = base64_decode(BOT_UPDATE_PUBKEY_B64, &publen);
+  if (!pub || publen != 32) {
+    if (pub) free(pub);
+    *err = "configured update public key is malformed";
+    return NULL;
+  }
+
+  /* Fetch the manifest. */
+  http_response_t man;
+  man.buffer = NULL;
+  man.size = 0;
+  if (!fetch_url(BOT_UPDATE_URL, &man)) {
+    free(pub);
+    if (man.buffer) free(man.buffer);
+    *err = "failed to download release manifest";
+    return NULL;
+  }
+
+  /* Fetch the detached signature (base64 of 64 raw bytes). */
+  http_response_t sig;
+  sig.buffer = NULL;
+  sig.size = 0;
+  if (!fetch_url(BOT_UPDATE_SIG_URL, &sig)) {
+    free(pub);
+    if (man.buffer) free(man.buffer);
+    if (sig.buffer) free(sig.buffer);
+    *err = "failed to download release signature (releases.txt.sig)";
+    return NULL;
+  }
+
+  int siglen = 0;
+  unsigned char *sigbytes = base64_decode(sig.buffer, &siglen);
+  bool ok = (sigbytes && siglen == 64 &&
+             crypto_ed25519_verify(pub, (const unsigned char *)man.buffer,
+                                   man.size, sigbytes));
+
+  free(pub);
+  if (sigbytes) free(sigbytes);
+  if (sig.buffer) free(sig.buffer);
+
+  if (!ok) {
+    if (man.buffer) free(man.buffer);
+    *err = "release manifest signature INVALID — possible tampering";
+    return NULL;
+  }
+  return man.buffer; /* verified manifest; caller frees */
+}
+
 void updater_check_for_updates(bot_state_t *state, const char *nick) {
   log_message(L_DEBUG, state, "[DEBUG] updater_check_for_updates called.\n");
-  http_response_t response;
-  response.buffer = NULL;
 
-  if (!fetch_url(BOT_UPDATE_URL, &response)) {
-    irc_printf(state, "PRIVMSG %s :Failed to download release file.\r\n", nick);
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(&verr);
+  if (!manifest) {
+    irc_printf(state, "PRIVMSG %s :Update check failed: %s.\r\n",
+               nick, verr ? verr : "unknown error");
     return;
   }
+  http_response_t response;
+  response.buffer = manifest; /* verified bytes; existing parse/free below */
+  response.size = 0;
 
   irc_printf(state, "PRIVMSG %s :--- Available Updates (Current: %s) ---\r\n",
              nick, BOT_VERSION);
@@ -375,15 +446,31 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
               version_to_install);
 
   http_response_t response;
-  response.buffer = NULL;
   char *binary_url = NULL;
   char *expected_hash = NULL;
   char *deps_to_check = NULL;
 
-  if (!fetch_url(BOT_UPDATE_URL, &response)) {
-    irc_printf(state, "PRIVMSG %s :Failed to download release file.\r\n", nick);
+  /* Downgrade protection: refuse to install anything older than the running
+   * build, defeating a replay of an old (but validly signed) manifest that
+   * points at a known-vulnerable version. */
+  if (strverscmp(version_to_install, BOT_VERSION) < 0) {
+    irc_printf(state,
+               "PRIVMSG %s :Refusing downgrade: %s is older than the running "
+               "version %s.\r\n",
+               nick, version_to_install, BOT_VERSION);
     return;
   }
+
+  /* Fetch + Ed25519-verify the manifest before trusting any field in it. */
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(&verr);
+  if (!manifest) {
+    irc_printf(state, "PRIVMSG %s :Upgrade aborted: %s.\r\n",
+               nick, verr ? verr : "unknown error");
+    return;
+  }
+  response.buffer = manifest;
+  response.size = 0;
 
   char *saveptr;
   char *line = strtok_r(response.buffer, "\n", &saveptr);
@@ -412,6 +499,10 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
                "PRIVMSG %s :Error: Version '%s' not found in release file.\r\n",
                nick, version_to_install);
     if (response.buffer) free(response.buffer);
+    /* If strdup(url) failed mid-match while hash/deps succeeded, those two are
+     * non-NULL here; free(NULL) is a no-op for the normal not-found path. */
+    free(expected_hash);
+    free(deps_to_check);
     return;
   }
   if (response.buffer) {
@@ -502,8 +593,13 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   irc_printf(state, "PRIVMSG %s :Hash verified. Creating upgrade script...\r\n",
              nick);
 
-  FILE *f = fopen("upgrade.sh", "w");
+  /* Create with mode 0700 atomically (no umask-dependent world-readable/
+   * writable window on a script we are about to exec); fchmod as belt-and-
+   * suspenders.  Avoids the TOCTOU between fopen and a later path-based chmod. */
+  int up_fd = open("upgrade.sh", O_WRONLY | O_CREAT | O_TRUNC, 0700);
+  FILE *f = (up_fd >= 0) ? fdopen(up_fd, "w") : NULL;
   if (!f) {
+    if (up_fd >= 0) close(up_fd);
     irc_printf(state,
                "PRIVMSG %s :Error: Could not create upgrade.sh script.\r\n",
                nick);
@@ -565,9 +661,8 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   fprintf(f, "echo \"[UPGRADE] Restarting bot...\"\n");
   fprintf(f, "exec %s\n", state->executable_path);
 
+  (void)fchmod(fileno(f), 0700);
   fclose(f);
-
-  chmod("upgrade.sh", 0700);
 
   irc_printf(state, "QUIT :Upgrading to %s...\r\n", version_to_install);
   irc_disconnect(state);

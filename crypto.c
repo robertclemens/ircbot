@@ -21,6 +21,31 @@ bool crypto_derive_config_key(const char *password, const unsigned char *salt,
                              EVP_sha256(), 32, out_key) == 1;
 }
 
+/* Generate a combined Ed25519 + X25519 keypair (raw 32 + 32 bytes each).
+ * priv_out and pub_out must be HUB_KEY_RAW_LEN (64) bytes each.
+ * Layout: priv = ed_priv(32) || x_priv(32); pub = ed_pub(32) || x_pub(32). */
+bool crypto_generate_combined_keypair(unsigned char priv_out[HUB_KEY_RAW_LEN],
+                                       unsigned char pub_out[HUB_KEY_RAW_LEN]) {
+    if (!priv_out || !pub_out) return false;
+    EVP_PKEY *ep = NULL, *xp = NULL;
+    EVP_PKEY_CTX *ec = EVP_PKEY_CTX_new_id(EVP_PKEY_ED25519, NULL);
+    EVP_PKEY_CTX *xc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519,  NULL);
+    size_t l = 32;
+    bool ok =
+        ec && EVP_PKEY_keygen_init(ec) > 0 && EVP_PKEY_keygen(ec, &ep) > 0 &&
+        EVP_PKEY_get_raw_private_key(ep, priv_out,      &l) > 0 && l == 32 &&
+        EVP_PKEY_get_raw_public_key (ep, pub_out,       &l) > 0 && l == 32 &&
+        xc && EVP_PKEY_keygen_init(xc) > 0 && EVP_PKEY_keygen(xc, &xp) > 0 &&
+        EVP_PKEY_get_raw_private_key(xp, priv_out + 32, &l) > 0 && l == 32 &&
+        EVP_PKEY_get_raw_public_key (xp, pub_out  + 32, &l) > 0 && l == 32;
+    if (ep) EVP_PKEY_free(ep);
+    if (xp) EVP_PKEY_free(xp);
+    if (ec) EVP_PKEY_CTX_free(ec);
+    if (xc) EVP_PKEY_CTX_free(xc);
+    if (!ok) { secure_wipe(priv_out, HUB_KEY_RAW_LEN); memset(pub_out, 0, HUB_KEY_RAW_LEN); }
+    return ok;
+}
+
 
 int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *salt, size_t salt_len,
@@ -253,6 +278,23 @@ char *base64_encode(const unsigned char *input, int length) {
 
     BIO_free_all(bio);
     return b64_text;
+}
+
+/* Ed25519 detached-signature verification.  pub: 32-byte raw Ed25519 public
+ * key; sig: 64-byte signature over msg.  Verification is a public operation,
+ * so constant-time handling is not required.  Returns true iff sig is valid. */
+bool crypto_ed25519_verify(const unsigned char pub[32],
+                           const unsigned char *msg, size_t msg_len,
+                           const unsigned char sig[64]) {
+    EVP_PKEY *pk = EVP_PKEY_new_raw_public_key(EVP_PKEY_ED25519, NULL, pub, 32);
+    if (!pk) return false;
+    EVP_MD_CTX *md = EVP_MD_CTX_new();
+    bool ok = (md != NULL
+            && EVP_DigestVerifyInit(md, NULL, NULL, NULL, pk) == 1  /* md=NULL: Ed25519 is pure */
+            && EVP_DigestVerify(md, sig, 64, msg, msg_len) == 1);
+    if (md) EVP_MD_CTX_free(md);
+    EVP_PKEY_free(pk);
+    return ok;
 }
 
 unsigned char *base64_decode(const char *input, int *out_len) {
