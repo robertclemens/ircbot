@@ -37,13 +37,13 @@
 // Detached Ed25519 signature for releases.txt (raw 64-byte sig, base64-encoded).
 #define BOT_UPDATE_SIG_URL                                                     \
   "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
-  "releases.txt.sig"
+  "releases.sig"
 // Base64 of the 32-byte raw Ed25519 PUBLIC key that signs releases.txt.
 // MUST be set to enable the self-updater; an empty value DISABLES updates
 // (fail-closed).  Generate the keypair, publish releases.txt.sig, and paste the
 // 44-char base64 public key here.  Full procedure: docs/security.md ->
 // "Signed Release Process (Ed25519 detached signatures)".
-#define BOT_UPDATE_PUBKEY_B64 ""
+#define BOT_UPDATE_PUBKEY_B64 "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU="
 // End of edit section
 
 // You should not edit below this line. While some of the macros may be
