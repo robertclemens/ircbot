@@ -1,5 +1,6 @@
 #include <errno.h>
 #include <fcntl.h>
+#include <inttypes.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
 #include <openssl/rand.h>
@@ -141,9 +142,9 @@ static void passfile_build_context(char *buf, size_t len) {
     stat(pw->pw_dir, &home_st);
   uname(&uts);
 
-  snprintf(buf, len, "%lu:%lu:%u:%u:%s",
-           (unsigned long)home_st.st_ino,
-           (unsigned long)home_st.st_dev,
+  snprintf(buf, len, "%ju:%ju:%u:%u:%.64s",
+           (uintmax_t)home_st.st_ino,
+           (uintmax_t)home_st.st_dev,
            (unsigned int)getuid(),
            (unsigned int)getgid(),
            uts.machine);
@@ -562,7 +563,7 @@ static void run_config_wizard(void) {
       mask_record_t *m = &state.mask_records[state.mask_record_count++];
       memset(m, 0, sizeof(*m));
       snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
-      snprintf(m->mask, sizeof(m->mask), "%s", admin_masks[mi]);
+      snprintf(m->mask, sizeof(m->mask), "%.255s", admin_masks[mi]);
       m->is_active = true; m->timestamp = now;
     }
     memset(admin_pass,  0, sizeof(admin_pass));

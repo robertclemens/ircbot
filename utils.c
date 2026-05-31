@@ -71,7 +71,7 @@ void get_local_ip(bot_state_t *state) {
 
 #ifdef HAVE_CURL
 
-static int strverscmp(const char *s1, const char *s2) {
+static int local_strverscmp(const char *s1, const char *s2) {
   const unsigned char *p1 = (const unsigned char *)s1;
   const unsigned char *p2 = (const unsigned char *)s2;
   int state;
@@ -390,7 +390,7 @@ void updater_check_for_updates(bot_state_t *state, const char *nick) {
     char version[64], date[64], url[512], hash[128], deps[256];
     if (sscanf(line, "%63s %63s %511s %127s %255s", version, date, url, hash,
                deps) == 5) {
-      if (strverscmp(version, BOT_VERSION) > 0) {
+      if (local_strverscmp(version, BOT_VERSION) > 0) {
         updates_found++;
         char deps_status[512] = "[OK]";
         bool all_deps_ok = true;
@@ -453,7 +453,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
   /* Downgrade protection: refuse to install anything older than the running
    * build, defeating a replay of an old (but validly signed) manifest that
    * points at a known-vulnerable version. */
-  if (strverscmp(version_to_install, BOT_VERSION) < 0) {
+  if (local_strverscmp(version_to_install, BOT_VERSION) < 0) {
     irc_printf(state,
                "PRIVMSG %s :Refusing downgrade: %s is older than the running "
                "version %s.\r\n",
