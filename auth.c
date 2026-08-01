@@ -1,6 +1,3 @@
-#include <inttypes.h>
-#include <openssl/crypto.h>
-#include <openssl/sha.h>
 #include <string.h>
 #include <strings.h>
 #include <time.h> // Ensure time() is available
@@ -35,59 +32,6 @@ static bool wildcard_match(const char *pattern, const char *text) {
   return !*p;
 }
 
-bool auth_verify_password(bot_state_t *state, const char *nonce_str,
-                          const char *hash_attempt,
-                          const char *stored_password) {
-  if (!nonce_str || !hash_attempt || !stored_password) {
-    log_message(L_DEBUG, state, "[DEBUG_AUTH] FAIL: Null inputs.\n");
-    return false;
-  }
-
-  uint64_t nonce = strtoull(nonce_str, NULL, 10);
-
-  { time_t _now = time(NULL);
-    for (int i = 0; i < MAX_SEEN_HASHES; i++) {
-      if (state->admin_nonces[i].nonce == nonce &&
-          _now - state->admin_nonces[i].ts <= NONCE_TTL_SECONDS) {
-        log_message(L_DEBUG, state,
-                    "[DEBUG_AUTH] FAIL: Replay detected (Nonce %" PRIu64 ").\n",
-                    nonce);
-        return false;
-      }
-    }
-  }
-
-  char to_hash[512];
-  char hex[65];
-  unsigned char raw[SHA256_DIGEST_LENGTH];
-
-  long min = (long)(time(NULL) / 60);
-
-  // Time Window 1 (Current Minute)
-  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64, stored_password, min,
-           nonce);
-  SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
-
-  int offset = 0;
-  for (int i = 0; i < SHA256_DIGEST_LENGTH; i++) {
-    offset += snprintf(hex + offset, sizeof(hex) - offset, "%02x", raw[i]);
-  }
-
-  log_message(L_DEBUG, state,
-              "[DEBUG_AUTH] Check 1 (Min %ld)\n", min);
-
-  if (strlen(hash_attempt) == 64 &&
-      CRYPTO_memcmp(hash_attempt, hex, 64) == 0) {
-    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce, time(NULL) };
-    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-    OPENSSL_cleanse(to_hash, sizeof(to_hash));
-    return true;
-  }
-
-  OPENSSL_cleanse(to_hash, sizeof(to_hash));
-  return false;
-}
-
 /* auth_find_user: find the user_record_t whose usermask matches user_host.
  * Updates last_used on the matching mask and last_seen on the user record.
  * Sets state->config_dirty so the timestamps are persisted on next flush. */
@@ -118,35 +62,6 @@ user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
   return NULL;
 }
 
-/* auth_verify_password_record: same HMAC check as auth_verify_password but
- * uses user_record_t.password instead of a global bot_pass. */
-bool auth_verify_password_record(const user_record_t *user,
-                                 const char *nonce_str,
-                                 const char *hash_attempt) {
-  if (!user || !nonce_str || !hash_attempt) return false;
-  /* Re-use the existing auth_verify_password by casting away const on state
-   * just for nonce cache tracking — we pass NULL state to skip cache, then
-   * do manual replay check via admin_nonces in the caller. */
-  /* Build the expected hash directly so we don't need a full state pointer. */
-  uint64_t nonce = strtoull(nonce_str, NULL, 10);
-  long min = (long)(time(NULL) / 60);
-
-  char to_hash[512];
-  char hex[65];
-  unsigned char raw[SHA256_DIGEST_LENGTH];
-  snprintf(to_hash, sizeof(to_hash), "%s:%ld:%" PRIu64,
-           user->password, min, nonce);
-  SHA256((unsigned char *)to_hash, strlen(to_hash), raw);
-  int off = 0;
-  for (int k = 0; k < SHA256_DIGEST_LENGTH; k++)
-    off += snprintf(hex + off, sizeof(hex) - off, "%02x", raw[k]);
-  OPENSSL_cleanse(to_hash, sizeof(to_hash));
-  if (strlen(hash_attempt) == 64 &&
-      CRYPTO_memcmp(hash_attempt, hex, 64) == 0)
-    return true;
-  return false;
-}
-
 // Strip leading '~' from the ident portion of nick!ident@host, writing the
 // normalized form into out.  Handles both stored masks (which may lack '~' due
 // to 396/NICK reconstruction without tilde) and live WHO results (which carry
@@ -163,7 +78,14 @@ static void strip_ident_tilde(const char *in, char *out, size_t out_size) {
   snprintf(out + prefix, out_size - prefix, "%s", bang + 2); // skip '~'
 }
 
-bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
+// auth_is_trusted_bot: wildcard-match user_host against trusted_bots[]
+// hostmasks. On a match, if uuid_out is non-NULL, also fills in the
+// matched entry's UUID (hostmask|uuid|timestamp format) so callers that
+// need to bind the sender's identity (e.g. GCM AAD) don't have to
+// re-implement this lookup.
+bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
+                         char *uuid_out, size_t uuid_out_size) {
+  if (uuid_out && uuid_out_size > 0) uuid_out[0] = '\0';
   if (state->trusted_bot_count == 0)
     return false;
 
@@ -178,6 +100,11 @@ bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host) {
       char norm_hostmask[MAX_MASK_LEN];
       strip_ident_tilde(hostmask, norm_hostmask, sizeof(norm_hostmask));
       if (wildcard_match(norm_hostmask, norm_user_host)) {
+        if (uuid_out && uuid_out_size > 0) {
+          char uuid[64] = "";
+          sscanf(state->trusted_bots[i], "%*255[^|]|%63[^|]", uuid);
+          snprintf(uuid_out, uuid_out_size, "%s", uuid);
+        }
         return true;
       }
     }

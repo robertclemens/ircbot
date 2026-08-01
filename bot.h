@@ -379,10 +379,8 @@ struct bot_state {
 void ssl_init_openssl(void);
 user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
                               time_t now);
-bool auth_verify_password_record(const user_record_t *user,
-                                 const char *nonce_str,
-                                 const char *hash_attempt);
-bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host);
+bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
+                         char *uuid_out, size_t uuid_out_size);
 void setup_signals(void);
 void daemonize(void);
 void change_proc_name(int argc, char *argv[]);

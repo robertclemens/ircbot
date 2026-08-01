@@ -114,7 +114,7 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
                 for (int x = 0; x < c->roster_count; x++) {
                   roster_entry_t *entry = &c->roster[x];
                   if (entry->is_op &&
-                      auth_is_trusted_bot(state, entry->hostmask)) {
+                      auth_is_trusted_bot(state, entry->hostmask, NULL, 0)) {
                     if (helper_count < MAX_ROSTER_SIZE) {
                       helpers[helper_count++] = entry;
                     }
@@ -468,7 +468,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
                 c->roster_count);
     for (int i = 0; i < c->roster_count; i++) {
       roster_entry_t *entry = &c->roster[i];
-      bool is_trusted = auth_is_trusted_bot(state, entry->hostmask);
+      bool is_trusted = auth_is_trusted_bot(state, entry->hostmask, NULL, 0);
       log_message(L_DEBUG, state, "[OP-REQ] Roster[%d]: nick=%s hostmask=%s is_op=%d is_trusted=%d\n",
                   i, entry->nick, entry->hostmask, entry->is_op, is_trusted);
       if (entry->is_op && is_trusted) {

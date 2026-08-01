@@ -25,7 +25,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   /* --- Block 1: Trusted Bot Logic (Encrypted Communication) --- */
 
-  if (auth_is_trusted_bot(state, user_host)) {
+  char sender_bot_uuid[64];
+  if (auth_is_trusted_bot(state, user_host, sender_bot_uuid,
+                          sizeof(sender_bot_uuid))) {
     char message_copy_bot[MAX_BUFFER];
     snprintf(message_copy_bot, sizeof(message_copy_bot), "%s", message);
 
@@ -59,8 +61,14 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
         unsigned char *decrypted_data = malloc(ciphertext_len + 1);
         if (decrypted_data) {
-          int decrypted_len = crypto_aes_gcm_decrypt(
-              ciphertext_ptr, ciphertext_len, key, decrypted_data, tag);
+          /* Sender always binds its own UUID as GCM AAD (bot_comms.c
+           * bot_comms_send_command); mirror that here with the UUID we
+           * just resolved from trusted_bots[], or the tag never verifies. */
+          int decrypted_len = crypto_aes_gcm_decrypt_aad(
+              ciphertext_ptr, ciphertext_len,
+              (const unsigned char *)sender_bot_uuid,
+              (int)strlen(sender_bot_uuid),
+              key, decrypted_data, tag);
 
           if (decrypted_len >= 0) {
             decrypted_data[decrypted_len] = '\0';

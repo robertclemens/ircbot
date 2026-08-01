@@ -15,6 +15,7 @@ bot_config_gen*
 *.b64
 
 .claude
+CLAUDE.md
 docsbot_config_gen
 utils/decrypt_config
 utils/encrypt_config
