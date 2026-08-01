@@ -65,8 +65,15 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
 
   bool adding = true; // Default direction
   char *saveptr;
-  // Initialize tokenizing the arguments string
-  char *current_arg = strtok_r(args, " ", &saveptr);
+  char no_args[1] = "";
+  /* args is NULL when the MODE line carries no trailing parameters at all
+   * (e.g. "+nt" - neither mode takes an argument). strtok_r() requires a
+   * non-NULL string on its first call - passing NULL makes it read from an
+   * uninitialized saveptr here, which is what crashed. Fall back to an
+   * empty buffer so saveptr ends up validly initialized either way; every
+   * later strtok_r(NULL, " ", &saveptr) continuation call below then just
+   * keeps returning NULL, as intended when there are no more arguments. */
+  char *current_arg = strtok_r(args ? args : no_args, " ", &saveptr);
 
   for (int i = 0; modes[i] != '\0'; i++) {
     char mode = modes[i];
