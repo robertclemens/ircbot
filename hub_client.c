@@ -1278,57 +1278,72 @@ void hub_client_connect(bot_state_t *state) {
     state->last_hub_connect_attempt = time(NULL) + 60;
     return;
   }
-  char *p = strchr(hub_tmp, ':');
+  char *p = strrchr(hub_tmp, ':');
   if (!p) {
+    log_message(L_INFO, state, "[HUB] Invalid hub address (missing port): %s\n",
+                hub_tmp);
     state->hub_connecting = false;
     __sync_lock_release(&lock);
     return;
   }
   *p = '\0';
-  int port = atoi(p + 1);
-  int sockfd = socket(AF_INET, SOCK_STREAM, 0);
-  if (sockfd < 0) {
-    state->hub_connecting = false;
-    __sync_lock_release(&lock);
-    return;
-  }
-  struct sockaddr_in addr;
-  memset(&addr, 0, sizeof(addr));
-  addr.sin_family = AF_INET;
-  addr.sin_port = htons(port);
-  if (inet_pton(AF_INET, hub_tmp, &addr.sin_addr) != 1) {
-    log_message(L_INFO, state, "[HUB] Invalid hub IP address: %s\n", hub_tmp);
-    close(sockfd);
+  const char *host = hub_tmp;
+  const char *port_str = p + 1;
+
+  /* Accept either a literal IP (v4/v6) or a DNS name here: getaddrinfo()
+   * handles both, so there's no need to special-case inet_pton() first. */
+  struct addrinfo hints, *res = NULL;
+  memset(&hints, 0, sizeof(hints));
+  hints.ai_family = AF_UNSPEC;
+  hints.ai_socktype = SOCK_STREAM;
+
+  int gai_err = getaddrinfo(host, port_str, &hints, &res);
+  if (gai_err != 0) {
+    log_message(L_INFO, state, "[HUB] Cannot resolve hub address '%s': %s\n",
+                host, gai_strerror(gai_err));
     state->hub_connecting = false;
     __sync_lock_release(&lock);
     return;
   }
 
-  int flags = fcntl(sockfd, F_GETFL, 0);
-  fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-
-  int conn_result = connect(sockfd, (struct sockaddr *)&addr, sizeof(addr));
+  int sockfd = -1;
   bool connected = false;
-  if (conn_result == 0) {
-    connected = true;
-  } else if (errno == EINPROGRESS) {
-    fd_set writefds;
-    struct timeval timeout;
-    FD_ZERO(&writefds);
-    FD_SET(sockfd, &writefds);
-    timeout.tv_sec = 10;
-    timeout.tv_usec = 0;
-    int sel = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
-    if (sel > 0) {
-      int so_error;
-      socklen_t solen = sizeof(so_error);
-      getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &solen);
-      if (so_error == 0) connected = true;
+  int flags = 0;
+  for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
+    sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
+    if (sockfd < 0) continue;
+
+    flags = fcntl(sockfd, F_GETFL, 0);
+    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
+
+    int conn_result = connect(sockfd, ai->ai_addr, ai->ai_addrlen);
+    if (conn_result == 0) {
+      connected = true;
+    } else if (errno == EINPROGRESS) {
+      fd_set writefds;
+      struct timeval timeout;
+      FD_ZERO(&writefds);
+      FD_SET(sockfd, &writefds);
+      timeout.tv_sec = 10;
+      timeout.tv_usec = 0;
+      int sel = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
+      if (sel > 0) {
+        int so_error;
+        socklen_t solen = sizeof(so_error);
+        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &solen);
+        if (so_error == 0) connected = true;
+      }
     }
+
+    if (connected) break;
+    close(sockfd);
+    sockfd = -1;
   }
+  freeaddrinfo(res);
 
   if (!connected) {
-    close(sockfd);
+    log_message(L_INFO, state, "[HUB] Failed to connect to %s:%s\n", host,
+                port_str);
     state->hub_connecting = false;
     __sync_lock_release(&lock);
     return;
