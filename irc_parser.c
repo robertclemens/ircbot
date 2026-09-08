@@ -230,16 +230,22 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
   }
 }
 
-/* Record the bot's own hostmask.  There is exactly ONE source: our own entry
- * in a 352 (RPL_WHOREPLY), which is the byte-for-byte string the server hands
- * every other client — the same numeric peers build their rosters from and
- * store in trusted_bots[].  Taking it from anywhere else is what broke
- * op-requests before: a self-directed lookup can report a host the network
- * never shows anyone (real vs resolved/cloaked), and a locally re-spliced
- * nick!ident@host is a guess about a string only the server gets to define.
+/* Record the bot's own hostmask.  Only two things may call this, and both hand
+ * it a string the server itself presented to OTHER clients verbatim:
+ *   - our own entry in a 352 (RPL_WHOREPLY) — the numeric peers parse into
+ *     their rosters and store in trusted_bots[];
+ *   - the prefix of our own JOIN echo — what the channel was shown.
+ * Both were verified byte-identical against ngircd (2026-09-08).
  *
- * So: nothing here parses, resolves, or reconstructs a mask.  Events that can
- * change it (001, 396 cloak, own NICK) only re-ask via request_own_hostmask().
+ * Nothing here parses a self-directed answer, resolves a name, or splices a
+ * mask together.  The reason is that the server's choice of host form is per
+ * session and outside our control: an ircd prints the resolved name only when
+ * forward-confirmed rDNS succeeds within its timeout, and the raw IP otherwise
+ * — the same box is legitimately `nick!~i@host.example.net` in one session and
+ * `nick!~i@203.0.113.7` in the next.  So a remembered host re-spliced onto a
+ * new nick, or an ident carried over from config, silently publishes a mask no
+ * peer can match.  Events that can change the mask (001, 396 cloak, own NICK)
+ * therefore only re-ask via request_own_hostmask().
  *
  * Idempotent: updates actual_hostname(+ts) and calls hub_client_sync_hostmask
  * only when the value actually changes, so repeated WHOs never re-push. */
@@ -260,11 +266,13 @@ static void update_own_hostmask(bot_state_t *state, const char *mask) {
 
 /* Ask the server for our own DISPLAYED hostmask.  `WHO <nick>` is answered by
  * every IRC network with a 352 carrying exactly the nick!ident@host other
- * clients see — the same numeric peers build their rosters from — so it cannot
- * come back with a real host the network hides from everyone else, the way
- * USERHOST can.  Works without joining a channel and regardless of whether 001
- * embedded a mask.  Sent only on connect and after a settled nick change, so
- * it adds no sustained traffic. */
+ * clients are shown — the same numeric peers build their rosters from — and it
+ * works without joining a channel (the reply's channel field is "*").
+ * USERHOST is not used: its answer is addressed to us alone, so nothing
+ * guarantees it is the string the network puts in front of anyone else, and we
+ * have no reason to publish a form no peer will ever match against.  Sent on
+ * connect, on a cloak change, and after a settled nick change, so it adds no
+ * sustained traffic. */
 static void request_own_hostmask(bot_state_t *state) {
   if (state->current_nick[0] != '\0')
     irc_printf(state, "WHO %s\r\n", state->current_nick);
@@ -623,7 +631,28 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
   } else if (strcmp(command, "JOIN") == 0 && prefix) {
+    /* Our own JOIN echo carries, as its prefix, the server presenting our mask
+     * to the channel — the identical string every other client in that channel
+     * receives, and byte-for-byte the same as our 352 entry (verified against
+     * ngircd, 2026-09-08).  Copy it before strtok_r splits prefix in place.
+     * This is the earliest exact value available: it lands before the channel
+     * WHO we are about to send comes back. */
+    char join_mask[MAX_MASK_LEN];
+    size_t prefix_len = strlen(prefix);
+    /* Explicit length test, not a bounded copy: a prefix that does not fit a
+     * mask buffer is not a mask we may store — publishing a truncated one is
+     * worse than publishing none, and the 352 is still coming. */
+    bool join_mask_ok = (prefix_len > 0 && prefix_len < sizeof(join_mask));
+    if (join_mask_ok) {
+      memcpy(join_mask, prefix, prefix_len);
+      join_mask[prefix_len] = '\0';
+    }
+
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
+    if (join_mask_ok && nick && strcasecmp(nick, state->current_nick) == 0 &&
+        strchr(join_mask, '!') && strchr(join_mask, '@'))
+      update_own_hostmask(state, join_mask);
+
     if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
                  strcasecmp(nick, state->target_nick) == 0)) {
       char *chan_name = (*params == ':') ? params + 1 : params;
