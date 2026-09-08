@@ -10,6 +10,7 @@
 #include <openssl/ssl.h>
 #include <stdbool.h>
 #include <stdio.h>
+#include <string.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -328,7 +329,6 @@ struct bot_state {
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
-  unsigned long local_ip_long;
   time_t connection_time;
   time_t last_pong_time;
   time_t nick_release_time;
@@ -438,7 +438,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...);
 _Noreturn void handle_fatal_error(const char *message);
-void get_local_ip(bot_state_t *state);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
                              const char *version);

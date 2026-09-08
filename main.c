@@ -746,7 +746,6 @@ int main(int argc, char *argv[]) {
     memset(startup_password, 0, sizeof(startup_password));
     return 1;
   }
-  get_local_ip(&state);
   setup_signals();
 
   if (!config_load(&state, startup_password, CONFIG_FILE)) {

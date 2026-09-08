@@ -976,8 +976,19 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
           long long old_ts = 0;
           sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%lld", &old_ts);
           if (ts > old_ts) {
-            char full_entry[256];
-            snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld", hostmask, uuid, ts);
+            /* Sized to the provable worst case: hostmask(255) + '|' +
+             * uuid(63) + '|' + ts(20 digits) + NUL.  A trust record must
+             * never be stored truncated — a clipped hostmask or UUID would
+             * silently mis-key every later match — so refuse instead. */
+            char full_entry[MAX_MASK_LEN + sizeof(uuid) + 32];
+            int elen = snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld",
+                                hostmask, uuid, ts);
+            if (elen < 0 || elen >= (int)sizeof(full_entry)) {
+              log_message(L_INFO, state,
+                          "[HUB] Rejected oversized trusted-bot entry for %s\n",
+                          hostmask);
+              break;
+            }
             char *new_entry = strdup(full_entry);
             if (!new_entry) break;
             free(state->trusted_bots[existing_idx]);
@@ -986,8 +997,15 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n", hostmask);
           }
         } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          char full_entry[256];
-          snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld", hostmask, uuid, ts);
+          char full_entry[MAX_MASK_LEN + sizeof(uuid) + 32];
+          int elen = snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld",
+                              hostmask, uuid, ts);
+          if (elen < 0 || elen >= (int)sizeof(full_entry)) {
+            log_message(L_INFO, state,
+                        "[HUB] Rejected oversized trusted-bot entry for %s\n",
+                        hostmask);
+            break;
+          }
           char *new_entry = strdup(full_entry);
           if (!new_entry) break;
           state->trusted_bots[state->trusted_bot_count++] = new_entry;

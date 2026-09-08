@@ -230,17 +230,24 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
   }
 }
 
-/* Single funnel for every source of the bot's own hostmask (001 welcome,
- * 396 cloak, 302 USERHOST reply, 352 self WHO entry, self NICK re-splice).
- * Idempotent: only updates + pushes to the hub when the mask actually changes,
- * so multiple sources converging on the same value produce exactly one 'h'
- * delta and periodic WHOs never re-push.  Reuses hub_client_sync_hostmask ->
- * hub_client_push_delta(state,"h",...): no new send path, no wire change. */
+/* Record the bot's own hostmask.  There is exactly ONE source: our own entry
+ * in a 352 (RPL_WHOREPLY), which is the byte-for-byte string the server hands
+ * every other client — the same numeric peers build their rosters from and
+ * store in trusted_bots[].  Taking it from anywhere else is what broke
+ * op-requests before: a self-directed lookup can report a host the network
+ * never shows anyone (real vs resolved/cloaked), and a locally re-spliced
+ * nick!ident@host is a guess about a string only the server gets to define.
+ *
+ * So: nothing here parses, resolves, or reconstructs a mask.  Events that can
+ * change it (001, 396 cloak, own NICK) only re-ask via request_own_hostmask().
+ *
+ * Idempotent: updates actual_hostname(+ts) and calls hub_client_sync_hostmask
+ * only when the value actually changes, so repeated WHOs never re-push. */
 static void update_own_hostmask(bot_state_t *state, const char *mask) {
   if (!mask || mask[0] == '\0')
     return;
   if (strcmp(state->actual_hostname, mask) == 0)
-    return; // unchanged — nothing to do
+    return; // unchanged — nothing to push
 
   snprintf(state->actual_hostname, sizeof(state->actual_hostname), "%s", mask);
   state->actual_hostname_ts = time(NULL);
@@ -251,31 +258,16 @@ static void update_own_hostmask(bot_state_t *state, const char *mask) {
     hub_client_sync_hostmask(state);
 }
 
-/* The server-observed ident from actual_hostname (the substring between '!' and
- * '@'), captured authoritatively by 302/352/001.  Falls back to the configured
- * user only when no mask is known yet.  Used when re-splicing a mask on cloak
- * (396) or nick change so we never substitute a configured ident the server did
- * not actually assign — a wrong ident would break trusted-bot mask matching. */
-static void own_ident(const bot_state_t *state, char *out, size_t out_sz) {
-  const char *bang = strchr(state->actual_hostname, '!');
-  const char *at   = strchr(state->actual_hostname, '@');
-  if (bang && at && at > bang + 1) {
-    size_t n = (size_t)(at - (bang + 1));
-    if (n >= out_sz) n = out_sz - 1;
-    memcpy(out, bang + 1, n);
-    out[n] = '\0';
-  } else {
-    snprintf(out, out_sz, "%s", state->user);
-  }
-}
-
-/* Ask the server for our own hostmask directly.  USERHOST is RFC1459 and
- * answered by every IRC network, so this works without joining a channel and
- * regardless of whether 001 embedded the mask.  Sent only on connect and after
- * a settled nick change, so it adds no sustained traffic. */
+/* Ask the server for our own DISPLAYED hostmask.  `WHO <nick>` is answered by
+ * every IRC network with a 352 carrying exactly the nick!ident@host other
+ * clients see — the same numeric peers build their rosters from — so it cannot
+ * come back with a real host the network hides from everyone else, the way
+ * USERHOST can.  Works without joining a channel and regardless of whether 001
+ * embedded a mask.  Sent only on connect and after a settled nick change, so
+ * it adds no sustained traffic. */
 static void request_own_hostmask(bot_state_t *state) {
   if (state->current_nick[0] != '\0')
-    irc_printf(state, "USERHOST %s\r\n", state->current_nick);
+    irc_printf(state, "WHO %s\r\n", state->current_nick);
 }
 
 void parser_handle_line(bot_state_t *state, char *line) {
@@ -326,18 +318,36 @@ void parser_handle_line(bot_state_t *state, char *line) {
   }
   if (strcmp(command, "001") == 0) {
     state->status |= S_AUTHED;
-    // [NEW] Parse hostmask from 001 message when the server embeds it.
-    // 001 params typically: "Nick :Welcome... Nick!User@Host" — take the last
-    // token if it looks like a full mask.  Many networks omit it, so this is
-    // only an opportunistic backup for the authoritative USERHOST below.
-    char *last_token = strrchr(params, ' ');
-    if (last_token) {
-      last_token++; // Skip space
-      if (strchr(last_token, '!') && strchr(last_token, '@'))
-        update_own_hostmask(state, last_token);
+    /* 001's first parameter is the nick the server actually registered us
+     * under, which is not always the one we asked for (length truncation,
+     * collision handling, a services rename).  Self-recognition in the 352
+     * and 302 handlers is a strcasecmp against current_nick, so a stale value
+     * here silently disables every self-mask capture and the bot goes on
+     * publishing whatever the 001 welcome line happened to say. */
+    {
+      const char *sp = strchr(params, ' ');
+      size_t nlen = sp ? (size_t)(sp - params) : strlen(params);
+      if (nlen > 0 && nlen < sizeof(state->current_nick)) {
+        char srv_nick[MAX_NICK];
+        memcpy(srv_nick, params, nlen);
+        srv_nick[nlen] = '\0';
+        if (strcmp(state->current_nick, srv_nick) != 0) {
+          log_message(L_INFO, state,
+                      "[INFO] Server registered me as %s (was %s)\n", srv_nick,
+                      state->current_nick[0] ? state->current_nick : "unset");
+          snprintf(state->current_nick, sizeof(state->current_nick), "%s",
+                   srv_nick);
+          state->current_nick_ts = time(NULL);
+          if (state->hub_connected && state->hub_authenticated)
+            hub_client_push_delta(state, "n", state->current_nick,
+                                  state->current_nick_ts);
+        }
+      }
     }
-    // Authoritative, network-agnostic self-mask lookup — does not depend on the
-    // 001 line carrying the mask or on joining any channel.
+    /* The mask embedded in the 001 welcome text is deliberately NOT used:
+     * it is a self-directed greeting, and networks fill it with the real
+     * (pre-resolution / pre-cloak) host that no other client is ever shown.
+     * Ask instead, and take the answer only from the 352. */
     request_own_hostmask(state);
   } else if (strcmp(command, "433") == 0) {
     state->nick_change_pending = false;
@@ -415,91 +425,58 @@ void parser_handle_line(bot_state_t *state, char *line) {
   } else if (strcmp(command, "352") == 0) {
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
-
-    chan_t *c = channel_find(state, chan_name);
-    if (!c)
-      return;
-
     char *ident = strtok_r(NULL, " ", &saveptr_irc);
     char *host = strtok_r(NULL, " ", &saveptr_irc);
     strtok_r(NULL, " ", &saveptr_irc);
     char *nick = strtok_r(NULL, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
 
-    if (nick && ident && host && modes) {
-      bool is_op = (strstr(modes, "@") != NULL);
+    if (!nick || !ident || !host || !modes)
+      return;
 
-      /* Always update own op status even when the roster array is full.
-       * Without this, the bot's own 352 entry can be silently dropped in
-       * large channels (>MAX_ROSTER_SIZE users), leaving i_am_opped = false
-       * and triggering spurious OP-REQs on the next 315. */
-      if (strcasecmp(nick, state->current_nick) == 0) {
-        c->i_am_opped = is_op;
-        /* Passive self-mask capture: our own 352 entry carries the
-         * authoritative nick!user@host.  Free byproduct of a WHO we already
-         * send on join — the funnel dedups, so no extra traffic and no new
-         * WHO.  Belt-and-suspenders for networks that give no 001 mask/302. */
-        char self_mask[MAX_MASK_LEN];
-        snprintf(self_mask, sizeof(self_mask), "%s!%s@%s", nick, ident, host);
-        update_own_hostmask(state, self_mask);
-      }
+    bool is_op = (strstr(modes, "@") != NULL);
 
-      if (c->roster_count < MAX_ROSTER_SIZE) {
-        roster_entry_t *entry = &c->roster[c->roster_count];
-        snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
-        snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
-        entry->is_op = is_op;
-        c->roster_count++;
-      }
+    /* Self-mask capture, ahead of the channel lookup on purpose: the reply to
+     * `WHO <nick>` (request_own_hostmask) carries "*" as the channel, so
+     * gating this on channel_find would discard the one authoritative,
+     * channel-independent source of our displayed mask.  This is the same
+     * nick!ident@host every peer stores in trusted_bots[]. */
+    if (strcasecmp(nick, state->current_nick) == 0) {
+      char self_mask[MAX_MASK_LEN];
+      snprintf(self_mask, sizeof(self_mask), "%s!%s@%s", nick, ident, host);
+      update_own_hostmask(state, self_mask);
+    }
+
+    chan_t *c = channel_find(state, chan_name);
+    if (!c)
+      return;
+
+    /* Always update own op status even when the roster array is full.
+     * Without this, the bot's own 352 entry can be silently dropped in
+     * large channels (>MAX_ROSTER_SIZE users), leaving i_am_opped = false
+     * and triggering spurious OP-REQs on the next 315. */
+    if (strcasecmp(nick, state->current_nick) == 0)
+      c->i_am_opped = is_op;
+
+    if (c->roster_count < MAX_ROSTER_SIZE) {
+      roster_entry_t *entry = &c->roster[c->roster_count];
+      snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
+      snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
+      entry->is_op = is_op;
+      c->roster_count++;
     }
   } else if (strcmp(command, "396") == 0) {
     char *hostname = strtok_r(params, " ", &saveptr_irc); // Nick
     hostname = strtok_r(NULL, " ", &saveptr_irc);         // Host
 
     if (hostname) {
-      // [UPDATED] Reconstruct Nick!Ident@NewHost using the server-observed
-      // ident (not the configured user), route through the funnel, then confirm
-      // authoritatively with USERHOST in case the cloak also changed the ident.
-      char ident[64];
-      own_ident(state, ident, sizeof(ident));
-      char mask[MAX_MASK_LEN];
-      snprintf(mask, sizeof(mask), "%s!%s@%s", state->current_nick, ident,
-               hostname);
-      update_own_hostmask(state, mask);
+      /* 396 gives only the host half, and a cloak can change the ident too.
+       * Rather than splice a mask together — a guess about a string only the
+       * server defines — treat it purely as a signal that our mask moved and
+       * re-ask.  The 352 reply supplies the exact new value. */
+      log_message(L_INFO, state, "[INFO] Displayed host changed to %s; "
+                                 "re-checking my mask\n", hostname);
       request_own_hostmask(state);
-    }
-  } else if (strcmp(command, "302") == 0) {
-    /* RPL_USERHOST — our own USERHOST reply.  Format of params:
-     *   "<ournick> :<nick>[*]=[+|-]<user>@<host>"
-     * Parse the trailing ':'-reply, strip the trailing '*' (IRC-op flag) from
-     * the nick and the leading '+'/'-' (away flag) from the userhost, accept
-     * only our own nick, and funnel nick!user@host. */
-    char *reply = strchr(params, ':');
-    if (reply) {
-      reply++; // skip ':'
-      char *eq = strchr(reply, '=');
-      if (eq) {
-        *eq = '\0';
-        char *rnick = reply;
-        char *uh = eq + 1;
-        // strip IRC-op '*' suffix from nick
-        char *star = strchr(rnick, '*');
-        if (star)
-          *star = '\0';
-        // strip away/here '+'/'-' prefix from userhost
-        if (*uh == '+' || *uh == '-')
-          uh++;
-        // a 302 may list several space-separated entries; keep only the first
-        char *sp = strchr(uh, ' ');
-        if (sp)
-          *sp = '\0';
-        if (rnick[0] && strcasecmp(rnick, state->current_nick) == 0 &&
-            strchr(uh, '@')) {
-          char mask[MAX_MASK_LEN];
-          snprintf(mask, sizeof(mask), "%s!%s", rnick, uh);
-          update_own_hostmask(state, mask);
-        }
-      }
     }
   } else if (strcmp(command, "315") == 0) {
     strtok_r(params, " ", &saveptr_irc);
@@ -705,23 +682,12 @@ void parser_handle_line(bot_state_t *state, char *line) {
                               state->current_nick_ts);
       }
 
-      /* Immediate re-splice of newnick!user@oldhost from the host we already
-       * know (funnel dedups + syncs).  Now reliable because actual_hostname is
-       * populated on connect by USERHOST. */
-      char *at = strchr(state->actual_hostname, '@');
-      if (at) {
-        char host[128];
-        snprintf(host, sizeof(host), "%s", at + 1);
-
-        char ident[64];
-        own_ident(state, ident, sizeof(ident));
-        char mask[MAX_MASK_LEN];
-        snprintf(mask, sizeof(mask), "%s!%s@%s", state->current_nick,
-                 ident, host);
-        update_own_hostmask(state, mask);
-      }
-      /* Confirm with the server too: some networks reassign host/cloak on a
-       * nick change.  One USERHOST per nick change is not sustained traffic. */
+      /* Our mask just changed in its nick half, and some networks reassign
+       * host/cloak on a nick change too.  No local re-splice: ask, and let the
+       * 352 supply the exact string.  Until it arrives actual_hostname briefly
+       * holds the previous nick — a stale-but-real mask the server did once
+       * present, which is strictly safer to publish than a guessed one.  One
+       * WHO per nick change is not sustained traffic. */
       request_own_hostmask(state);
 
       state->nick_change_pending = false;

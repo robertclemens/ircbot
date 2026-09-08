@@ -610,7 +610,12 @@ bool config_load(bot_state_t *state, const char *password,
         for (int j = 0; j < nu; j++) {
           if (strcmp(new_users[j].name, try_name) == 0) {
             collision = true;
-            snprintf(try_name, sizeof(try_name), "%s_%d", derived_name, suffix++);
+            /* Reserve room for "_<suffix>" (1 + up to 10 digits + NUL) so a
+             * long derived_name can never push the suffix out of the buffer:
+             * a truncated suffix would collapse two distinct names to the same
+             * string and silently defeat this dedup loop. */
+            snprintf(try_name, sizeof(try_name), "%.*s_%d",
+                     (int)(sizeof(try_name) - 12), derived_name, suffix++);
             break;
           }
         }
