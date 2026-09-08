@@ -281,6 +281,7 @@ static void run_config_wizard(void) {
 #define WIZARD_MAX_MASKS 20
   char admin_masks[WIZARD_MAX_MASKS][MAX_MASK_LEN];
   int  admin_mask_count = 0;
+  bool hub_managed = false;
   memset(admin_name,  0, sizeof(admin_name));
   memset(admin_pass,  0, sizeof(admin_pass));
   memset(admin_masks, 0, sizeof(admin_masks));
@@ -293,6 +294,16 @@ static void run_config_wizard(void) {
     memset(config_pass, 0, MAX_PASS);
     memset(server_buf, 0, MAX_BUFFER);
     memset(chan_buf, 0, MAX_CHAN);
+
+    /* Reset every mode-dependent field here rather than at its prompt: the
+     * prompts now live in mutually exclusive branches, so a wizard restart that
+     * switches from standalone to hub-managed would otherwise carry the first
+     * pass's admin name/password/masks into the committed config. */
+    hub_managed = false;
+    admin_mask_count = 0;
+    memset(admin_name,  0, sizeof(admin_name));
+    memset(admin_masks, 0, sizeof(admin_masks));
+    secure_wipe(admin_pass, sizeof(admin_pass));
 
     printf("==========================================\n");
     printf("         Starting Configuration Wizard      \n");
@@ -373,42 +384,6 @@ static void run_config_wizard(void) {
     get_input("Enter VHOST IP (optional, press Enter for default [no vhost])",
               state.vhost, sizeof(state.vhost));
 
-    printf("\n--- Setup First Admin ---\n");
-    memset(admin_name,  0, sizeof(admin_name));
-    memset(admin_pass,  0, sizeof(admin_pass));
-    memset(admin_masks, 0, sizeof(admin_masks));
-    admin_mask_count = 0;
-    while (true) {
-      get_input("Enter admin friendly name (no spaces, e.g. robert)", admin_name, sizeof(admin_name));
-      if (strlen(admin_name) > 0 && !strchr(admin_name,' ') && !strchr(admin_name,'|'))
-        break;
-      printf("ERROR: Name cannot contain spaces or '|'.\n");
-    }
-    while (!get_confirmed_password("Enter admin password", admin_pass, MAX_PASS))
-      ;
-    printf("\n--- Setup Admin Usermasks ---\n");
-    printf("Enter usermasks for this admin (e.g. nick!*@*.example.com).\n");
-    printf("Press Enter with no mask when done (at least one required).\n\n");
-    while (admin_mask_count < WIZARD_MAX_MASKS) {
-      char tmp_mask[MAX_MASK_LEN] = {0};
-      printf("Usermask %d%s: ", admin_mask_count + 1,
-             admin_mask_count == 0 ? " (required)" : " (or Enter to finish)");
-      fflush(stdout);
-      char *res = fgets(tmp_mask, sizeof(tmp_mask), stdin);
-      if (!res) break;
-      tmp_mask[strcspn(tmp_mask, "\n")] = '\0';
-      if (tmp_mask[0] == '\0') {
-        if (admin_mask_count == 0) { printf("ERROR: At least one usermask required.\n"); continue; }
-        break;
-      }
-      if (!strchr(tmp_mask, '!') || !strchr(tmp_mask, '@')) {
-        printf("ERROR: Mask must contain '!' and '@'. Try again.\n");
-        continue;
-      }
-      snprintf(admin_masks[admin_mask_count], MAX_MASK_LEN, "%s", tmp_mask);
-      admin_mask_count++;
-    }
-
     printf("\n--- Setup IRC Server ---\n");
     while (true) {
       get_input("Enter IRC server (e.g., irc.efnet.org)", server_buf,
@@ -418,30 +393,28 @@ static void run_config_wizard(void) {
       printf("🚨 ERROR: Invalid server format.\n");
     }
 
-    printf("\n--- Setup Initial Channel ---\n");
-    while (true) {
-      get_input("Enter channel to join (e.g., #bots) [Optional, Enter to skip]",
-                chan_buf, MAX_CHAN);
-      if (strlen(chan_buf) == 0)
-        break;
-      if (chan_buf[0] == '#' && strlen(chan_buf) > 1)
-        break;
-      printf("🚨 ERROR: Channel must start with '#'.\n");
-    }
+    /* Management mode decides the rest of the wizard.  A hub-managed bot owns
+     * none of the records the hub is authoritative for, so prompting for them
+     * only produces local state the first sync discards — or, under opt 'h'
+     * (OPT_HUB_ONLY_MUTATIONS), state the hub rejects outright and the bot then
+     * re-pushes forever with no way to notice.  Ask first, collect only what
+     * this bot actually owns. */
+    printf("\n--- Management Mode ---\n");
+    printf("Hub-managed: admins, usermasks and channels live on the hub and are\n");
+    printf("  managed with hub_admin. This bot only needs hub addresses and\n");
+    printf("  their pinned public keys.\n");
+    printf("Standalone:  this bot owns its own admin list and channels.\n\n");
 
-    // Hub Configuration (Optional) — add as many hubs as desired
-    printf("\n--- Hub Configuration (Optional) ---\n");
-    printf("If this bot will connect to one or more IRC Hubs for centralized\n");
-    printf("management, you'll need each hub's address and public key (the\n");
-    printf("base64 from the hub's hub_public.b64 file). Each hub has its own\n");
-    printf("keypair, so the key is pinned per hub.\n");
-    printf("Press Enter / 'n' to skip.\n");
+    char mode_choice[16];
+    get_input("Hub-managed? (Y/n)", mode_choice, sizeof(mode_choice));
+    hub_managed = (mode_choice[0] != 'n' && mode_choice[0] != 'N');
 
-    char hub_choice[16];
-    get_input("Configure hub connection(s)? (y/N)", hub_choice,
-              sizeof(hub_choice));
+    if (hub_managed) {
+      printf("\n--- Hub Configuration ---\n");
+      printf("You'll need each hub's address and public key (the base64 from\n");
+      printf("the hub's hub_public.b64 file). Each hub has its own keypair, so\n");
+      printf("the key is pinned per hub.\n");
 
-    if (hub_choice[0] == 'y' || hub_choice[0] == 'Y') {
       while (state.hub_count < MAX_SERVERS) {
         char hub_addr[256];
         char hub_pub_input[256];
@@ -517,10 +490,65 @@ static void run_config_wizard(void) {
         get_input("Add another hub? (y/N)", more, sizeof(more));
         if (more[0] != 'y' && more[0] != 'Y') break;
       }
+      if (state.hub_count == 0) {
+        /* Defensive: the loop above always adds on its first pass, so this is
+         * unreachable today.  Fail closed rather than write a hub-managed
+         * config with nothing to connect to. */
+        printf("\n🚨 ERROR: A hub-managed bot needs at least one hub. "
+               "Restarting setup.\n\n");
+        continue;
+      }
       printf("\n✓ Hub configuration saved (%d hub%s).\n",
              state.hub_count, state.hub_count == 1 ? "" : "s");
+      printf("\n  Admins, usermasks and channels for this bot are added with\n");
+      printf("  hub_admin (IRC Admin Commands), not here. This wizard assumes\n");
+      printf("  the hub network runs with opt 'h' (hub-only mutations), which\n");
+      printf("  is the default — it cannot verify that until the first sync.\n");
+      printf("  If your hub does not set opt 'h', you can also add them later\n");
+      printf("  from IRC with '+admin' and 'join'.\n");
     } else {
-      printf("Skipping hub configuration.\n");
+      printf("\n--- Setup First Admin ---\n");
+      while (true) {
+        get_input("Enter admin friendly name (no spaces, e.g. robert)", admin_name, sizeof(admin_name));
+        if (strlen(admin_name) > 0 && !strchr(admin_name,' ') && !strchr(admin_name,'|'))
+          break;
+        printf("ERROR: Name cannot contain spaces or '|'.\n");
+      }
+      while (!get_confirmed_password("Enter admin password", admin_pass, MAX_PASS))
+        ;
+      printf("\n--- Setup Admin Usermasks ---\n");
+      printf("Enter usermasks for this admin (e.g. nick!*@*.example.com).\n");
+      printf("Press Enter with no mask when done (at least one required).\n\n");
+      while (admin_mask_count < WIZARD_MAX_MASKS) {
+        char tmp_mask[MAX_MASK_LEN] = {0};
+        printf("Usermask %d%s: ", admin_mask_count + 1,
+               admin_mask_count == 0 ? " (required)" : " (or Enter to finish)");
+        fflush(stdout);
+        char *res = fgets(tmp_mask, sizeof(tmp_mask), stdin);
+        if (!res) break;
+        tmp_mask[strcspn(tmp_mask, "\n")] = '\0';
+        if (tmp_mask[0] == '\0') {
+          if (admin_mask_count == 0) { printf("ERROR: At least one usermask required.\n"); continue; }
+          break;
+        }
+        if (!strchr(tmp_mask, '!') || !strchr(tmp_mask, '@')) {
+          printf("ERROR: Mask must contain '!' and '@'. Try again.\n");
+          continue;
+        }
+        snprintf(admin_masks[admin_mask_count], MAX_MASK_LEN, "%s", tmp_mask);
+        admin_mask_count++;
+      }
+
+      printf("\n--- Setup Initial Channel ---\n");
+      while (true) {
+        get_input("Enter channel to join (e.g., #bots) [Optional, Enter to skip]",
+                  chan_buf, MAX_CHAN);
+        if (strlen(chan_buf) == 0)
+          break;
+        if (chan_buf[0] == '#' && strlen(chan_buf) > 1)
+          break;
+        printf("🚨 ERROR: Channel must start with '#'.\n");
+      }
     }
 
     printf("\n==========================================\n");
@@ -528,7 +556,16 @@ static void run_config_wizard(void) {
     printf("==========================================\n");
     printf("Bot Nick: %s\n", state.target_nick);
     printf("IRC Server: %s\n", server_buf);
-    printf("Managed: %s\n", (state.hub_count > 0 ? "YES" : "NO"));
+    if (hub_managed) {
+      printf("Mode: HUB-MANAGED (%d hub%s)\n", state.hub_count,
+             state.hub_count == 1 ? "" : "s");
+      printf("Admins/channels: managed on the hub\n");
+    } else {
+      printf("Mode: STANDALONE\n");
+      printf("Admin: %s (%d usermask%s)\n", admin_name, admin_mask_count,
+             admin_mask_count == 1 ? "" : "s");
+      printf("Channel: %s\n", chan_buf[0] ? chan_buf : "(none)");
+    }
 
     get_input("Does this look correct? (Y/n)", confirm_char,
               sizeof(confirm_char));
@@ -542,8 +579,14 @@ static void run_config_wizard(void) {
     }
   } while (true);
 
-  // Commit — create admin user_record + all collected mask_records
-  {
+  /* Commit — create admin user_record + all collected mask_records.  Skipped
+   * entirely for a hub-managed bot: the hub is authoritative for a|/m| records
+   * and replaces the bot's set wholesale on the first sync
+   * (hub_client_process_config_data), so anything written here is dead on
+   * arrival.  The guard is load-bearing, not cosmetic — admin_name/admin_pass
+   * are never populated in hub-managed mode, so running this unguarded would
+   * persist an admin record with an empty name and an empty password. */
+  if (!hub_managed) {
     unsigned char rnd[16];
     RAND_bytes(rnd, sizeof(rnd));
     rnd[6]=(rnd[6]&0x0f)|0x40; rnd[8]=(rnd[8]&0x3f)|0x80;
@@ -566,9 +609,11 @@ static void run_config_wizard(void) {
       snprintf(m->mask, sizeof(m->mask), "%.255s", admin_masks[mi]);
       m->is_active = true; m->timestamp = now;
     }
-    memset(admin_pass,  0, sizeof(admin_pass));
-    memset(admin_masks, 0, sizeof(admin_masks));
   }
+  /* Wipe unconditionally — the buffers exist in both modes even though only the
+   * standalone branch fills them. */
+  secure_wipe(admin_pass,  sizeof(admin_pass));
+  secure_wipe(admin_masks, sizeof(admin_masks));
 #undef WIZARD_MAX_MASKS
   state.server_list[state.server_count++] = strdup(server_buf);
 
@@ -587,6 +632,10 @@ static void run_config_wizard(void) {
   printf("You can now start the bot:\n");
   printf("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'\n");
   printf("  Or run './ircbot' directly and enter the password when prompted.\n");
+
+  /* Release the wizard's local state: frees server_list[] entries (the strdup
+   * at the server_buf line) and the channel list, and cleanses key material. */
+  state_destroy(&state);
 }
 
 int main(int argc, char *argv[]) {

@@ -230,6 +230,54 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
   }
 }
 
+/* Single funnel for every source of the bot's own hostmask (001 welcome,
+ * 396 cloak, 302 USERHOST reply, 352 self WHO entry, self NICK re-splice).
+ * Idempotent: only updates + pushes to the hub when the mask actually changes,
+ * so multiple sources converging on the same value produce exactly one 'h'
+ * delta and periodic WHOs never re-push.  Reuses hub_client_sync_hostmask ->
+ * hub_client_push_delta(state,"h",...): no new send path, no wire change. */
+static void update_own_hostmask(bot_state_t *state, const char *mask) {
+  if (!mask || mask[0] == '\0')
+    return;
+  if (strcmp(state->actual_hostname, mask) == 0)
+    return; // unchanged — nothing to do
+
+  snprintf(state->actual_hostname, sizeof(state->actual_hostname), "%s", mask);
+  state->actual_hostname_ts = time(NULL);
+  log_message(L_INFO, state, "[INFO] My hostmask is now: %s\n",
+              state->actual_hostname);
+
+  if (state->hub_connected && state->hub_authenticated)
+    hub_client_sync_hostmask(state);
+}
+
+/* The server-observed ident from actual_hostname (the substring between '!' and
+ * '@'), captured authoritatively by 302/352/001.  Falls back to the configured
+ * user only when no mask is known yet.  Used when re-splicing a mask on cloak
+ * (396) or nick change so we never substitute a configured ident the server did
+ * not actually assign — a wrong ident would break trusted-bot mask matching. */
+static void own_ident(const bot_state_t *state, char *out, size_t out_sz) {
+  const char *bang = strchr(state->actual_hostname, '!');
+  const char *at   = strchr(state->actual_hostname, '@');
+  if (bang && at && at > bang + 1) {
+    size_t n = (size_t)(at - (bang + 1));
+    if (n >= out_sz) n = out_sz - 1;
+    memcpy(out, bang + 1, n);
+    out[n] = '\0';
+  } else {
+    snprintf(out, out_sz, "%s", state->user);
+  }
+}
+
+/* Ask the server for our own hostmask directly.  USERHOST is RFC1459 and
+ * answered by every IRC network, so this works without joining a channel and
+ * regardless of whether 001 embedded the mask.  Sent only on connect and after
+ * a settled nick change, so it adds no sustained traffic. */
+static void request_own_hostmask(bot_state_t *state) {
+  if (state->current_nick[0] != '\0')
+    irc_printf(state, "USERHOST %s\r\n", state->current_nick);
+}
+
 void parser_handle_line(bot_state_t *state, char *line) {
   if (strncmp(line, "PING :", 6) == 0) {
     irc_printf(state, "PONG :%s\r\n", line + 6);
@@ -278,25 +326,19 @@ void parser_handle_line(bot_state_t *state, char *line) {
   }
   if (strcmp(command, "001") == 0) {
     state->status |= S_AUTHED;
-    // [NEW] Parse hostmask from 001 message
-    // 001 params typically: "Nick :Welcome... Nick!User@Host"
-    // We want the last token
+    // [NEW] Parse hostmask from 001 message when the server embeds it.
+    // 001 params typically: "Nick :Welcome... Nick!User@Host" — take the last
+    // token if it looks like a full mask.  Many networks omit it, so this is
+    // only an opportunistic backup for the authoritative USERHOST below.
     char *last_token = strrchr(params, ' ');
     if (last_token) {
       last_token++; // Skip space
-      if (strchr(last_token, '!') && strchr(last_token, '@')) {
-        snprintf(state->actual_hostname, sizeof(state->actual_hostname),
-                 "%s", last_token);
-        state->actual_hostname_ts = time(NULL);
-        log_message(L_INFO, state, "[INFO] Discovered my hostmask: %s\n",
-                    state->actual_hostname);
-
-        // Trigger Hub Sync
-        if (state->hub_connected && state->hub_authenticated) {
-          hub_client_sync_hostmask(state);
-        }
-      }
+      if (strchr(last_token, '!') && strchr(last_token, '@'))
+        update_own_hostmask(state, last_token);
     }
+    // Authoritative, network-agnostic self-mask lookup — does not depend on the
+    // 001 line carrying the mask or on joining any channel.
+    request_own_hostmask(state);
   } else if (strcmp(command, "433") == 0) {
     state->nick_change_pending = false;
     if (!(state->status & S_AUTHED)) {
@@ -393,6 +435,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
        * and triggering spurious OP-REQs on the next 315. */
       if (strcasecmp(nick, state->current_nick) == 0) {
         c->i_am_opped = is_op;
+        /* Passive self-mask capture: our own 352 entry carries the
+         * authoritative nick!user@host.  Free byproduct of a WHO we already
+         * send on join — the funnel dedups, so no extra traffic and no new
+         * WHO.  Belt-and-suspenders for networks that give no 001 mask/302. */
+        char self_mask[MAX_MASK_LEN];
+        snprintf(self_mask, sizeof(self_mask), "%s!%s@%s", nick, ident, host);
+        update_own_hostmask(state, self_mask);
       }
 
       if (c->roster_count < MAX_ROSTER_SIZE) {
@@ -408,17 +457,48 @@ void parser_handle_line(bot_state_t *state, char *line) {
     hostname = strtok_r(NULL, " ", &saveptr_irc);         // Host
 
     if (hostname) {
-      // [UPDATED] Reconstruct full hostmask: Nick!User@NewHost
-      snprintf(state->actual_hostname, sizeof(state->actual_hostname),
-               "%s!%s@%s", state->current_nick, state->user, hostname);
-      state->actual_hostname_ts = time(NULL);
-
-      log_message(L_INFO, state, "[INFO] My visible host is now: %s\n",
-                  state->actual_hostname);
-
-      // Trigger Hub Sync
-      if (state->hub_connected && state->hub_authenticated) {
-        hub_client_sync_hostmask(state);
+      // [UPDATED] Reconstruct Nick!Ident@NewHost using the server-observed
+      // ident (not the configured user), route through the funnel, then confirm
+      // authoritatively with USERHOST in case the cloak also changed the ident.
+      char ident[64];
+      own_ident(state, ident, sizeof(ident));
+      char mask[MAX_MASK_LEN];
+      snprintf(mask, sizeof(mask), "%s!%s@%s", state->current_nick, ident,
+               hostname);
+      update_own_hostmask(state, mask);
+      request_own_hostmask(state);
+    }
+  } else if (strcmp(command, "302") == 0) {
+    /* RPL_USERHOST — our own USERHOST reply.  Format of params:
+     *   "<ournick> :<nick>[*]=[+|-]<user>@<host>"
+     * Parse the trailing ':'-reply, strip the trailing '*' (IRC-op flag) from
+     * the nick and the leading '+'/'-' (away flag) from the userhost, accept
+     * only our own nick, and funnel nick!user@host. */
+    char *reply = strchr(params, ':');
+    if (reply) {
+      reply++; // skip ':'
+      char *eq = strchr(reply, '=');
+      if (eq) {
+        *eq = '\0';
+        char *rnick = reply;
+        char *uh = eq + 1;
+        // strip IRC-op '*' suffix from nick
+        char *star = strchr(rnick, '*');
+        if (star)
+          *star = '\0';
+        // strip away/here '+'/'-' prefix from userhost
+        if (*uh == '+' || *uh == '-')
+          uh++;
+        // a 302 may list several space-separated entries; keep only the first
+        char *sp = strchr(uh, ' ');
+        if (sp)
+          *sp = '\0';
+        if (rnick[0] && strcasecmp(rnick, state->current_nick) == 0 &&
+            strchr(uh, '@')) {
+          char mask[MAX_MASK_LEN];
+          snprintf(mask, sizeof(mask), "%s!%s", rnick, uh);
+          update_own_hostmask(state, mask);
+        }
       }
     }
   } else if (strcmp(command, "315") == 0) {
@@ -625,19 +705,24 @@ void parser_handle_line(bot_state_t *state, char *line) {
                               state->current_nick_ts);
       }
 
+      /* Immediate re-splice of newnick!user@oldhost from the host we already
+       * know (funnel dedups + syncs).  Now reliable because actual_hostname is
+       * populated on connect by USERHOST. */
       char *at = strchr(state->actual_hostname, '@');
       if (at) {
         char host[128];
         snprintf(host, sizeof(host), "%s", at + 1);
 
-        snprintf(state->actual_hostname, sizeof(state->actual_hostname),
-                 "%s!%s@%s", state->current_nick, state->user, host);
-        state->actual_hostname_ts = time(NULL);
-
-        if (state->hub_connected && state->hub_authenticated) {
-          hub_client_sync_hostmask(state);
-        }
+        char ident[64];
+        own_ident(state, ident, sizeof(ident));
+        char mask[MAX_MASK_LEN];
+        snprintf(mask, sizeof(mask), "%s!%s@%s", state->current_nick,
+                 ident, host);
+        update_own_hostmask(state, mask);
       }
+      /* Confirm with the server too: some networks reassign host/cloak on a
+       * nick change.  One USERHOST per nick change is not sustained traffic. */
+      request_own_hostmask(state);
 
       state->nick_change_pending = false;
       if (strcasecmp(state->current_nick, state->target_nick) == 0) {

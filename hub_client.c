@@ -622,17 +622,35 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   /* Hub is authoritative for user/mask records. Replace rather than merge so
    * the bot always has exactly the hub's current set — no stale or duplicate
    * UUIDs from a previous sync can accumulate. Preserve last_seen/last_used
-   * that were updated locally since the last hub push. */
+   * that were updated locally since the last hub push.
+   *
+   * Only wipe a table when this payload actually carries records of that kind.
+   * A payload legitimately lacking a|/o| (or m|) lines — the hub has none, or a
+   * partial/other push — must NOT silently empty the in-memory table (which,
+   * combined with the updates>0 save-gate below, would diverge RAM from disk).
+   * When such lines ARE present the "replace to drop stale UUIDs" semantics
+   * still hold, because parsing rebuilds the whole set. */
+  bool has_user_lines = false, has_mask_lines = false;
+  for (const char *p = payload; p && *p; ) {
+    if ((p[0] == 'a' || p[0] == 'o') && p[1] == '|') has_user_lines = true;
+    else if (p[0] == 'm' && p[1] == '|') has_mask_lines = true;
+    const char *nl = strchr(p, '\n');
+    if (!nl) break;
+    p = nl + 1;
+  }
+
   user_record_t saved_users[MAX_USER_RECORDS];
   mask_record_t saved_masks[MAX_USER_MASKS];
   int saved_user_count = state->user_record_count;
   int saved_mask_count = state->mask_record_count;
   memcpy(saved_users, state->user_records, sizeof(user_record_t) * (size_t)saved_user_count);
   memcpy(saved_masks, state->mask_records, sizeof(mask_record_t) * (size_t)saved_mask_count);
-  state->user_record_count = 0;
-  state->mask_record_count = 0;
+  if (has_user_lines) state->user_record_count = 0;
+  if (has_mask_lines) state->mask_record_count = 0;
 
-  char work_buf[MAX_BUFFER];
+  /* Change 5: static, sized to a full config payload so a large hub config is
+   * parsed whole (no truncation).  Single-threaded, non-reentrant. */
+  static char work_buf[MAX_CONFIG_PAYLOAD];
   snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
   char *saveptr;
@@ -1391,7 +1409,9 @@ void hub_client_process(bot_state_t *state) {
   uint32_t net_len;
   memcpy(&net_len, header, 4);
   int packet_len = ntohl(net_len);
-  if (packet_len <= 0 || packet_len > (MAX_BUFFER - 4)) {
+  /* Change 5: a CMD_CONFIG_DATA frame from the hub can exceed MAX_BUFFER at
+   * scale — bound by the config-frame ceiling instead of the small wire size. */
+  if (packet_len <= 0 || packet_len > MAX_HUB_FRAME) {
     hub_client_disconnect(state);
     return;
   }
@@ -1552,7 +1572,11 @@ void hub_client_process(bot_state_t *state) {
     return;
   }
   state->last_hub_activity = time(NULL);
-  unsigned char plain[MAX_BUFFER], tag[GCM_TAG_LEN];
+  /* Change 5: decrypt scratch sized to the largest inbound hub frame.  static
+   * (not stack) — the bot is single-threaded and this path is non-reentrant, so
+   * a ~200 KB frame needs no oversized stack allocation. */
+  static unsigned char plain[MAX_HUB_FRAME];
+  unsigned char tag[GCM_TAG_LEN];
   if (packet_len > (GCM_IV_LEN + GCM_TAG_LEN)) {
     memcpy(tag, packet_body + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
     int plain_len =
@@ -1592,7 +1616,9 @@ void hub_client_process(bot_state_t *state) {
           int payload_len = ntohl(payload_len_network);
 
           if (payload_len > 0 && payload_len <= (plain_len - 5)) {
-            char payload_buf[MAX_BUFFER];
+            /* Change 5: static, sized to the largest inbound frame (see plain
+             * above). payload_len <= plain_len-5 <= MAX_HUB_FRAME-5. */
+            static char payload_buf[MAX_HUB_FRAME];
             memcpy(payload_buf, &plain[5], payload_len);
             payload_buf[payload_len] = '\0';
 

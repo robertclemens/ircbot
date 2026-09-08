@@ -75,6 +75,33 @@
 #define MAX_MASK_LEN 256    // Max usermask length
 #define MAX_OP_MASKS 20     // Max number of operators
 #define MAX_TRUSTED_BOTS 200 // Max number of trusted bots
+
+/* ==========================================================================
+ * Bulk config-payload ceiling (Change 5) — shared contract with irchub/hub.h.
+ * MAX_BUFFER (16 KB) stays the wire-frame size for small messages (deltas, op
+ * requests, pings).  A full CMD_CONFIG_DATA from the hub can be much larger, so
+ * its receive/decrypt/parse buffers size to MAX_CONFIG_PAYLOAD instead.  This
+ * must be >= the hub's MAX_CONFIG_PAYLOAD so the bot can always receive what the
+ * hub sends; the counts match (records 40, masks 200) and MAX_TRUSTED_BOTS (200)
+ * >= the hub's MAX_BOTS, so this formula yields >= the hub's ceiling.
+ * ========================================================================== */
+#define CFG_GLOBAL_LINE_MAX 1088  /* key[32]+value[1024]+ts+seps */
+#define CFG_BOT_FIELD_LINE  320   /* per-bot line: capped value */
+#define CFG_USER_LINE_MAX   384   /* a|/o|: uuid+name+MAX_PASS+pubkey */
+#define CFG_MASK_LINE_MAX   352   /* m|: uuid+MAX_MASK_LEN */
+#define CFG_BLINE_MAX       352   /* b|<mask>|<uuid>|<ts> */
+#define CFG_MAX_GLOBALS     64    /* mirrors hub MAX_BOT_ENTRIES */
+#define CFG_BOT_SYNC_FIELDS 8
+#define CFG_PAYLOAD_SLACK   8192
+#define MAX_CONFIG_PAYLOAD \
+  ( CFG_MAX_GLOBALS     * CFG_GLOBAL_LINE_MAX + \
+    MAX_USER_RECORDS    * CFG_USER_LINE_MAX   + \
+    MAX_USER_MASKS      * CFG_MASK_LINE_MAX   + \
+    CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE  + \
+    MAX_TRUSTED_BOTS    * CFG_BLINE_MAX       + \
+    CFG_PAYLOAD_SLACK )
+/* Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin. */
+#define MAX_HUB_FRAME (MAX_CONFIG_PAYLOAD + 64)
 #define MAX_ROSTER_SIZE                                                        \
   50 // Max channel roster size to store. Increase if in very large channels.
 #define MAX_SEEN_HASHES                                                        \
