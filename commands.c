@@ -155,7 +155,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
   }
   /* --- Block 2: Admin/Op Logic --- */
-  /* Three accepted formats:
+  /* Two accepted formats:
    *   v1   (default):      "~A1 <base64-blob>"
    *     blob = salt(16) || iv(12) || ciphertext(N) || tag(16)
    *     key  = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 32)
@@ -172,11 +172,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
    *     OpenSSL's `enc` CLI, pure-Perl with Digest::SHA + openssl CLI)
    *     can still produce a valid frame.
    *
-   *   legacy (deprecated): "<nonce>:<hash> <command> [args...]"
-   *     hash = sha256(password ":" minute ":" nonce)
+   * The pre-PBKDF2 "<nonce>:<hash> <command>" scheme was removed in
+   * 0292ddb; anything without a ~A1/~A1c prefix is now unauthenticated and
+   * falls straight through to the "Auth failed" path below.  Clients still
+   * shipping it (bot_auth.pl < 3.0.0) must be upgraded, not re-supported.
    *
    * Plaintext under both v1 and v1c is "<timestamp>:<nonce>:<command> [args]".
-   * All formats populate the same dispatch variables and fall through to
+   * Both formats populate the same dispatch variables and fall through to
    * the existing command tree below. */
 
   char v1_plaintext[MAX_BUFFER];     /* v1 decrypted-payload working buffer */
@@ -513,6 +515,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   if (!is_admin && !is_op) {
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
     if (used_v1) secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+    /* Nothing below this point may run for an unauthenticated sender: bail
+     * rather than relying on every downstream branch staying guarded.
+     * `command` is still NULL here on the no-prefix path. */
+    return;
   }
 
   if (is_admin) {

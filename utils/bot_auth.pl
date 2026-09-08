@@ -20,7 +20,7 @@ use IPC::Open2 qw(open2);
 # Usage:
 #   /botcmd <bot_nick> <command> [args...]
 
-our $VERSION = '4.0.0';
+our $VERSION = '4.1.0';
 our %IRSSI = (
     authors     => 'rclemens',
     contact     => '',
@@ -55,6 +55,11 @@ sub aes_cbc_encrypt {
         $openssl, 'enc', '-aes-256-cbc',
         '-K', $enc_key_hex,
         '-iv', $iv_hex);
+    # Ciphertext is binary: keep any :utf8/:encoding layer another loaded
+    # irssi script may have pushed via ${^OPEN} off these handles, or the
+    # blob gets mangled and the bot rejects the HMAC.
+    binmode($CHILD_IN,  ':raw');
+    binmode($CHILD_OUT, ':raw');
     print $CHILD_IN $plaintext;
     close($CHILD_IN);
     local $/; my $ct = <$CHILD_OUT>;
@@ -120,7 +125,18 @@ sub cmd_bot_auth {
     my $blob = $salt . $iv . $ct . $mac;
     my $b64 = encode_base64($blob, '');
 
-    $server->command("quote PRIVMSG $bot_nick :~A1c $b64");
+    my $raw = "PRIVMSG $bot_nick :~A1c $b64";
+    # The server prepends ":nick!user@host " before relaying, and the 512-byte
+    # line limit counts it.  Refuse here rather than let the server silently
+    # truncate the blob — a truncated blob reaches the bot as an HMAC failure,
+    # which looks identical to a wrong password.
+    if (length($raw) + 100 + 2 > 512) {
+        return Irssi::print(
+            "Error: '$command_line' is too long — the ~A1c blob would be "
+          . "truncated on the wire. Shorten the command.");
+    }
+
+    $server->command("quote $raw");
     Irssi::print("Sent (~A1c) '$command_line' to $bot_nick.");
 }
 
