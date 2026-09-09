@@ -2,11 +2,26 @@ use strict;
 use warnings;
 use Irssi;
 use Irssi::Irc;
-use Crypt::KeyDerivation  qw(pbkdf2);          # CryptX
-use Crypt::AuthEnc::GCM   qw(gcm_encrypt_authenticate); # CryptX
-use Crypt::PRNG           qw(random_bytes);    # CryptX
-use MIME::Base64          qw(encode_base64);   # core
+use MIME::Base64 qw(encode_base64);   # core
 use Config;
+
+# CryptX is loaded at runtime, not with `use`, so a missing dependency reports
+# one actionable line in the irssi window instead of aborting the script with a
+# compile error and an @INC dump.  Functions are called fully qualified, so
+# nothing needs importing into this script's package.
+our $CRYPTX_OK = eval {
+    require Crypt::KeyDerivation;   # pbkdf2
+    require Crypt::AuthEnc::GCM;    # gcm_encrypt_authenticate
+    require Crypt::PRNG;            # random_bytes
+    1;
+};
+our $CRYPTX_ERR = $CRYPTX_OK ? '' : "$@";
+
+sub cryptx_hint {
+    return 'bot_auth: CryptX is not installed — this script cannot encrypt '
+         . 'without it.  Install one of:  sudo apt install libcryptx-perl  |  '
+         . 'cpan CryptX  |  cpanm CryptX';
+}
 
 # ircbot_irssi_auth.pl — v1 (~A1) admin-command client for ircbot, Irssi edition.
 #
@@ -47,11 +62,11 @@ our %IRSSI = (
 sub build_v1_payload {
     my ($password, $command_line) = @_;
 
-    my $salt = random_bytes(16);
-    my $iv   = random_bytes(12);
+    my $salt = Crypt::PRNG::random_bytes(16);
+    my $iv   = Crypt::PRNG::random_bytes(12);
 
     # PBKDF2-HMAC-SHA256, 100000 iterations, 32-byte key.
-    my $key = pbkdf2($password, $salt, 100000, 'SHA256', 32);
+    my $key = Crypt::KeyDerivation::pbkdf2($password, $salt, 100000, 'SHA256', 32);
 
     # Nonce: a positive decimal integer the bot parses with strtoull().  Use 62
     # bits so it is exact on both 64-bit and 32-bit perl builds and can never
@@ -61,19 +76,21 @@ sub build_v1_payload {
     # non-portable" under `use warnings` on 32-bit perl.
     my $nonce;
     if ($Config{ivsize} >= 8) {
-        my $nb = random_bytes(8);
+        my $nb = Crypt::PRNG::random_bytes(8);
         substr($nb, 0, 1) = chr(ord(substr($nb, 0, 1)) & 0x3F);
         $nonce = unpack('Q>', $nb);
     } else {
         # 32-bit perl: 48 bits of randomness, still far beyond the bot's
         # 4096-entry / 60-second replay ring.
-        my @b = unpack('C6', random_bytes(6));
+        my @b = unpack('C6', Crypt::PRNG::random_bytes(6));
         $nonce = 0;
         $nonce = $nonce * 256 + $_ for @b;
     }
 
     my $plaintext = sprintf('%d:%s:%s', time(), $nonce, $command_line);
-    my ($ct, $tag) = gcm_encrypt_authenticate('AES', $key, $iv, '', $plaintext);
+    my ($ct, $tag) =
+        Crypt::AuthEnc::GCM::gcm_encrypt_authenticate('AES', $key, $iv, '',
+                                                     $plaintext);
 
     # Best-effort scrub of the derived key and plaintext.  Perl may retain
     # copies (COW, realloc); this is hygiene, not a guarantee.
@@ -110,6 +127,8 @@ sub load_password {
 
 sub cmd_bot_auth {
     my ($data, $server, $witem) = @_;
+
+    return Irssi::print(cryptx_hint()) if !$CRYPTX_OK;
 
     if (!$server || !$server->{connected}) {
         $server = $witem->{server} if $witem && $witem->{server};
@@ -154,7 +173,12 @@ Irssi::settings_add_str('bot_auth', 'bot_auth_passfile', '');
 Irssi::command_bind('botcmd', \&cmd_bot_auth);
 
 Irssi::print("Bot Authenticator v$VERSION (~A1 / AES-256-GCM) loaded.");
-Irssi::print('Dependency: CryptX.  Set /set bot_auth_passfile <file> (chmod 600) '
-           . 'or /set bot_auth_password <pass>.');
+if ($CRYPTX_OK) {
+    Irssi::print('Set /set bot_auth_passfile <file> (chmod 600) '
+               . 'or /set bot_auth_password <pass>, then /botcmd <bot> <command>.');
+} else {
+    Irssi::print(cryptx_hint());
+    Irssi::print('/botcmd stays registered but will refuse to send until then.');
+}
 
 1;

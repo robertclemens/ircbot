@@ -32,9 +32,19 @@ import stat
 import time
 
 import weechat
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+# Imported defensively so a missing dependency shows one actionable line in the
+# client instead of an ImportError traceback at load time.
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    CRYPTO_OK = True
+except ImportError:
+    CRYPTO_OK = False
+
+CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
+               "script cannot encrypt without it.  Install one of:  "
+               "sudo apt install python3-cryptography  |  pip install cryptography")
 
 SCRIPT_NAME = "ircbot_weechat_auth"
 SCRIPT_AUTHOR = "rclemens"
@@ -100,6 +110,10 @@ def load_password():
 
 
 def botcmd_cb(data, buffer, args):
+    if not CRYPTO_OK:
+        weechat.prnt("", CRYPTO_HINT)
+        return weechat.WEECHAT_RC_OK
+
     parts = args.split(None, 1)
     if len(parts) < 2:
         weechat.prnt("", "Usage: /botcmd <bot_nick> <command> [args...]")
@@ -154,3 +168,7 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
         "  /set plugins.var.python.ircbot_weechat_auth.passfile /path/to/file  (chmod 600)\n"
         "  /set plugins.var.python.ircbot_weechat_auth.password <pass>",
         "", "botcmd_cb", "")
+    if not CRYPTO_OK:
+        weechat.prnt("", CRYPTO_HINT)
+        weechat.prnt("", "/botcmd stays registered but will refuse to send "
+                         "until then.")

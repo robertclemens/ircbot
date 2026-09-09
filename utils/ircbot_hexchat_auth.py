@@ -31,9 +31,19 @@ import stat
 import time
 
 import hexchat
-from cryptography.hazmat.primitives import hashes
-from cryptography.hazmat.primitives.ciphers.aead import AESGCM
-from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+# Imported defensively so a missing dependency shows one actionable line in the
+# client instead of an ImportError traceback at load time.
+try:
+    from cryptography.hazmat.primitives import hashes
+    from cryptography.hazmat.primitives.ciphers.aead import AESGCM
+    from cryptography.hazmat.primitives.kdf.pbkdf2 import PBKDF2HMAC
+    CRYPTO_OK = True
+except ImportError:
+    CRYPTO_OK = False
+
+CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
+               "script cannot encrypt without it.  Install one of:  "
+               "sudo apt install python3-cryptography  |  pip install cryptography")
 
 __module_name__ = "ircbot_hexchat_auth"
 __module_version__ = "5.0.0"
@@ -97,6 +107,10 @@ def load_password():
 
 
 def botcmd_cb(word, word_eol, userdata):
+    if not CRYPTO_OK:
+        hexchat.prnt(CRYPTO_HINT)
+        return hexchat.EAT_ALL
+
     if len(word) < 3:
         hexchat.prnt("Usage: /BOTCMD <bot_nick> <command> [args...]")
         hexchat.prnt("       /BOTCMD passfile <path>   |   /BOTCMD password <pass>")
@@ -147,5 +161,8 @@ def botcmd_cb(word, word_eol, userdata):
 
 hexchat.hook_command("BOTCMD", botcmd_cb,
                      help="/BOTCMD <bot_nick> <command> [args...]")
-hexchat.prnt("%s %s loaded (~A1 / AES-256-GCM). Dependency: cryptography."
+hexchat.prnt("%s %s loaded (~A1 / AES-256-GCM)."
              % (__module_name__, __module_version__))
+if not CRYPTO_OK:
+    hexchat.prnt(CRYPTO_HINT)
+    hexchat.prnt("/BOTCMD stays registered but will refuse to send until then.")
