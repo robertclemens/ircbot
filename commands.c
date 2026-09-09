@@ -175,7 +175,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
    * The pre-PBKDF2 "<nonce>:<hash> <command>" scheme was removed in
    * 0292ddb; anything without a ~A1/~A1c prefix is now unauthenticated and
    * falls straight through to the "Auth failed" path below.  Clients still
-   * shipping it (bot_auth.pl < 3.0.0) must be upgraded, not re-supported.
+   * shipping it (the irssi script before v3.0.0, now utils/ircbot_irssi_auth.pl)
+   * must be upgraded, not re-supported.
    *
    * Plaintext under both v1 and v1c is "<timestamp>:<nonce>:<command> [args]".
    * Both formats populate the same dispatch variables and fall through to

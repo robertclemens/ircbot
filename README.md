@@ -46,12 +46,19 @@ This project pairs with [irchub](https://github.com/robertclemens/irchub) — a 
         */5 * * * * /home/user/ircbot/ircbot 1>/dev/null 2>/dev/null
         ```
 
-5) To send commands to your bot, you will need to hash your DEFAULT_BOT_PASS that you defined in bot.h. The hash output is timebased and lasts for no more than 120 seconds. I have provided two methods for generating this hash:
-* Linux CLI: ./bot-auth.sh <DEFAULT_BOT_PASS> will output a hash you may send to your bot: 
-    * /msg botnick <hash_output> help
-* IRSSI Script: bot_auth.pl. You may "/script load bot_auth.pl" with bot_auth.pl in ~/.irssi/scripts/ or place in ~/.irssi/scripts/autorun/ for automatic loading upon starting irssi. 
-    * /set bot_auth_password <DEFAULT_BOT_PASS>
+5) To send commands to your bot, your IRC client encrypts each command with your admin password. The wire format is `~A1` (AES-256-GCM, key = PBKDF2-HMAC-SHA256 of your password); the bot rejects anything more than 30 seconds old or replayed. Ready-made client scripts live in `utils/`:
+* IRSSI: `ircbot_irssi_auth.pl` — needs CryptX (`cpan CryptX`). Put it in `~/.irssi/scripts/` and `/script load ircbot_irssi_auth.pl`, or `~/.irssi/scripts/autorun/` to load on start.
+    * /set bot_auth_passfile /path/to/passfile   (chmod 600; preferred)
+    * /set bot_auth_password <ADMIN_PASS>        (or store it in the irssi config)
     * /botcmd botnick help
+* HexChat: `ircbot_hexchat_auth.py` — needs `python3-cryptography`. Copy to `~/.config/hexchat/addons/`.
+    * /BOTCMD passfile /path/to/passfile
+    * /BOTCMD botnick help
+* WeeChat: `ircbot_weechat_auth.py` — needs `python3-cryptography`. Copy to `~/.weechat/python/` and `/python load ircbot_weechat_auth.py`.
+    * /set plugins.var.python.ircbot_weechat_auth.passfile /path/to/passfile
+    * /botcmd botnick help
+
+See `utils/README.txt` for the other transports and for why these scripts must not be reimplemented on top of the `openssl` CLI.
 
 ### Changelog
 

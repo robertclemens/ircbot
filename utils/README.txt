@@ -22,7 +22,12 @@ alone can produce it.  Use ~A1 when you do have the compiled bot-auth helper
 
 
 
-/* bot-auth.sh  (~A1c, pure openssl CLI) */
+/* bot-auth.sh  (~A1c, pure openssl CLI)  ***LEAKS YOUR PASSWORD*** */
+
+SECURITY WARNING: this script passes the admin password to openssl as
+`-kdfopt pass:"$password"` and the derived key as `enc -K <hex>`, both on the
+command line, where any local user can read them from ps(1) for the lifetime
+of the call.  Prefer a client script above.  See "WHY NOT openssl(1)".
 
 Builds a ~A1c payload using ONLY openssl(1) and standard coreutils.  No
 Python, no Perl modules, no compiled helpers.
@@ -34,7 +39,11 @@ Requires: openssl 3.0+ (for `openssl kdf -binary PBKDF2`).
 
 
 
-/* bot-auth.cmd  (~A1c, Windows batch + openssl + PowerShell) */
+/* bot-auth.cmd  (~A1c, Windows batch + openssl + PowerShell)  ***LEAKS*** */
+
+SECURITY WARNING: passes the password and derived key on the command line
+(readable via Win32_Process.CommandLine) and writes the derived keys and the
+plaintext to temp files.  Needs reworking before it should be relied on.
 
 Windows-native batch counterpart to bot-auth.sh.  Uses openssl.exe (ships
 with Git for Windows or any OpenSSL 3.x install) and PowerShell (built into
@@ -48,14 +57,67 @@ Sends the output to the bot:
 
 
 
-/* bot_auth.pl  (~A1c, Irssi, no CPAN modules) */
+/* ircbot_irssi_auth.pl  (~A1, Irssi, requires CryptX) */
 
-Irssi script.  Uses Digest::SHA (CORE Perl module, no install) for PBKDF2
-and HMAC; shells out to openssl(1) for AES-256-CBC.  CryptX is no longer
-required.
+Irssi script.  All crypto runs in-process via CryptX — PBKDF2 through
+Crypt::KeyDerivation and AES-256-GCM through Crypt::AuthEnc::GCM.
 
-    /set bot_auth_password your_admin_password
+    cpan CryptX            (or: apt install libcryptx-perl)
+    /set bot_auth_passfile /home/you/.ircbot_admin_pass    # preferred, chmod 600
+    /set bot_auth_password your_admin_password             # or store in irssi config
     /botcmd <bot_nick> <command> [args]
+
+NOTE: Crypt::PBKDF2 is a separate distribution and is NOT part of CryptX.
+This script deliberately uses CryptX's own Crypt::KeyDerivation::pbkdf2 so
+CryptX is the only dependency.
+
+WHY NOT openssl(1): `openssl enc` accepts a raw key only as `-K <hex>` on the
+command line, and `openssl kdf` takes the password only as `-kdfopt pass:...`.
+argv is world-readable via ps(1), so the CLI cannot be used for this protocol
+without leaking either the derived key or the admin password to every local
+user.  Do not "simplify" any of these scripts back onto the openssl CLI.
+
+
+/* ircbot_hexchat_auth.py  (~A1, HexChat, requires python3-cryptography) */
+
+HexChat Python script.  In-process PBKDF2 + AES-256-GCM.
+
+    pip install cryptography       (or: apt install python3-cryptography)
+    cp ircbot_hexchat_auth.py ~/.config/hexchat/addons/
+    /BOTCMD passfile /home/you/.ircbot_admin_pass          # preferred, chmod 600
+    /BOTCMD password your_admin_password                   # or store in prefs
+    /BOTCMD <bot_nick> <command> [args]
+
+
+/* ircbot_weechat_auth.py  (~A1, WeeChat, requires python3-cryptography) */
+
+WeeChat Python script.  In-process PBKDF2 + AES-256-GCM.
+
+    cp ircbot_weechat_auth.py ~/.weechat/python/   (or ~/.local/share/weechat/python/)
+    /python load ircbot_weechat_auth.py
+    /set plugins.var.python.ircbot_weechat_auth.passfile /home/you/.ircbot_admin_pass
+    /botcmd <bot_nick> <command> [args]
+
+Run /botcmd from a buffer on the bot's network — the script sends on that
+buffer's server.
+
+
+/* repartee — NOT CURRENTLY POSSIBLE */
+
+Repartee (https://repart.ee/) scripts run in a sandboxed Lua 5.4 environment
+with `os`, `io`, `loadfile`, `dofile` and `package` removed.  That leaves no
+way to build a ~A1/~A1c frame:
+
+  - no `package`/`require`  -> no crypto binding (luaossl, lua-openssl)
+  - no `os`                 -> no clock for the <unix_ts> envelope field
+  - no `io`                 -> no /dev/urandom
+
+`math.random` is not a CSPRNG; deriving a salt, GCM IV or nonce from it would
+silently destroy the security of every command sent.  A script here needs one
+of: a crypto helper exposed on repartee's own `api` table, a whitelisted
+`require`, or an api call that returns cryptographically secure random bytes
+plus wall-clock time.  Until then, generate the blob with another client's
+script (or a shell) and send it with repartee's raw-line command.
 
 
 
