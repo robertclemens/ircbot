@@ -27,6 +27,7 @@ static void state_init(bot_state_t *state) {
   memset(state, 0, sizeof(bot_state_t));
   state->status = S_NONE;
   state->log_type = DEFAULT_LOG_LEVEL;
+  state->bot_start_time = time(NULL);
   state->last_pong_time = time(NULL);
   state->nick_release_time = time(NULL) - NICK_TAKE_TIME;
   state->actual_hostname_ts = 0;

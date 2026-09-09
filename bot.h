@@ -32,6 +32,7 @@
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
 #define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
+#define BOT_LOG_FILE_SIZE (10 * 1024 * 1024) // 10MB cap; LOGFILE is truncated past this
 #define BOT_UPDATE_URL                                                         \
   "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
   "releases.txt"
@@ -329,6 +330,7 @@ struct bot_state {
   int server_count;
   int current_server_index;
   int nick_generation_attempt;
+  time_t bot_start_time;
   time_t connection_time;
   time_t last_pong_time;
   time_t nick_release_time;

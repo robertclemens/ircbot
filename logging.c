@@ -40,6 +40,14 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   vsnprintf(base_message, sizeof(base_message), format, args);
   va_end(args);
 
+  /* Callers end their format strings with "\n"; strip it so the trailing
+   * newline is added exactly once here (and never lands in the ring buffer,
+   * where an embedded newline would split the PRIVMSG the .log command sends). */
+  for (size_t i = strlen(base_message); i > 0; i--) {
+    if (base_message[i - 1] != '\n' && base_message[i - 1] != '\r') break;
+    base_message[i - 1] = '\0';
+  }
+
   char full_log_line[MAX_LOG_LINE_LEN];
   snprintf(full_log_line, sizeof(full_log_line), "[%s] %s", time_buf,
            base_message);
@@ -61,8 +69,26 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   }
 
 #ifdef DEBUG
-  printf("%s", full_log_line);
+  printf("%s\n", full_log_line);
 #endif
+
+  /* Enforce the BOT_LOG_FILE_SIZE ceiling before appending: past the cap the
+   * file is truncated rather than allowed to grow without bound. */
+  struct stat log_stat;
+  if (stat(LOGFILE, &log_stat) == 0 &&
+      log_stat.st_size >= (off_t)BOT_LOG_FILE_SIZE) {
+    int trunc_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (trunc_fd >= 0) {
+      FILE *trunc_stream = fdopen(trunc_fd, "a");
+      if (trunc_stream) {
+        fprintf(trunc_stream, "[%s] Log file truncated (size limit reached)\n",
+                time_buf);
+        fclose(trunc_stream);
+      } else {
+        close(trunc_fd);
+      }
+    }
+  }
 
   int log_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_APPEND, 0600);
   FILE *stream = (log_fd >= 0) ? fdopen(log_fd, "a") : NULL;

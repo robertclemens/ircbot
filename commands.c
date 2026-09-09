@@ -12,6 +12,14 @@
 
 #include "bot.h"
 
+/* Render an elapsed span as "0d 16h 31m 55s" for the status readout. */
+static void status_fmt_elapsed(char *buf, size_t len, time_t since) {
+  long d = (long)(time(NULL) - since);
+  if (since <= 0 || d < 0) d = 0;
+  snprintf(buf, len, "%ldd %ldh %ldm %lds", d / 86400, (d % 86400) / 3600,
+           (d % 3600) / 60, d % 60);
+}
+
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message) {
@@ -760,15 +768,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 #define ST_SEP  "+----------------------------------------------------------------------------"
 #define ST_FOOT "`----------------------------------------------------------------------------"
 #define ST_LINE "| "
-      /* Uptime */
+      /* Uptime — bot process lifetime, independent of any connection */
       char uptime_str[64];
-      if (state->connection_time > 0 && (state->status & S_CONNECTED)) {
-        long up = (long)(time(NULL) - state->connection_time);
-        snprintf(uptime_str, sizeof(uptime_str), "%ldd %ldh %ldm %lds",
-                 up/86400, (up%86400)/3600, (up%3600)/60, up%60);
-      } else {
+      if (state->bot_start_time > 0)
+        status_fmt_elapsed(uptime_str, sizeof(uptime_str), state->bot_start_time);
+      else
         snprintf(uptime_str, sizeof(uptime_str), "N/A");
-      }
 
       /* Network string — include port after hostname */
       char srv_buf[300] = "N/A";
@@ -789,7 +794,20 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                  state->server_list[state->current_server_index - 1]);
       }
       const char *srv = srv_buf;
-      const char *conn_str = (state->status & S_CONNECTED) ? "CONNECTED" : "DISCONNECTED";
+      /* Connected time on the Network line tracks the IRC link only */
+      char conn_buf[80];
+      if (state->status & S_CONNECTED) {
+        if (state->connection_time > 0) {
+          char irc_up_str[64];
+          status_fmt_elapsed(irc_up_str, sizeof(irc_up_str), state->connection_time);
+          snprintf(conn_buf, sizeof(conn_buf), "CONNECTED %s", irc_up_str);
+        } else {
+          snprintf(conn_buf, sizeof(conn_buf), "CONNECTED");
+        }
+      } else {
+        snprintf(conn_buf, sizeof(conn_buf), "DISCONNECTED");
+      }
+      const char *conn_str = conn_buf;
 
       /* Count active admins and opers */
       int admin_count = 0, oper_count = 0;
@@ -910,11 +928,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :+-[ Hub Config ]-------------------------------------------------------------\r\n", nick);
         if (state->hub_connected && state->current_hub[0]) {
           if (state->hub_connect_time > 0 && state->hub_authenticated) {
-            long hup = (long)(time(NULL) - state->hub_connect_time);
             char hub_up_str[64];
-            snprintf(hub_up_str, sizeof(hub_up_str), "%ldd %ldh %ldm %lds",
-                     hup/86400, (hup%86400)/3600, (hup%3600)/60, hup%60);
-            irc_printf(state, "PRIVMSG %s :| Hub    : %s (CONNECTED, UPTIME: %s)\r\n",
+            status_fmt_elapsed(hub_up_str, sizeof(hub_up_str),
+                               state->hub_connect_time);
+            irc_printf(state, "PRIVMSG %s :| Hub    : %s (CONNECTED %s)\r\n",
                        nick, state->current_hub, hub_up_str);
           } else {
             irc_printf(state, "PRIVMSG %s :| Hub    : %s (CONNECTED)\r\n",
