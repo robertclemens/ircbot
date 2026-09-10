@@ -166,10 +166,18 @@ void irc_note_refusal(bot_state_t *state, const char *text, bool ban_numeric) {
               ban_numeric ? "refused registration" : "ERROR", clean);
 
   /* A 465 is usually followed by an ERROR; keep both for the classifier.
-   * Truncation is harmless: bounded, and the telling words come early. */
+   * Truncation is harmless: bounded, and the telling words come early.
+   * Appended by hand -- an snprintf here trips gcc 8's -Wformat-truncation. */
+  const size_t cap = sizeof(state->irc_refusal);
   size_t off = strlen(state->irc_refusal);
-  snprintf(state->irc_refusal + off, sizeof(state->irc_refusal) - off, "%s%s",
-           off ? " | " : "", clean);
+  if (off > 0 && off + 3 + 1 < cap) { /* " | " plus >= 1 byte of text */
+    memcpy(state->irc_refusal + off, " | ", 3);
+    off += 3;
+  }
+  size_t n = strlen(clean);
+  if (n > cap - 1 - off) n = cap - 1 - off;
+  memcpy(state->irc_refusal + off, clean, n);
+  state->irc_refusal[off + n] = '\0';
 }
 
 /* Classify what this link was told, once, as it goes down (irc_disconnect). */
