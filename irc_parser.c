@@ -278,6 +278,13 @@ static void request_own_hostmask(bot_state_t *state) {
     irc_printf(state, "WHO %s\r\n", state->current_nick);
 }
 
+/* The trailing parameter ("... :text"), or all of params if there is none. */
+static const char *irc_trailing(const char *params) {
+  if (params[0] == ':') return params + 1;
+  const char *t = strstr(params, " :");
+  return t ? t + 2 : params;
+}
+
 void parser_handle_line(bot_state_t *state, char *line) {
   if (strncmp(line, "PING :", 6) == 0) {
     irc_printf(state, "PONG :%s\r\n", line + 6);
@@ -326,6 +333,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
   }
   if (strcmp(command, "001") == 0) {
     state->status |= S_AUTHED;
+    irc_note_registered(state); /* server accepted us: drop any ban hold */
     /* 001's first parameter is the nick the server actually registered us
      * under, which is not always the one we asked for (length truncation,
      * collision handling, a services rename).  Self-recognition in the 352
@@ -362,6 +370,16 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (!(state->status & S_AUTHED)) {
       irc_generate_new_nick(state);
     }
+  } else if (strcmp(command, "465") == 0 || strcmp(command, "463") == 0) {
+    /* ERR_YOUREBANNEDCREEP / ERR_NOPERMFORHOST: this server is refusing us.
+     * Only recorded here; irc_disconnect() classifies it and holds the server
+     * when the link drops.  (474 below is a channel ban, not a server one.) */
+    irc_note_refusal(state, irc_trailing(params), true);
+  } else if (strcmp(command, "ERROR") == 0) {
+    /* The server's last words before closing the link -- "Closing Link: ...
+     * (K-Lined)", "(Throttled: ...)", "(Ping timeout)".  Classified at
+     * disconnect alongside any 465/463. */
+    irc_note_refusal(state, irc_trailing(params), false);
   } else if (strcmp(command, "474") == 0) {
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);

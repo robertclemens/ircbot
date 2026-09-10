@@ -62,6 +62,15 @@
 #define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops)
 #define ROSTER_REFRESH_OPPED    360 // WHO interval (s) when already opped (peer discovery)
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
+/* IRC server refusals (bans / throttles) -- see irc_note_refusal().  A server
+ * that refuses the bot is skipped until its hold expires. */
+#define IRC_RECONNECT_MIN_INTERVAL 10 // Floor between any two IRC connect attempts
+#define IRC_THROTTLE_BACKOFF 60       // Throttled: first hold, doubling per strike...
+#define IRC_THROTTLE_BACKOFF_MAX 1800 // ...capped at 30 min
+#define IRC_BAN_BACKOFF 900           // Banned, no length stated: 15 min, doubling...
+#define IRC_BAN_BACKOFF_MAX 86400     // ...capped at 24 h
+#define IRC_BAN_STATED_MAX 2592000    // Clamp a server-stated ban length to 30 days
+#define IRC_BAN_GRACE 30              // Added to a stated ban length (clock skew)
 
 // Limits
 #define MAX_SERVERS 10 // Max number of servers to store
@@ -319,6 +328,26 @@ typedef struct {
   bool ed_pub_set;
 } hub_entry_t;
 
+/* Why a server_list[] slot is being skipped (irc_client.c). */
+typedef enum {
+  SB_NONE = 0,    /* eligible */
+  SB_THROTTLED,   /* "reconnecting too fast" / connection limits */
+  SB_BANNED,      /* banned, no length stated: escalating backoff */
+  SB_BANNED_TEMP, /* banned for a length the server stated */
+  SB_BANNED_PERM  /* server said permanent: never retried automatically */
+} server_block_kind_t;
+
+#define IRC_REFUSAL_LEN 256 /* stored server refusal text, sanitized */
+
+/* Per-server hold, parallel to server_list[].  Runtime only (not in the
+ * config): a restart, +server/-server, or 'jump <server>' clears it. */
+typedef struct {
+  server_block_kind_t kind;
+  time_t until;                 /* not retried before this (0 for PERM) */
+  int strikes;                  /* consecutive refusals since the last 001 */
+  char reason[IRC_REFUSAL_LEN]; /* what the server said, sanitized */
+} server_block_t;
+
 struct bot_state {
   int server_fd;
   int pid_fd;
@@ -336,6 +365,12 @@ struct bot_state {
   time_t current_nick_ts;
   int server_count;
   int current_server_index;
+  server_block_t server_blocks[MAX_SERVERS]; // ban/throttle holds, per slot
+  int irc_server_idx;          // server_list[] slot of the current/last attempt
+  time_t last_irc_attempt;     // enforces IRC_RECONNECT_MIN_INTERVAL
+  bool irc_refusal_ban;        // this link got 465 / 463
+  char irc_refusal[IRC_REFUSAL_LEN]; // this link's 465/463/ERROR text
+  bool irc_blocked_logged;     // "every server refusing" logged this episode
   int nick_generation_attempt;
   time_t bot_start_time;
   time_t connection_time;
@@ -441,6 +476,13 @@ void irc_handle_read(bot_state_t *state);
 void irc_check_status(bot_state_t *state);
 void irc_attempt_nick_change(bot_state_t *state, const char *new_nick);
 void irc_generate_new_nick(bot_state_t *state);
+/* Server refusal handling (irc_client.c) */
+void irc_note_refusal(bot_state_t *state, const char *text, bool ban_numeric);
+void irc_note_registered(bot_state_t *state);
+void irc_server_block_clear(bot_state_t *state, int idx);
+void irc_server_block_remove(bot_state_t *state, int idx);
+void irc_server_block_desc(const bot_state_t *state, int idx, char *buf,
+                           size_t len);
 void parser_handle_line(bot_state_t *state, char *line);
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,

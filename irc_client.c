@@ -1,4 +1,5 @@
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -12,7 +13,306 @@
 
 #include "bot.h"
 
+/* ---- Server refusals (bans / throttles) ----------------------------------
+ *
+ * A server that refuses the bot says why in a 465 (ERR_YOUREBANNEDCREEP) or
+ * 463 (ERR_NOPERMFORHOST) numeric and/or the ERROR line it sends before
+ * closing the link.  The parser hands that text to irc_note_refusal(); when
+ * the link drops, irc_disconnect() classifies it once and puts a hold on that
+ * server_list[] slot, which irc_connect() then skips.
+ *
+ *   ban wording + stated length  ("Temporary K-line 60 min.", "expires in 2h")
+ *        -> held for that long (+IRC_BAN_GRACE), never less than the
+ *           throttle backoff for the strike count
+ *   ban wording + "permanent"    -> never retried automatically
+ *   ban wording alone            -> IRC_BAN_BACKOFF doubling to _MAX: an
+ *           unlabelled temporary ban clears by itself, and an unlabelled
+ *           permanent one costs one connection attempt a day
+ *   "throttled", "too fast", "too many [connections]"
+ *        -> IRC_THROTTLE_BACKOFF doubling to _MAX
+ *
+ * Ban wording is a 465/463, or K-/G-/Z-/D-lined, AKILL, "banned", "not
+ * welcome".  Anything else -- ping timeout, KILL, the echo of our own QUIT --
+ * is an ordinary disconnect.  The text is server-controlled: it is sanitized
+ * (a lone CR/LF would inject IRC commands when 'status' echoes it), bounded,
+ * and parsed without overflow.  Holds are runtime-only; 'jump <server>',
+ * +server/-server and a restart clear them. */
+
+/* Server text, control bytes (including a lone CR or LF) replaced by '?'. */
+static void refusal_sanitize(char *dst, size_t cap, const char *src) {
+  size_t n = 0;
+  for (const unsigned char *p = (const unsigned char *)src; *p && n + 1 < cap;
+       p++)
+    dst[n++] = (*p < 0x20 || *p == 0x7f) ? '?' : (char)*p;
+  dst[n] = '\0';
+}
+
+/* Lower-cased, '-' dropped: "K-Lined", "k-line" and "KLINE" all read "kline". */
+static void refusal_fold(char *dst, size_t cap, const char *src) {
+  size_t n = 0;
+  for (; *src && n + 1 < cap; src++)
+    if (*src != '-') dst[n++] = (char)tolower((unsigned char)*src);
+  dst[n] = '\0';
+}
+
+/* needle at a word start (not preceded by a letter), so "unbanned" and
+ * "deadline" do not read as "banned" and "dline".  Returns the position just
+ * past the match, or NULL. */
+static const char *refusal_find(const char *hay, const char *needle) {
+  size_t nl = strlen(needle);
+  for (const char *p = strstr(hay, needle); p; p = strstr(p + 1, needle))
+    if (p == hay || !isalpha((unsigned char)p[-1])) return p + nl;
+  return NULL;
+}
+
+/* A length such as "60 min", "2 hours", "1h30m" starting at the first digit
+ * within 48 chars of s.  Only a known unit word counts, so a date ("2026/09")
+ * or "3 strikes" yields 0 (= unknown).  Digits are clamped while parsing, so
+ * hostile input cannot overflow; the result is capped at IRC_BAN_STATED_MAX. */
+static long long refusal_parse_duration(const char *s) {
+  static const struct { const char *word; long long secs; } units[] = {
+    {"s", 1}, {"sec", 1}, {"secs", 1}, {"second", 1}, {"seconds", 1},
+    {"m", 60}, {"min", 60}, {"mins", 60}, {"minute", 60}, {"minutes", 60},
+    {"h", 3600}, {"hr", 3600}, {"hrs", 3600}, {"hour", 3600}, {"hours", 3600},
+    {"d", 86400}, {"day", 86400}, {"days", 86400},
+    {"w", 604800}, {"wk", 604800}, {"week", 604800}, {"weeks", 604800},
+    {"mo", 2592000}, {"month", 2592000}, {"months", 2592000},
+    {"y", 31536000}, {"yr", 31536000}, {"year", 31536000}, {"years", 31536000},
+  };
+  const char *p = s;
+  for (int skipped = 0; *p && !isdigit((unsigned char)*p); p++)
+    if (++skipped > 48) return 0;
+
+  long long total = 0;
+  for (int pairs = 0; pairs < 4 && isdigit((unsigned char)*p); pairs++) {
+    long long n = 0;
+    for (; isdigit((unsigned char)*p); p++)
+      if (n < 1000000000LL) n = n * 10 + (*p - '0');
+    while (*p == ' ') p++;
+    char word[12];
+    size_t wl = 0;
+    for (; isalpha((unsigned char)*p); p++)
+      if (wl + 1 < sizeof(word)) word[wl++] = *p;
+    word[wl] = '\0';
+    long long unit = 0;
+    for (size_t i = 0; i < sizeof(units) / sizeof(units[0]); i++)
+      if (strcmp(word, units[i].word) == 0) { unit = units[i].secs; break; }
+    if (unit == 0) break;
+    total += n * unit; /* n < 1e10, unit < 3.2e7: no overflow */
+    if (total >= IRC_BAN_STATED_MAX) return IRC_BAN_STATED_MAX;
+    while (*p == ' ' || *p == ',') p++;
+  }
+  return total;
+}
+
+static server_block_kind_t refusal_classify(const char *text, bool ban_numeric,
+                                            long long *stated_secs) {
+  static const char *const ban_words[] = {"kline", "gline",    "zline",
+                                          "dline", "akill",    "autokill",
+                                          "banned", "not welcome"};
+  static const char *const throttle_words[] = {"throttl", "too fast",
+                                               "too many"};
+  char t[IRC_REFUSAL_LEN];
+  refusal_fold(t, sizeof(t), text);
+  *stated_secs = 0;
+
+  /* An oper KILL or the echo of our own QUIT carries free text that may say
+   * anything; neither is a ban. */
+  if (!ban_numeric && (strstr(t, "killed (") || strstr(t, "(quit:")))
+    return SB_NONE;
+
+  bool ban = ban_numeric;
+  for (size_t i = 0; !ban && i < sizeof(ban_words) / sizeof(ban_words[0]); i++)
+    if (refusal_find(t, ban_words[i])) ban = true;
+  if (ban) {
+    const char *after = refusal_find(t, "temporar");
+    if (!after) after = refusal_find(t, "expire");
+    if (after) {
+      *stated_secs = refusal_parse_duration(after);
+      return *stated_secs > 0 ? SB_BANNED_TEMP : SB_BANNED;
+    }
+    return refusal_find(t, "permanent") ? SB_BANNED_PERM : SB_BANNED;
+  }
+  for (size_t i = 0; i < sizeof(throttle_words) / sizeof(throttle_words[0]);
+       i++)
+    if (refusal_find(t, throttle_words[i])) return SB_THROTTLED;
+  return SB_NONE;
+}
+
+static long long refusal_backoff(long long base, int strikes, long long cap) {
+  long long s = base;
+  for (int i = 1; i < strikes && s < cap; i++) s *= 2;
+  return s < cap ? s : cap;
+}
+
+static void refusal_fmt_secs(char *buf, size_t len, long long s) {
+  if (s >= 86400)
+    snprintf(buf, len, "%lldd%lldh", s / 86400, (s % 86400) / 3600);
+  else if (s >= 3600)
+    snprintf(buf, len, "%lldh%02lldm", s / 3600, (s % 3600) / 60);
+  else if (s >= 60 && s % 60)
+    snprintf(buf, len, "%lldm%02llds", s / 60, s % 60);
+  else if (s >= 60)
+    snprintf(buf, len, "%lldm", s / 60);
+  else
+    snprintf(buf, len, "%llds", s);
+}
+
+void irc_note_refusal(bot_state_t *state, const char *text, bool ban_numeric) {
+  char clean[IRC_REFUSAL_LEN];
+  refusal_sanitize(clean, sizeof(clean), text ? text : "");
+  if (ban_numeric) state->irc_refusal_ban = true;
+  log_message(L_INFO, state, "[IRC] Server %s: %s\n",
+              ban_numeric ? "refused registration" : "ERROR", clean);
+
+  /* A 465 is usually followed by an ERROR; keep both for the classifier.
+   * Truncation is harmless: bounded, and the telling words come early. */
+  size_t off = strlen(state->irc_refusal);
+  snprintf(state->irc_refusal + off, sizeof(state->irc_refusal) - off, "%s%s",
+           off ? " | " : "", clean);
+}
+
+/* Classify what this link was told, once, as it goes down (irc_disconnect). */
+static void irc_apply_refusal(bot_state_t *state) {
+  if (state->irc_refusal[0] == '\0' && !state->irc_refusal_ban) return;
+
+  long long stated = 0;
+  server_block_kind_t kind =
+      refusal_classify(state->irc_refusal, state->irc_refusal_ban, &stated);
+  int idx = state->irc_server_idx;
+  if (kind != SB_NONE && idx >= 0 && idx < state->server_count) {
+    server_block_t *b = &state->server_blocks[idx];
+    time_t now = time(NULL);
+    if (b->strikes < 32) b->strikes++;
+
+    long long hold = 0;
+    if (kind == SB_THROTTLED) {
+      hold = refusal_backoff(IRC_THROTTLE_BACKOFF, b->strikes,
+                             IRC_THROTTLE_BACKOFF_MAX);
+    } else if (kind == SB_BANNED) {
+      hold = refusal_backoff(IRC_BAN_BACKOFF, b->strikes, IRC_BAN_BACKOFF_MAX);
+    } else if (kind == SB_BANNED_TEMP) {
+      /* Honour the stated length, but never redial faster than a throttle
+       * would -- a short or misread length must not become a tight loop. */
+      long long floor = refusal_backoff(IRC_THROTTLE_BACKOFF, b->strikes,
+                                        IRC_BAN_BACKOFF_MAX);
+      hold = stated + IRC_BAN_GRACE;
+      if (hold < floor) hold = floor;
+    }
+    b->kind = kind;
+    b->until = (kind == SB_BANNED_PERM) ? 0 : now + (time_t)hold;
+    snprintf(b->reason, sizeof(b->reason), "%s", state->irc_refusal);
+
+    char hold_s[32] = "", stated_s[32] = "";
+    refusal_fmt_secs(hold_s, sizeof(hold_s), hold);
+    refusal_fmt_secs(stated_s, sizeof(stated_s), stated);
+    if (kind == SB_BANNED_PERM)
+      log_message(L_INFO, state,
+                  "[BAN] %s: PERMANENT ban - will not reconnect to it until "
+                  "restart, 'jump %s', or re-adding it.\n",
+                  state->server_list[idx], state->server_list[idx]);
+    else if (kind == SB_BANNED_TEMP)
+      log_message(L_INFO, state,
+                  "[BAN] %s: temporary ban, server says %s - holding %s "
+                  "(strike %d).\n",
+                  state->server_list[idx], stated_s, hold_s, b->strikes);
+    else
+      log_message(L_INFO, state, "[BAN] %s: %s - holding %s (strike %d).\n",
+                  state->server_list[idx],
+                  kind == SB_THROTTLED ? "throttled" : "banned, no length given",
+                  hold_s, b->strikes);
+  }
+  state->irc_refusal[0] = '\0';
+  state->irc_refusal_ban = false;
+}
+
+/* 001: this server took us; forget any hold and strike count it had. */
+void irc_note_registered(bot_state_t *state) {
+  int idx = state->irc_server_idx;
+  if (idx < 0 || idx >= state->server_count) return;
+  if (state->server_blocks[idx].strikes > 0)
+    log_message(L_INFO, state, "[BAN] %s accepted us; hold cleared.\n",
+                state->server_list[idx]);
+  memset(&state->server_blocks[idx], 0, sizeof(server_block_t));
+}
+
+void irc_server_block_clear(bot_state_t *state, int idx) {
+  if (idx < 0 || idx >= MAX_SERVERS) return;
+  memset(&state->server_blocks[idx], 0, sizeof(server_block_t));
+  state->irc_blocked_logged = false;
+}
+
+/* -server: call BEFORE server_list[] is compacted (server_count unchanged). */
+void irc_server_block_remove(bot_state_t *state, int idx) {
+  int n = state->server_count;
+  if (idx < 0 || idx >= n) return;
+  memmove(&state->server_blocks[idx], &state->server_blocks[idx + 1],
+          (size_t)(n - 1 - idx) * sizeof(server_block_t));
+  memset(&state->server_blocks[n - 1], 0, sizeof(server_block_t));
+  if (state->irc_server_idx == idx)
+    state->irc_server_idx = -1; /* a refusal on this link now has no slot */
+  else if (state->irc_server_idx > idx)
+    state->irc_server_idx--;
+}
+
+/* "banned 42m", "throttled 55s", "banned, permanent", or "" if eligible. */
+void irc_server_block_desc(const bot_state_t *state, int idx, char *buf,
+                           size_t len) {
+  if (len == 0) return;
+  buf[0] = '\0';
+  if (idx < 0 || idx >= MAX_SERVERS) return;
+  const server_block_t *b = &state->server_blocks[idx];
+  if (b->kind == SB_BANNED_PERM) {
+    snprintf(buf, len, "banned, permanent");
+    return;
+  }
+  time_t now = time(NULL);
+  if (b->kind == SB_NONE || b->until <= now) return;
+  char left[32];
+  refusal_fmt_secs(left, sizeof(left), (long long)(b->until - now));
+  snprintf(buf, len, "%s %s", b->kind == SB_THROTTLED ? "throttled" : "banned",
+           left);
+}
+
+/* First slot at or after current_server_index (wrapping) that is not held;
+ * -1 when every configured server is refusing us (logged once per episode). */
+static int irc_pick_server(bot_state_t *state, time_t now) {
+  int n = state->server_count;
+  if (n <= 0) return -1;
+  int start = state->current_server_index;
+  if (start < 0 || start >= n) start = 0;
+
+  time_t soonest = 0;
+  for (int k = 0; k < n; k++) {
+    int i = (start + k) % n;
+    const server_block_t *b = &state->server_blocks[i];
+    if (b->kind == SB_BANNED_PERM) continue;
+    if (b->kind != SB_NONE && b->until > now) {
+      if (soonest == 0 || b->until < soonest) soonest = b->until;
+      continue;
+    }
+    state->irc_blocked_logged = false;
+    return i;
+  }
+  if (!state->irc_blocked_logged) {
+    state->irc_blocked_logged = true;
+    if (soonest) {
+      char wait_s[32];
+      refusal_fmt_secs(wait_s, sizeof(wait_s), (long long)(soonest - now));
+      log_message(L_INFO, state,
+                  "[BAN] Every configured server is refusing this bot; next "
+                  "attempt in %s.\n", wait_s);
+    } else {
+      log_message(L_INFO, state,
+                  "[BAN] Every configured server has permanently banned this "
+                  "bot; not reconnecting to IRC until restarted.\n");
+    }
+  }
+  return -1;
+}
+
 void irc_disconnect(bot_state_t *state) {
+  irc_apply_refusal(state);
   // Send QUIT first so the server removes the nick immediately.
   // Without this, NAT holds the TCP state and the nick ghosts until ping-timeout.
   if ((state->status & S_CONNECTED) && state->server_fd != -1) {
@@ -81,8 +381,14 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
 
 void irc_connect(bot_state_t *state) {
   if (state->server_fd != -1) return;
-  if (state->server_list[state->current_server_index] == NULL)
-    state->current_server_index = 0;
+  time_t attempt_now = time(NULL);
+  int pick = irc_pick_server(state, attempt_now);
+  if (pick < 0) return; /* everything held; irc_pick_server logged why */
+  state->current_server_index = pick;
+  state->irc_server_idx = pick;
+  state->last_irc_attempt = attempt_now;
+  state->irc_refusal[0] = '\0';
+  state->irc_refusal_ban = false;
 
   char server_str[256];
   snprintf(server_str, sizeof(server_str), "%s",
@@ -326,7 +632,12 @@ void irc_check_status(bot_state_t *state) {
 
   // --- IRC SERVER STATUS ---
   if (!(state->status & S_CONNECTED)) {
-    irc_connect(state);
+    /* Floor between attempts.  Without it a server that drops us before
+     * registration is redialled every main-loop tick (~1 s) -- the pattern
+     * that gets a host throttled and then Z-lined.  Per-server ban/throttle
+     * holds are applied inside irc_connect(). */
+    if (now - state->last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL)
+      irc_connect(state);
     return;
   }
 

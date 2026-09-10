@@ -586,6 +586,13 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s :Error: Server '%s' not in list.\r\n",
                      nick, arg1);
         } else {
+          /* An explicit jump overrides any ban/throttle hold on the target. */
+          char held[64];
+          irc_server_block_desc(state, target_idx, held, sizeof(held));
+          if (held[0])
+            log_message(L_INFO, state, "[BAN] %s: hold (%s) cleared by jump.\n",
+                        state->server_list[target_idx], held);
+          irc_server_block_clear(state, target_idx);
           state->current_server_index = target_idx;
           irc_printf(state, "QUIT :Jumping to %s...\r\n", arg1);
           irc_disconnect(state);
@@ -842,8 +849,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           bool is_cur = (state->current_server_index > 0 &&
                          i == state->current_server_index - 1 &&
                          (state->status & S_CONNECTED));
-          char entry[140];
-          snprintf(entry, sizeof(entry), "%s%s", is_cur ? "*" : " ", s);
+          char held[64], entry[200];
+          irc_server_block_desc(state, i, held, sizeof(held));
+          snprintf(entry, sizeof(entry), "%s%s%s%s%s", is_cur ? "*" : " ", s,
+                   held[0] ? " (" : "", held, held[0] ? ")" : "");
           int elen = (int)strlen(entry);
           if (soff > 0 && soff + 2 + elen < (int)sizeof(srv_line) - 1) {
             srv_line[soff++] = ','; srv_line[soff++] = ' ';
@@ -1583,6 +1592,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       if (state->server_count < MAX_SERVERS) {
         char *dup = strdup(arg1);
         if (!dup) return;
+        irc_server_block_clear(state, state->server_count); /* fresh slot */
         state->server_list[state->server_count++] = dup;
         state->server_list[state->server_count] = NULL;
         config_write_with_state_pass(state);
@@ -1602,6 +1612,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           break;
         }
       if (found_index != -1) {
+        irc_server_block_remove(state, found_index); /* before compaction */
         free(state->server_list[found_index]);
         for (int i = found_index; i < state->server_count - 1; i++)
           state->server_list[i] = state->server_list[i + 1];
@@ -1855,7 +1866,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
           irc_printf(
               state,
               "PRIVMSG %s :Syntax: jump [server] - Jump to the next IRC server, "
-              "or to a specific server by hostname (port-independent match).\r\n",
+              "or to a specific server by hostname (port-independent match). "
+              "Servers that banned or throttled the bot are skipped; naming one "
+              "clears its hold and retries it now.\r\n",
               nick);
         } else if (strcasecmp(arg1, "op") == 0) {
           irc_printf(state,
