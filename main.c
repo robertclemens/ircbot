@@ -10,6 +10,8 @@
 #include <strings.h>
 #include <sys/file.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
+#include <sys/resource.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -23,8 +25,39 @@ void ssl_init_openssl(void) {
   OpenSSL_add_ssl_algorithms();
 }
 
+/* Process hardening: keep secrets out of anything that lands on disk.
+ *
+ * PR_SET_DUMPABLE(0) suppresses the core dump on a crash.  Without it a
+ * crash hands every admin/oper plaintext password in user_records[] to
+ * /proc/sys/kernel/core_pattern -- on this host that pipes to
+ * systemd-coredump, i.e. straight to disk.  It also blocks same-uid ptrace
+ * attach, complementing kernel.yama.ptrace_scope.
+ *
+ * RLIMIT_CORE 0 covers the same ground and, unlike the dumpable flag
+ * (which the kernel resets to 1 on execve), is inherited across the
+ * updater's exec in utils.c.
+ *
+ * Neither defends against root.  See docs/admin_cmd_encryption.md.
+ * Called before any config or key material is loaded. */
+static void harden_process(void) {
+  struct rlimit rl = { 0, 0 };
+  setrlimit(RLIMIT_CORE, &rl);
+#ifdef PR_SET_DUMPABLE
+  prctl(PR_SET_DUMPABLE, 0, 0, 0, 0);
+#endif
+}
+
 static void state_init(bot_state_t *state) {
   memset(state, 0, sizeof(bot_state_t));
+  /* Lock the whole state into RAM so no part of it can reach swap or a
+   * hibernation image.  bot_state_t is ~301 KB against a 4 MB RLIMIT_MEMLOCK,
+   * so locking wholesale is cheaper than tracking individual fields and it
+   * covers user_records[] (every admin/oper plaintext password), hub_key[]
+   * (base64 of the combined private key), hub_session_key[], and anything
+   * secret added later.  Best-effort: a failure here is not fatal. */
+  if (mlock(state, sizeof(bot_state_t)) != 0)
+    fprintf(stderr, "Warning: mlock(state) failed (%s) - "
+                    "secrets may reach swap.\n", strerror(errno));
   state->status = S_NONE;
   state->log_type = DEFAULT_LOG_LEVEL;
   state->bot_start_time = time(NULL);
@@ -640,6 +673,7 @@ static void run_config_wizard(void) {
 }
 
 int main(int argc, char *argv[]) {
+  harden_process();
 #ifdef HAVE_CURL
   curl_global_init(CURL_GLOBAL_DEFAULT);
 #endif
