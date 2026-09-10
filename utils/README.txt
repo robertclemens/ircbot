@@ -150,18 +150,36 @@ runtime dependencies on openssl.exe / PowerShell.
 
 
 
-/* encrypt_config.c :: Compile instructions: gcc encrypt_config.c -o config_tool -lssl -lcrypto */
+/* encrypt_config.c :: Compile instructions: gcc -O2 -Wall encrypt_config.c -o encrypt_config -lcrypto */
 
-config_tool.c is a tool for generating a config file to use with the bot. This is normally not necessary but can provide
+    ./encrypt_config <plaintext_file> <encrypted_out>
+
+encrypt_config is a tool for generating a config file to use with the bot. This is normally not necessary but can provide
 a good way to generate all of the channels, usermasks, passwords, etc without having to send the commands to the bot which
 is useful for loading up many bots.
 
+The password is prompted for after the tool starts (twice, no echo); it is never given on the command line, where ps(1)
+and shell history would see it. For scripting, pipe it in instead: when stdin is not a terminal the first line of stdin
+is the password (echo pw | ./encrypt_config plain.txt .ircbot.cnf). The output is written mode 0600 via a temp file
+and rename, so a failed run never leaves a half-written config. Input over MAX_CONFIG_SIZE (the bot's load limit), and
+input that is not a plaintext config (e.g. an already-encrypted file), is refused.
 
 
-/* decrypt_config.c :: Compile instructions: gcc decrypt_config.c -o decyrpt_tool -lssl -lcrypto */
 
-decrypt_tool.c is a debugging tool to look at the contents of your config file. This is normally not necessary but helps
+/* decrypt_config.c :: Compile instructions: gcc -O2 -Wall decrypt_config.c -o decrypt_config -lcrypto */
+
+    ./decrypt_config [config_file]              (default: .ircbot.cnf)
+    ./decrypt_config .ircbot.cnf > plain.txt    (then encrypt_config plain.txt .ircbot.cnf; shred plain.txt)
+
+decrypt_config is a debugging tool to look at the contents of your config file. This is normally not necessary but helps
 debug issues with the bot.
+
+The password is prompted for after the tool starts (no echo), or piped in on stdin as above. stdout carries the raw
+plaintext and nothing else, so it can be redirected or piped; the prompt goes to the terminal and errors to stderr.
+
+Both tools share config_tool.h (must sit next to them when compiling); it takes SALT_SIZE, PBKDF2_ITERATIONS, MAX_PASS
+and MAX_CONFIG_SIZE from ../bot.h so the file format cannot drift from the bot's. Passwords longer than MAX_PASS-1
+characters are rejected rather than silently truncated.
 
 
 

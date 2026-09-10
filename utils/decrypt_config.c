@@ -1,110 +1,107 @@
-#include <openssl/err.h>
-#include <openssl/evp.h>
-#include <openssl/sha.h>
-#include <stdio.h>
-#include <stdlib.h>
-#include <string.h>
+/* decrypt_config.c -- dump a decrypted ircbot config.
+ *
+ * Usage: decrypt_config [config_file]        (default: .ircbot.cnf)
+ *
+ * The password is prompted for after start-up (echo off), or read as the first
+ * line of stdin when stdin is not a terminal -- never taken from argv.
+ * stdout carries the raw plaintext and nothing else, byte for byte, so it can
+ * be redirected or piped; the prompt goes to the terminal, errors to stderr.
+ *
+ * Build: gcc -O2 -Wall -o decrypt_config decrypt_config.c -lcrypto */
+#include "config_tool.h" /* first: sets the feature-test macro */
 
-#define SALT_SIZE 16     // Do not edit. This must match bot.h defines.
-#define GCM_IV_LEN 12    // Do not edit. This must match bot.h defines and is industry standard.
-#define GCM_TAG_LEN 16   // Do not edit. This must match bot.h defines and is industry standard.
-#define PBKDF2_ITERATIONS 100000  // Do not edit. This must match bot.h defines.
-
-void handle_crypto_errors(void) {
-    ERR_print_errors_fp(stderr);
-    abort();
+static void usage(const char *argv0) {
+  fprintf(stderr,
+          "Usage: %s [config_file]   (default: %s)\n"
+          "Prompts for the config password, then writes the raw plaintext "
+          "to stdout.\n"
+          "With stdin not a terminal, the first line of stdin is the "
+          "password.\n",
+          argv0, CONFIG_FILE);
 }
 
 int main(int argc, char *argv[]) {
-    if (argc != 3) {
-        fprintf(stderr, "Usage: %s <password> <encrypted_file>\n", argv[0]);
-        fprintf(stderr, "Example: %s \"my-super-secret-key\" .ircbot\n", argv[0]);
-        return 1;
-    }
+  tool_harden();
 
-    char *password = argv[1];
-    char *in_filename = argv[2];
+  if (argc > 2 || (argc == 2 && argv[1][0] == '-')) {
+    usage(argv[0]);
+    return 1;
+  }
+  const char *path = (argc == 2) ? argv[1] : CONFIG_FILE;
 
-    FILE *in_file = fopen(in_filename, "rb");
-    if (!in_file) {
-        perror("Error opening input file");
-        return 1;
-    }
+  /* Same bound as config_load(): the bot refuses ciphertext > MAX_CONFIG_SIZE.
+   * Read the file first so a bad path fails before the user types anything. */
+  unsigned char *file = NULL;
+  size_t file_len = 0;
+  if (!tool_read_file(path, CFG_HDR_LEN + 1, CFG_HDR_LEN + MAX_CONFIG_SIZE,
+                      &file, &file_len))
+    return 1;
 
-    unsigned char salt[SALT_SIZE];
-    if (fread(salt, 1, sizeof(salt), in_file) != sizeof(salt)) {
-        fprintf(stderr, "Error: Could not read Salt.\n");
-        fclose(in_file);
-        return 1;
-    }
+  const unsigned char *salt = file;
+  const unsigned char *iv = salt + SALT_SIZE;
+  unsigned char tag[GCM_TAG_LEN];
+  memcpy(tag, iv + GCM_IV_LEN, GCM_TAG_LEN);
+  const unsigned char *ct = file + CFG_HDR_LEN;
+  const int ct_len = (int)(file_len - CFG_HDR_LEN);
 
-    unsigned char iv[GCM_IV_LEN];
-    unsigned char tag[GCM_TAG_LEN];
-    if (fread(iv, 1, sizeof(iv), in_file) != sizeof(iv) ||
-        fread(tag, 1, sizeof(tag), in_file) != sizeof(tag)) {
-        fprintf(stderr, "Error: Could not read IV/Tag. Is the file corrupt or too small?\n");
-        fclose(in_file);
-        return 1;
-    }
+  int rc = 1, len = 0, plain_len = 0;
+  bool derived;
+  char password[MAX_PASS];
+  unsigned char key[CFG_KEY_LEN];
+  unsigned char *plain = NULL;
+  EVP_CIPHER_CTX *ctx = NULL;
+  tool_lock(password, sizeof(password));
+  tool_lock(key, sizeof(key));
 
-    fseek(in_file, 0, SEEK_END);
-    long ciphertext_len = ftell(in_file) - SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
-    fseek(in_file, SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN, SEEK_SET);
+  if (tool_read_password("Config password: ", password, sizeof(password)) < 0)
+    goto out;
+  derived = tool_derive_key(password, salt, key);
+  OPENSSL_cleanse(password, sizeof(password));
+  if (!derived) {
+    fprintf(stderr, "Error: key derivation failed.\n");
+    goto out;
+  }
 
-    if (ciphertext_len <= 0) {
-        fprintf(stderr, "Error: No ciphertext found in file.\n");
-        fclose(in_file);
-        return 1;
-    }
+  plain = malloc((size_t)ct_len);
+  ctx = EVP_CIPHER_CTX_new();
+  if (!plain || !ctx) {
+    fprintf(stderr, "Error: out of memory.\n");
+    goto out;
+  }
+  tool_lock(plain, (size_t)ct_len);
 
-    unsigned char *ciphertext = malloc(ciphertext_len);
-    if (!ciphertext) {
-        fprintf(stderr, "Error: Malloc failed for ciphertext buffer.\n");
-        fclose(in_file);
-        return 1;
-    }
-    fread(ciphertext, 1, ciphertext_len, in_file);
-    fclose(in_file);
+  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL) != 1 ||
+      EVP_DecryptInit_ex(ctx, NULL, NULL, key, iv) != 1 ||
+      EVP_DecryptUpdate(ctx, plain, &len, ct, ct_len) != 1 ||
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) != 1) {
+    fprintf(stderr, "Error: decryption setup failed.\n");
+    goto out;
+  }
+  plain_len = len;
+  /* GCM authenticates here: nothing is released unless the tag verifies. */
+  if (EVP_DecryptFinal_ex(ctx, plain + plain_len, &len) != 1) {
+    fprintf(stderr, "Error: decryption failed (wrong password, or the file "
+                    "is corrupt or not an ircbot config).\n");
+    goto out;
+  }
+  plain_len += len;
 
-    unsigned char key[32];
-    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
-                           salt, SALT_SIZE, PBKDF2_ITERATIONS,
-                           EVP_sha256(), 32, key) != 1) {
-        fprintf(stderr, "Error: Failed to derive key from password.\n");
-        free(ciphertext);
-        return 1;
-    }
+  if (!tool_write_all(STDOUT_FILENO, plain, (size_t)plain_len)) {
+    fprintf(stderr, "Error: writing to stdout: %s\n", strerror(errno));
+    goto out;
+  }
+  rc = 0;
 
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    unsigned char *plaintext = malloc(ciphertext_len + 1);
-    if (!plaintext) {
-        fprintf(stderr, "Error: Malloc failed for plaintext buffer.\n");
-        free(ciphertext);
-        return 1;
-    }
-    int len;
-    int plaintext_len;
-
-    EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv);
-    EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext, ciphertext_len);
-    EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
-
-    if (EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len) <= 0) {
-        fprintf(stderr, "Error: Decryption failed. The password or salt is incorrect or the file has been tampered with.\n");
-        handle_crypto_errors();
-        EVP_CIPHER_CTX_free(ctx);
-        free(ciphertext);
-        free(plaintext);
-        return 1;
-    }
-    plaintext_len += len;
-    plaintext[plaintext_len] = '\0';
-
-    EVP_CIPHER_CTX_free(ctx);
-    free(ciphertext);
-
-    printf("%s", plaintext);
-
-    free(plaintext);
-    return 0;
+out:
+  EVP_CIPHER_CTX_free(ctx);
+  tool_wipe_unlock(key, sizeof(key));
+  tool_wipe_unlock(password, sizeof(password));
+  if (plain) {
+    tool_wipe_unlock(plain, (size_t)ct_len);
+    free(plain);
+  }
+  tool_wipe_unlock(file, file_len);
+  free(file);
+  return rc;
 }
