@@ -112,6 +112,13 @@
   4096 // Nonce cache for secure communication. Prevents replay attacks
 #define NONCE_TTL_SECONDS 60 // Entries older than this are treated as empty
 typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
+/* Config-write debounce.  auth_find_user() bumps last_seen/last_used on every
+ * successful admin auth, which would otherwise mean a full config rewrite --
+ * including a PBKDF2 key derivation -- per admin command.  The main loop
+ * flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds instead.
+ * Mirrors irchub's hub.h:564 / hub_main.c:435. */
+#define CONFIG_WRITE_DEBOUNCE_S 5
+
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
 #define GCM_TAG_LEN                                                            \
   16 // 16 bytes (128 bits) is industry standard. Do not change
@@ -374,6 +381,7 @@ struct bot_state {
   mask_record_t mask_records[MAX_USER_MASKS];
   int mask_record_count;
   bool config_dirty;   // true when last_used/last_seen needs flushing
+  time_t last_config_write; // last debounced flush (CONFIG_WRITE_DEBOUNCE_S)
 
   // Network options (opt| record, hub-pushed)
   char opt_flags[MAX_OPT_FLAGS + 1];

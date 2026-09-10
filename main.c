@@ -71,6 +71,7 @@ static void state_init(bot_state_t *state) {
   state->mask_record_count = 0;
   state->trusted_bot_count = 0;
   state->config_dirty = false;
+  state->last_config_write = 0;
   hub_client_init(state);
   srand(time(NULL));
 }
@@ -800,6 +801,31 @@ int main(int argc, char *argv[]) {
   while (!(state.status & S_DIE) && !g_shutdown_flag) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
+
+    /* Debounced config flush.  auth_find_user() sets config_dirty whenever it
+     * bumps last_seen / last_used, which happens on every successful admin
+     * auth; writing on each one would cost a full config rewrite (PBKDF2
+     * included) per command.  Flush at most once every
+     * CONFIG_WRITE_DEBOUNCE_S seconds instead.  select() below has a 1 s
+     * timeout, so this is evaluated at least once a second.
+     *
+     * Local writer on purpose: these timestamps are this bot's own view of
+     * when a mask was last used against it.  Pushing them to the hub would
+     * generate mesh sync traffic for every admin command.  Records that the
+     * hub is authoritative for still propagate via their own paths
+     * (hub_client_push_admin_delta on +admin/-admin, etc.).
+     *
+     * The cleanup path after this loop calls config_write_with_state_pass()
+     * unconditionally, so a still-dirty flag is flushed on clean shutdown. */
+    {
+      time_t cfg_now = time(NULL);
+      if (state.config_dirty &&
+          (cfg_now - state.last_config_write) >= CONFIG_WRITE_DEBOUNCE_S) {
+        config_write_local_with_state_pass(&state);
+        state.config_dirty = false;
+        state.last_config_write = cfg_now;
+      }
+    }
 
     // --- HUB GATEKEEPER ---
     // Only execute hub logic if we actually have hubs configured

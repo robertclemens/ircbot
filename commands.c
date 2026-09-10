@@ -388,7 +388,10 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
     /* Identify the sender by hostmask BEFORE trusting any payload content.
      * auth_find_user updates last_seen/last_used and sets config_dirty even
-     * on the v1 path, so the hub stays in sync. */
+     * on the v1 path, so both formats record activity identically.  The flush
+     * is debounced and LOCAL (main.c, CONFIG_WRITE_DEBOUNCE_S) -- these
+     * timestamps are this bot's own view and are deliberately not pushed to
+     * the hub; that would mean mesh traffic per admin command. */
     time_t now_auth = time(NULL);
     user_record_t *candidate = auth_find_user(state, user_host, now_auth);
     if (!candidate || !candidate->is_active || candidate->password[0] == '\0') {
