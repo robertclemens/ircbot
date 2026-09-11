@@ -20,6 +20,90 @@ static void status_fmt_elapsed(char *buf, size_t len, time_t since) {
            (d % 3600) / 60, d % 60);
 }
 
+/* CMD-log redaction.  `secret` flags the argument positions that carry a
+ * password; those are logged as REDACT_MASK, never as typed.
+ * This is an allowlist: a verb missing from the table is logged without its
+ * name or arguments, because a mistyped command can put a password in any
+ * position.  A new command belongs here, with its secret arguments flagged. */
+#define REDACT_ARG1 1u
+#define REDACT_ARG2 2u
+#define REDACT_ARG3 4u
+#define REDACT_MASK "********"
+
+typedef struct {
+  const char *name;
+  unsigned secret;
+} cmd_log_rule_t;
+
+static const cmd_log_rule_t LOGGABLE_CMDS[] = {
+  {"botpass", REDACT_ARG1}, /* botpass <password> */
+  {"+admin",  REDACT_ARG2}, /* +admin <name> <password> <mask> */
+  {"+oper",   REDACT_ARG2}, /* +oper <name> <password> <mask> */
+  {"chpass",  REDACT_ARG2}, /* chpass <name> <newpassword> */
+  {"die", 0},      {"jump", 0},     {"join", 0},      {"part", 0},
+  {"op", 0},       {"invite", 0},   {"+bot", 0},      {"-bot", 0},
+  {"status", 0},   {"givenick", 0}, {"chnick", 0},    {"saveconf", 0},
+  {"setlog", 0},   {"getlog", 0},   {"admins", 0},    {"opers", 0},
+  {"match", 0},    {"-admin", 0},   {"-oper", 0},     {"+usermask", 0},
+  {"-usermask", 0}, {"+server", 0}, {"-server", 0},   {"update", 0},
+  {"+hub", 0},     {"-hub", 0},     {"rekey", 0},     {"help", 0},
+  {NULL, 0}
+};
+
+/* Append src to dst (current length *len, capacity cap), stopping at the cap.
+ * No escaping here: log_message neutralizes control bytes in every line. */
+static void cmd_log_append(char *dst, size_t cap, size_t *len,
+                           const char *src) {
+  for (; *src != '\0' && *len + 1 < cap; src++)
+    dst[(*len)++] = *src;
+  dst[*len] = '\0';
+}
+
+/* Log an authenticated admin/oper command to L_CMD as
+ *   [CMD_ADMIN] <account> (<nick!user@host>): <command> <args>
+ * with each secret argument replaced by REDACT_MASK.  The dispatcher reads
+ * only arg1..arg3 and drops the rest of the line, so nothing past arg3 is
+ * logged either. */
+static void log_user_command(bot_state_t *state, const char *tag,
+                             const user_record_t *who, const char *user_host,
+                             const char *command, const char *arg1,
+                             const char *arg2, const char *arg3) {
+  const cmd_log_rule_t *rule = NULL;
+  for (int i = 0; LOGGABLE_CMDS[i].name; i++) {
+    if (strcasecmp(command, LOGGABLE_CMDS[i].name) == 0) {
+      rule = &LOGGABLE_CMDS[i];
+      break;
+    }
+  }
+
+  char line[MAX_LOG_LINE_LEN];
+  size_t len = 0;
+  line[0] = '\0';
+  cmd_log_append(line, sizeof(line), &len, who ? who->name : "?");
+  cmd_log_append(line, sizeof(line), &len, " (");
+  cmd_log_append(line, sizeof(line), &len, user_host);
+  cmd_log_append(line, sizeof(line), &len, "): ");
+
+  if (!rule) {
+    cmd_log_append(line, sizeof(line), &len,
+                   "unrecognized command (not logged)");
+  } else {
+    cmd_log_append(line, sizeof(line), &len, rule->name);
+    const char *args[3] = {arg1, arg2, arg3};
+    for (int i = 0; i < 3 && args[i]; i++) {
+      cmd_log_append(line, sizeof(line), &len, " ");
+      cmd_log_append(line, sizeof(line), &len,
+                     (rule->secret & (1u << i)) ? REDACT_MASK : args[i]);
+    }
+  }
+  log_message(L_CMD, state, "[%s] %s\n", tag, line);
+}
+
+static void dispatch_user_command(bot_state_t *state, const char *nick,
+                                  user_record_t *auth_user, bool is_admin,
+                                  bool is_op, char *command, char *arg1,
+                                  char *arg2, char *arg3);
+
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message) {
@@ -78,7 +162,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
               (int)strlen(sender_bot_uuid),
               key, decrypted_data, tag);
 
-          if (decrypted_len >= 0) {
+          if (decrypted_len >= 0 &&
+              has_control_bytes(decrypted_data, (size_t)decrypted_len)) {
+            log_message(L_CMD, state,
+                        "[BOT-COMMS] Control character in command from %s; "
+                        "dropped\n", user_host);
+          } else if (decrypted_len >= 0) {
             decrypted_data[decrypted_len] = '\0';
 
             char *saveptr_bot;
@@ -297,6 +386,16 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     secure_wipe(plain, (size_t)plain_len);
     free(plain);
 
+    /* Reject, don't repair: a CR/LF in an argument would reach irc_printf
+     * and split into a second IRC command. */
+    if (has_control_bytes(v1_plaintext, (size_t)plain_len)) {
+      log_message(L_CMD, state,
+                  "[CMD] v1c auth: control character in command from %s; "
+                  "dropped\n", user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+
     /* Parse: <timestamp>:<nonce>:<command> [args] — same envelope as v1. */
     char *sp_v1c;
     char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1c);
@@ -347,9 +446,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     if (candidate->type == 'a') is_admin = true;
     if (candidate->type == 'o') is_op    = true;
 
+    /* No command text here: log_user_command records it, redacted. */
     log_message(L_DEBUG, state,
-                "[CMD_DEBUG] v1c Parsed: Cmd='%s' Arg1='%s' User='%s' Type=%c\n",
-                command, (arg1 ? arg1 : "NULL"),
+                "[CMD_DEBUG] v1c frame verified: User='%s' Type=%c\n",
                 candidate->name, candidate->type);
   } else if (strncmp(message, "~A1 ", 4) == 0) {
     /* ---- v1: AES-256-GCM-protected admin command ---- */
@@ -449,6 +548,15 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     secure_wipe(plain, (size_t)plain_len);
     free(plain);
 
+    /* Same framing rule as v1c: control bytes drop the whole command. */
+    if (has_control_bytes(v1_plaintext, (size_t)plain_len)) {
+      log_message(L_CMD, state,
+                  "[CMD] v1 auth: control character in command from %s; "
+                  "dropped\n", user_host);
+      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+      return;
+    }
+
     /* Parse: timestamp:nonce:command args */
     char *sp_v1;
     char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1);
@@ -507,9 +615,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     if (candidate->type == 'a') is_admin = true;
     if (candidate->type == 'o') is_op    = true;
 
+    /* No command text here: log_user_command records it, redacted. */
     log_message(L_DEBUG, state,
-                "[CMD_DEBUG] v1 Parsed: Cmd='%s' Arg1='%s' User='%s' Type=%c\n",
-                command, (arg1 ? arg1 : "NULL"),
+                "[CMD_DEBUG] v1 frame verified: User='%s' Type=%c\n",
                 candidate->name, candidate->type);
   }
 
@@ -522,9 +630,40 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     return;
   }
 
-  if (is_admin) {
-    log_message(L_CMD, state, "[CMD_ADMIN] Executing Admin Command...\n");
+  /* Every value a command stores lands in a '|'-delimited config line and
+   * hub record (o|uuid|name|password|add|last_seen|ts), where a '|' shifts
+   * the fields after it: `chpass me pw|add|0|<far future>` would plant a
+   * timestamp that outranks any later -oper. */
+  const char *const toks[] = {command, arg1, arg2, arg3};
+  bool has_delim = false;
+  for (size_t i = 0; i < sizeof(toks) / sizeof(toks[0]); i++)
+    if (toks[i] && strchr(toks[i], '|'))
+      has_delim = true;
 
+  if (has_delim) {
+    log_message(L_CMD, state, "[CMD] '|' in command from %s (%s); dropped\n",
+                auth_user->name, user_host);
+    irc_printf(state,
+               "PRIVMSG %s :Error: '|' is not allowed in commands.\r\n", nick);
+  } else {
+    log_user_command(state, is_admin ? "CMD_ADMIN" : "CMD_OP", auth_user,
+                     user_host, command, arg1, arg2, arg3);
+    dispatch_user_command(state, nick, auth_user, is_admin, is_op, command,
+                          arg1, arg2, arg3);
+  }
+  /* The decrypted command can carry a new password (chpass, +admin, +oper,
+   * botpass) and nothing points into it once dispatch has returned. */
+  secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+}
+
+/* The admin/oper command tree, split out of commands_handle_private_message
+ * so the caller wipes the decrypted command after every return path here.
+ * command/arg1..arg3 point into the caller's v1_plaintext. */
+static void dispatch_user_command(bot_state_t *state, const char *nick,
+                                  user_record_t *auth_user, bool is_admin,
+                                  bool is_op, char *command, char *arg1,
+                                  char *arg2, char *arg3) {
+  if (is_admin) {
     /* opt 'h' (OPT_HUB_ONLY_MUTATIONS): when set by the network, the bot
      * refuses local mutation of hub-authoritative records.  These commands
      * must be performed via hub_admin instead.  Help text also hides them. */
@@ -2000,8 +2139,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     }
 
   } else if (is_op) {
-    log_message(L_CMD, state, "[CMD_OP] Op command from %s: %s %s\n", user_host,
-                command, (arg1 ? arg1 : ""));
     if (strcasecmp(command, "op") == 0 && arg1) {
       char *saveptr_op;
       char *op_arg1 = strtok_r(arg1, " ", &saveptr_op);

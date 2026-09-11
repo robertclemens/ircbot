@@ -71,7 +71,11 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
         decoded_data + SALT_SIZE, ciphertext_len,
         (const unsigned char *)sender_uuid_aad, sender_uuid_aad_len,
         key, decrypted_data, tag);
-    if (decrypted_len >= 0) {
+    if (decrypted_len >= 0 &&
+        has_control_bytes(decrypted_data, (size_t)decrypted_len)) {
+      log_message(L_CMD, state,
+                  "[BOT-COMM] Control character in relayed command; dropped\n");
+    } else if (decrypted_len >= 0) {
       if (sender_uuid_aad)
         log_message(L_DEBUG, state,
                     "[BOT-COMM] Sender UUID AAD-verified: %s\n",

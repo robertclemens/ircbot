@@ -562,6 +562,17 @@ static inline bool is_valid_bot_nick(const char *nick) {
          strchr(nick, '|') == NULL;
 }
 
+/* True if buf[0..len) holds a C0 control byte (NUL, CR, LF, ...) or DEL.
+ * Decrypted admin/oper/bot commands that match are dropped whole: a CR/LF in
+ * an argument would otherwise split into a second IRC command. */
+static inline bool has_control_bytes(const void *buf, size_t len) {
+  const unsigned char *p = (const unsigned char *)buf;
+  for (size_t i = 0; i < len; i++)
+    if (p[i] < 0x20 || p[i] == 0x7f)
+      return true;
+  return false;
+}
+
 /* Returns true if option letter `c` is present in the network-pushed
  * opt_flags string.  `c` is matched as-is; flag letters are case-sensitive
  * (uppercase and lowercase are independent options). */

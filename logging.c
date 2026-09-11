@@ -47,6 +47,12 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
     if (base_message[i - 1] != '\n' && base_message[i - 1] != '\r') break;
     base_message[i - 1] = '\0';
   }
+  /* Any control byte left is part of logged data (hub- or IRC-supplied
+   * strings), not layout: shown as '?', a CR/LF can't forge a second entry
+   * or split `getlog`'s PRIVMSG, and ESC can't drive a reader's terminal. */
+  for (char *p = base_message; *p != '\0'; p++)
+    if ((unsigned char)*p < 0x20 || *p == 0x7f)
+      *p = '?';
 
   char full_log_line[MAX_LOG_LINE_LEN];
   snprintf(full_log_line, sizeof(full_log_line), "[%s] %s", time_buf,

@@ -349,6 +349,17 @@ void irc_disconnect(bot_state_t *state) {
   channel_list_reset_status(state);
 }
 
+/* True if buf[0..len) is exactly one IRC line: it ends in the "\r\n" every
+ * irc_printf format carries, with no CR, LF or NUL anywhere before that. */
+static bool irc_is_single_line(const char *buf, int len) {
+  if (len < 2 || buf[len - 2] != '\r' || buf[len - 1] != '\n')
+    return false;
+  for (int i = 0; i < len - 2; i++)
+    if (buf[i] == '\r' || buf[i] == '\n' || buf[i] == '\0')
+      return false;
+  return true;
+}
+
 int irc_printf(bot_state_t *state, const char *format, ...) {
   if (!(state->status & S_CONNECTED)) return -1;
   char buffer[MAX_BUFFER];
@@ -357,7 +368,17 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
   int len = vsnprintf(buffer, sizeof(buffer), format, args);
   va_end(args);
   if (len < 0) return -1;
-  if (len >= (int)sizeof(buffer)) len = (int)sizeof(buffer) - 1;
+  /* One command per call, always.  Commands are filtered where they arrive;
+   * this is the backstop for every other value that reaches a format (hub
+   * data, config, getlog replays).  A line vsnprintf had to truncate has lost
+   * its terminator, so it is refused too rather than sent half-formed. */
+  if (len >= (int)sizeof(buffer) || !irc_is_single_line(buffer, len)) {
+    int verb = (int)strcspn(buffer, " \r\n");
+    log_message(L_INFO, state,
+                "[IRC] Refused to send %.*s line: embedded line break or no "
+                "terminator\n", verb > 16 ? 16 : verb, buffer);
+    return -1;
+  }
   log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
   if (state->is_ssl) {
     int sent = SSL_write(state->ssl, buffer, len);
