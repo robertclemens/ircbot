@@ -267,33 +267,42 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
 
 /**
  * Generate config payload for hub sync
- * Includes: c|, m|, o|, a|, p|, h| (hostmask), n| (nick)
- * Excludes: s|, u|, g|, v|, l|, i|, k| (bot-specific)
+ * Includes: c| (channels), p| (bot password), h| (hostmask), n| (nick)
+ * Excludes: a|, o|, m| (hub-authoritative) and s|, u|, g|, v|, l|, i|, k|
+ * (bot-specific)
+ * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| and p| are omitted as well: the
+ * bot refuses join/part/chpass/botpass locally, so those records can only be
+ * the hub's own copy, and irchub's process_bot_config_push rejects them by
+ * type before any timestamp compare — pushing them would just log one
+ * REJECTED line per record on every connect.
  */
 void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
                                         int max_len) {
   int offset = 0;
   int written;
+  const bool hub_only = is_opt_set(state, OPT_HUB_ONLY_MUTATIONS);
 
   // Channels
-  for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    const char *op = c->is_managed ? "add" : "del";
-    log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
-                c->name, c->is_managed, op, (long)c->timestamp);
-    if (c->key[0] != '\0') {
-      written = snprintf(buffer + offset, max_len - offset,
-                         "c|%s|%s|%d|%s|%ld\n",
-                         c->name, c->key, (int)c->modes, op,
-                         (long)c->timestamp);
-    } else {
-      written = snprintf(buffer + offset, max_len - offset,
-                         "c|%s||%d|%s|%ld\n",
-                         c->name, (int)c->modes, op,
-                         (long)c->timestamp);
+  if (!hub_only) {
+    for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+      const char *op = c->is_managed ? "add" : "del";
+      log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
+                  c->name, c->is_managed, op, (long)c->timestamp);
+      if (c->key[0] != '\0') {
+        written = snprintf(buffer + offset, max_len - offset,
+                           "c|%s|%s|%d|%s|%ld\n",
+                           c->name, c->key, (int)c->modes, op,
+                           (long)c->timestamp);
+      } else {
+        written = snprintf(buffer + offset, max_len - offset,
+                           "c|%s||%d|%s|%ld\n",
+                           c->name, (int)c->modes, op,
+                           (long)c->timestamp);
+      }
+      if (written < 0 || written >= max_len - offset)
+        break;
+      offset += written;
     }
-    if (written < 0 || written >= max_len - offset)
-      break;
-    offset += written;
   }
 
   /* Admin/oper/mask records are hub-authoritative — bots receive them from hub,
@@ -302,8 +311,8 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
    * fields (channels, nick, hostmask) are included in the push payload.
    * The hub manages a|/o|/m| records via CMD_ADMIN_* commands only. */
 
-  // Bot communication password (p| line, unchanged)
-  if (state->bot_comm_pass[0] != '\0') {
+  // Bot communication password (p| line); hub-authoritative under opt 'h'
+  if (!hub_only && state->bot_comm_pass[0] != '\0') {
     written = snprintf(buffer + offset, max_len - offset, "p|%s|%ld\n",
                        state->bot_comm_pass, (long)state->bot_comm_pass_ts);
     if (written > 0 && written < max_len - offset) {
@@ -874,7 +883,13 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     {
       char flags[MAX_OPT_FLAGS + 1] = {0};
       long long ts = 0;
-      if (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1) {
+      /* The hub sends "O||<ts>" when every flag is cleared.  %[^|] fails on
+       * an empty field, so parse that form on its own or a clear never lands
+       * and the bot keeps enforcing e.g. opt 'h' after the network dropped it. */
+      bool ok = (data[0] == '|')
+                    ? (sscanf(data + 1, "%lld", &ts) == 1)
+                    : (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1);
+      if (ok) {
         if (ts >= state->opt_flags_ts) {
           int w = 0;
           for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
