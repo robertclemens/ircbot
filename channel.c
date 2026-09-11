@@ -108,12 +108,8 @@ void channel_manager_check_joins(bot_state_t *state) {
       if (c->i_am_opped) {
         c->op_request_pending = false;
         c->op_request_retry_count = 0;
-        // Refresh roster periodically to discover newly-joined trusted members.
-        if (now - c->last_who_request > ROSTER_REFRESH_OPPED) {
-          c->roster_count = 0;
-          irc_printf(state, "WHO %s\r\n", c->name);
-          c->last_who_request = now;
-        }
+        // No periodic WHO while opped: nothing reads the roster until we are
+        // deopped, and the MODE -o handler re-reads the channel then.
         continue;
       }
       bool should_refresh = false;

@@ -59,8 +59,7 @@
   10 // Time delay for trying to gain the target nick (outside of givenick cmd)
 #define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
 #define CHECK_LAG_TIMEOUT 60    // Lag timeout
-#define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops)
-#define ROSTER_REFRESH_OPPED    360 // WHO interval (s) when already opped (peer discovery)
+#define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops); opped bots WHO only on deop
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
 /* IRC server refusals (bans / throttles) -- see irc_note_refusal().  A server
  * that refuses the bot is skipped until its hold expires. */

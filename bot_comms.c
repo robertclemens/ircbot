@@ -110,18 +110,8 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
               char *bot_arg2 = strtok_r(NULL, " ", &saveptr_cmd);
               if (bot_arg2) {
                 chan_t *ic = channel_find(state, bot_arg1);
-                if (ic && ic->status == C_IN) {
-                  bool have_ops = false;
-                  for (int r = 0; r < ic->roster_count; r++) {
-                    if (strcasecmp(ic->roster[r].nick, state->current_nick) == 0 &&
-                        ic->roster[r].is_op) {
-                      have_ops = true;
-                      break;
-                    }
-                  }
-                  if (have_ops)
-                    irc_printf(state, "INVITE %s %s\r\n", bot_arg2, bot_arg1);
-                }
+                if (ic && ic->status == C_IN && ic->i_am_opped)
+                  irc_printf(state, "INVITE %s %s\r\n", bot_arg2, bot_arg1);
               }
             }
           }

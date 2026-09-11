@@ -126,23 +126,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                     char *bot_arg2 = strtok_r(NULL, " ", &saveptr_cmd);
                     if (bot_arg2) {
                       chan_t *ic = channel_find(state, bot_arg1);
-                      if (ic && ic->status == C_IN) {
-                        bool have_ops = false;
-                        for (int r = 0; r < ic->roster_count; r++) {
-                          if (strcasecmp(ic->roster[r].nick,
-                                         state->current_nick) == 0 &&
-                              ic->roster[r].is_op) {
-                            have_ops = true;
-                            break;
-                          }
-                        }
-                        if (have_ops) {
-                          log_message(L_INFO, state,
-                                      "[BOT-COMMS] Inviting %s to %s (bot req)\n",
-                                      bot_arg2, bot_arg1);
-                          irc_printf(state, "INVITE %s %s\r\n",
-                                     bot_arg2, bot_arg1);
-                        }
+                      if (ic && ic->status == C_IN && ic->i_am_opped) {
+                        log_message(L_INFO, state,
+                                    "[BOT-COMMS] Inviting %s to %s (bot req)\n",
+                                    bot_arg2, bot_arg1);
+                        irc_printf(state, "INVITE %s %s\r\n",
+                                   bot_arg2, bot_arg1);
                       }
                     }
                   }
@@ -675,15 +664,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
       }
       chan_t *ic = channel_find(state, inv_channel);
       if (ic && ic->status == C_IN) {
-        bool have_ops = false;
-        for (int r = 0; r < ic->roster_count; r++) {
-          if (strcasecmp(ic->roster[r].nick, state->current_nick) == 0 &&
-              ic->roster[r].is_op) {
-            have_ops = true;
-            break;
-          }
-        }
-        if (have_ops) {
+        /* i_am_opped, not our roster entry: the roster isn't re-read while
+         * we hold ops, so after a nick change our entry has the old nick. */
+        if (ic->i_am_opped) {
           irc_printf(state, "INVITE %s %s\r\n", nick, inv_channel);
           irc_printf(state, "PRIVMSG %s :Inviting you to %s\r\n",
                      nick, inv_channel);

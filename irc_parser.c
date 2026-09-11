@@ -103,78 +103,17 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
               c->op_request_retry_count = 0;
               log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
             } else {
-              // [RESTORED] Immediate Op Recovery Logic
-              log_message(
-                  L_INFO, state,
-                  "[INFO] I was DEOPPED in %s. Requesting help immediately.\n",
-                  channel);
-
-              bool found_helper = false;
-
-              // Only request if we aren't already pending (to prevent spam
-              // loops)
+              /* Deopped: re-read the channel before choosing a helper.  While
+               * we held ops the roster was never refreshed, so peers that left
+               * or renamed may still be listed and peers that joined are not.
+               * The 315 handler picks a trusted op from the fresh WHO and sends
+               * the request, with the usual rate limit and retries.  Skipped
+               * while a request is already pending; its timeout re-WHOs. */
+              log_message(L_INFO, state,
+                          "[INFO] I was DEOPPED in %s. Refreshing roster to "
+                          "find a trusted op.\n",
+                          channel);
               if (!c->op_request_pending) {
-                roster_entry_t *helpers[MAX_ROSTER_SIZE];
-                int helper_count = 0;
-
-                // 1. Scan existing roster for trusted bots that are OPs
-                for (int x = 0; x < c->roster_count; x++) {
-                  roster_entry_t *entry = &c->roster[x];
-                  if (entry->is_op &&
-                      auth_is_trusted_bot(state, entry->hostmask, NULL, 0)) {
-                    if (helper_count < MAX_ROSTER_SIZE) {
-                      helpers[helper_count++] = entry;
-                    }
-                  }
-                }
-
-                // 2. Pick one and request ops
-                if (helper_count > 0) {
-                  int random_index = rand() % helper_count;
-                  roster_entry_t *chosen_helper = helpers[random_index];
-                  time_t req_now = time(NULL);
-
-                  log_message(
-                      L_INFO, state,
-                      "[INFO] Found %d trusted ops. Requesting ops from: %s\n",
-                      helper_count, chosen_helper->nick);
-
-                  c->op_request_pending = true;
-                  c->last_op_request_time = req_now;
-                  found_helper = true;
-
-                  if (req_now - state->last_op_request_sent >= OP_REQUEST_MIN_INTERVAL) {
-                    // Try hub first - look up UUID for this helper
-                    bool sent_via_hub = false;
-                    {
-                      char uuid[64];
-                      if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
-                        sent_via_hub = hub_client_request_op(state, uuid, c->name);
-                      }
-                    }
-
-                    // Fallback to PRIVMSG if hub unavailable
-                    if (!sent_via_hub) {
-                      bot_comms_send_command(state, chosen_helper->nick,
-                                             "OPME %s", c->name);
-                    }
-                    state->last_op_request_sent = req_now;
-                  } else {
-                    log_message(L_DEBUG, state,
-                                "[OP-REQ] Rate limited deop recovery in %s; retry in %lds\n",
-                                c->name,
-                                (long)(OP_REQUEST_MIN_INTERVAL -
-                                       (req_now - state->last_op_request_sent)));
-                  }
-                }
-              }
-
-              // 3. If no helper found, trigger immediate roster refresh
-              if (!found_helper && !c->op_request_pending) {
-                log_message(L_DEBUG, state,
-                            "[DEBUG] No trusted ops found locally. Refreshing "
-                            "roster for %s\n",
-                            c->name);
                 c->roster_count = 0;
                 irc_printf(state, "WHO %s\r\n", c->name);
                 c->last_who_request = time(NULL);
