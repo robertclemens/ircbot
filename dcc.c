@@ -475,9 +475,10 @@ static void dcc_on_connect(bot_state_t *state, dcc_session_t *s) {
               s->user_host, s->peer);
   char line[400];
   snprintf(line, sizeof(line),
-           "%s: DCC chat open for %s. Send commands with /botcmd %s "
-           "<command>; the replies come back here. Anything that is not a "
-           "sealed command closes this chat. Idle limit: %d min.",
+           "%s: DCC chat open for %s. Type commands here or use /botcmd %s "
+           "<command> (the client script seals both); the replies come back "
+           "here. Anything that is not a sealed command closes this chat. "
+           "Idle limit: %d min.",
            s->botnick, s->name, s->botnick, DCC_IDLE_TIMEOUT / 60);
   dcc_queue_str(s, line);
 }

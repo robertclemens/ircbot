@@ -39,6 +39,16 @@ Usage:
     /botauth  <bot_nick>                       - drop the cached key, re-auth now
     /botforget <bot_nick>                      - drop the cached key (and pin)
 
+Sealed replies (on by default): commands go out as "~A2S <b64>", which asks
+the bot to seal its answers too ("~A2R <b64>", only this command's sender can
+open them).  They are shown in place, decrypted, behind a lock marker:
+    /set plugins.var.python.ircbot_weechat_auth.sealed_marker <text|off>
+         (default U+1F512)
+    /set plugins.var.python.ircbot_weechat_auth.sealed_replies off
+         (plain ~A2 / plaintext replies, for bots older than ~A2S)
+A marked line provably came from the bot; an unmarked "reply" did not go
+through this protection.
+
 DCC chat: `/botcmd <bot> dcc` makes the bot offer a passive DCC chat.  The
 bot never accepts connections: it connects to a port your client listens on,
 so open WeeChat's DCC port range (xfer.network.port_range) in your firewall
@@ -46,7 +56,8 @@ and set xfer.network.own_ip if you are behind NAT.  WeeChat cannot take a
 passive offer, so this script answers the bot's with a /dcc chat of its own
 (WeeChat listens, the bot connects out).  While the chat is open, /botcmd
 sends each sealed command down the chat instead of by PRIVMSG, and the bot
-answers there.
+answers there.  Plain text typed into the chat buffer is sealed the same way
+before it is sent (never sent as typed).
 
 Compare a bot's key fingerprint (printed here on every successful auth)
 against that bot's own 'status' output or hub_admin's bot list before
@@ -81,7 +92,7 @@ CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
 
 SCRIPT_NAME = "ircbot_weechat_auth"
 SCRIPT_AUTHOR = "rclemens"
-SCRIPT_VERSION = "6.0.0"
+SCRIPT_VERSION = "6.1.0"
 SCRIPT_LICENSE = "Public Domain"
 SCRIPT_DESC = "Sends ~A2 admin commands to ircbot (Curve25519 + AES-256-GCM, passwordless)"
 
@@ -208,13 +219,13 @@ def open_lockbox(key, botnick, mynick, tsn, b64):
     return pt
 
 
-def build_command(key, bot_pub64, botnick, mynick, command):
-    """Build one ~A2 sealed command.  `bot_pub64` is the bot's raw 64-byte
-    combined public key (as returned by open_lockbox).  Returns the line to
-    send.  Raises ValueError if the command must be refused (control byte,
-    or the finished line would exceed the 400-char budget)."""
+def _seal_command(key, bot_pub64, botnick, mynick, command, sealed):
+    """(line, reply_key): a ~A2S frame and its reply key when `sealed`, else a
+    ~A2 frame and None.  Raises ValueError if the command must be refused
+    (control byte, or the finished line would exceed the 400-char budget)."""
     if any(b < 0x20 or b == 0x7F for b in command.encode("utf-8")):
         raise ValueError("command contains a control character")
+    label = b"ircbot-A2S-v1" if sealed else b"ircbot-A2-v1"
 
     nonce = os.urandom(8).hex()
     pt = ("%d:%s:%s" % (int(time.time()), nonce, command)).encode("utf-8")
@@ -229,19 +240,61 @@ def build_command(key, bot_pub64, botnick, mynick, command):
     if dh1 == b"\x00" * 32 or dh2 == b"\x00" * 32:
         raise ValueError("key exchange produced a degenerate shared secret")
 
-    info = b"ircbot-A2-v1" + key.x_pub + bot_x_pub
-    km = HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub, info=info).derive(dh1 + dh2)
+    def kdf(lbl):
+        return HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub,
+                    info=lbl + key.x_pub + bot_x_pub).derive(dh1 + dh2)
+    km = kdf(label)
+    rk = kdf(b"ircbot-A2R-v1") if sealed else None
 
     iv = os.urandom(12)
-    aad = (b"ircbot-A2-v1\0" + _lc(botnick).encode("utf-8") + b"\0" +
+    aad = (label + b"\0" + _lc(botnick).encode("utf-8") + b"\0" +
            _lc(mynick).encode("utf-8"))
     ct_tag = AESGCM(km).encrypt(iv, pt, aad)
 
     frame = eph_pub + iv + ct_tag
-    line = "~A2 " + base64.b64encode(frame).decode("ascii")
+    line = ("~A2S " if sealed else "~A2 ") + base64.b64encode(frame).decode("ascii")
     if len(line) > 400:
         raise ValueError("command is too long (%d > 400 chars on the wire)" % len(line))
-    return line
+    return line, rk
+
+
+def build_command(key, bot_pub64, botnick, mynick, command):
+    """Build one ~A2 sealed command.  `bot_pub64` is the bot's raw 64-byte
+    combined public key (as returned by open_lockbox).  Returns the line to
+    send.  Raises ValueError if the command must be refused (control byte,
+    or the finished line would exceed the 400-char budget)."""
+    return _seal_command(key, bot_pub64, botnick, mynick, command, False)[0]
+
+
+def build_sealed_command(key, bot_pub64, botnick, mynick, command):
+    """Build one ~A2S command: like ~A2, but the bot seals its replies to it
+    (~A2R).  Returns (line, reply_key), the key being HKDF(same ikm, eph_pub,
+    "ircbot-A2R-v1" || my_x || bot_x).  Raises ValueError like build_command."""
+    return _seal_command(key, bot_pub64, botnick, mynick, command, True)
+
+
+def open_reply(reply_key, botnick, mynick, b64):
+    """Open one ~A2R reply to a ~A2S command, with that command's reply key and
+    context nicks.  Returns (seq, more, text): text is one piece of a reply
+    line, continued in the next frame when more is 1.  None on any failure."""
+    try:
+        frame = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if len(frame) < 28 or len(frame) > 28 + 264:
+        return None
+    aad = (b"ircbot-A2R-v1\0" + _lc(botnick).encode("utf-8") + b"\0" +
+           _lc(mynick).encode("utf-8"))
+    try:
+        pt = AESGCM(reply_key).decrypt(frame[:12], frame[12:], aad)
+    except Exception:
+        return None
+    head, sep, text = pt.partition(b":")
+    more, sep2, text = text.partition(b":")
+    if (not sep or not sep2 or not head.isdigit() or len(head) > 19
+            or more not in (b"0", b"1")):
+        return None
+    return int(head), more == b"1", text.decode("utf-8", errors="replace")
 
 
 # =============================================================================
@@ -293,6 +346,74 @@ _KEY_CACHE = {}   # (server, bot_lc) -> bot_pub64 (raw 64 bytes)
 _PENDING = {}     # same key         -> (tsn, send_time)
 _QUEUE = {}       # same key         -> [command_line, ...]
 _DCC_NICK = {}    # same key         -> our nick when we asked for the DCC chat
+_REPLY_KEYS = {}  # same key         -> [{rk, bot, me, t, next, part}, ...] newest first
+_NOTED = {}       # same key         -> time of the last "could not open" note
+_OWN_ECHO = {}    # frame typed for us into a bot chat -> the text as typed
+
+REPLY_KEY_TTL = 600       # seconds a ~A2S reply key lives after its last use
+MAX_REPLY_KEYS = 8        # reply keys kept per bot
+DEFAULT_MARKER = "\U0001F512"
+
+
+def _sealed_on():
+    return weechat.config_get_plugin("sealed_replies") != "off"
+
+
+def _marked(text):
+    m = weechat.config_get_plugin("sealed_marker")
+    m = "" if m == "off" else m
+    return "%s %s" % (m, text) if m else text
+
+
+def _remember_reply_key(ck, rk, bot, me):
+    """A ~A2S command's reply key, with the nicks its replies are bound to."""
+    keys = _REPLY_KEYS.setdefault(ck, [])
+    keys.insert(0, {"rk": rk, "bot": bot, "me": me, "t": time.time(),
+                    "next": 0, "part": ""})
+    del keys[MAX_REPLY_KEYS:]
+
+
+def _reply_text(ck, b64):
+    """One ~A2R frame from a bot, tried against the keys of the commands we
+    sealed to it (newest first): ("show", line) for a complete reply line,
+    ("hold", None) for a piece of a longer line or a repeat, ("bad", None) if
+    no key opens it.  A missing piece is marked "[...]" in the joined line."""
+    now = time.time()
+    keys = [e for e in _REPLY_KEYS.get(ck, []) if now - e["t"] <= REPLY_KEY_TTL]
+    _REPLY_KEYS[ck] = keys
+    for e in keys:
+        got = open_reply(e["rk"], e["bot"], e["me"], b64)
+        if got is None:
+            continue
+        seq, more, text = got
+        if seq < e["next"]:
+            return "hold", None
+        if seq > e["next"] and e["part"]:
+            e["part"] += " [...] "
+        e["next"], e["t"] = seq + 1, now
+        e["part"] += text
+        if more:
+            return "hold", None
+        line, e["part"] = e["part"], ""
+        return "show", line
+    return "bad", None
+
+
+def _note_unopened(ck, nick):
+    if time.time() - _NOTED.get(ck, 0) < 30:
+        return
+    _NOTED[ck] = time.time()
+    weechat.prnt("", "bot_auth: a sealed reply from %s could not be opened (it "
+                     "answers a command this session did not send); hidden." % nick)
+
+
+def _reply_for(ck, nick, text):
+    """A ~A2R frame as the marked line to show, or None to show nothing (a
+    piece of a longer line, a repeat, or a frame no key opens)."""
+    st, line = _reply_text(ck, text[5:].strip()) if CRYPTO_OK else ("bad", None)
+    if st == "bad":
+        _note_unopened(ck, nick)
+    return _marked(line) if st == "show" else None
 
 
 def _load_key_pref():
@@ -347,6 +468,35 @@ def _dcc_chat_buffer(server, bot_nick):
     return found
 
 
+def _xfer_chat_of(buffer):
+    """(server, remote nick) of the open DCC chat shown in buffer, or None."""
+    found = None
+    il = weechat.infolist_get("xfer", "", "")
+    if il:
+        while not found and weechat.infolist_next(il):
+            if (weechat.infolist_pointer(il, "buffer") == buffer
+                    and weechat.infolist_string(il, "type_string") in ("chat_recv", "chat_send")
+                    and weechat.infolist_string(il, "status_string") == "active"):
+                found = (weechat.infolist_string(il, "plugin_id"),
+                         weechat.infolist_string(il, "remote_nick"))
+        weechat.infolist_free(il)
+    return found
+
+
+def _seal_for(ck, bot_nick, as_nick, key, bot_pub64, command_line):
+    """The frame for one command (~A2S with its reply key kept, or ~A2 when
+    sealed replies are off), or None if it must be refused (printed)."""
+    try:
+        line, rk = _seal_command(key, bot_pub64, bot_nick, as_nick, command_line,
+                                 _sealed_on())
+    except ValueError as exc:
+        weechat.prnt("", "bot_auth: %s" % exc)
+        return None
+    if rk:
+        _remember_reply_key(ck, rk, bot_nick, as_nick)
+    return line
+
+
 def _send_command(buffer, server, mynick, key, bot_nick, bot_pub64, command_line):
     """A command goes down the bot's DCC chat when one is open, else by
     PRIVMSG.  On the chat the bot takes the sender nick to be the one that
@@ -354,10 +504,8 @@ def _send_command(buffer, server, mynick, key, bot_nick, bot_pub64, command_line
     ck = (server, _lc(bot_nick))
     chat = _dcc_chat_buffer(server, bot_nick)
     as_nick = _DCC_NICK.get(ck, mynick) if chat else mynick
-    try:
-        line = build_command(key, bot_pub64, bot_nick, as_nick, command_line)
-    except ValueError as exc:
-        weechat.prnt("", "bot_auth: %s" % exc)
+    line = _seal_for(ck, bot_nick, as_nick, key, bot_pub64, command_line)
+    if not line:
         return
     if chat:
         weechat.command(chat, line)   # text, not a /command: sent down the chat
@@ -454,6 +602,7 @@ def cb_botforget(data, buffer, args):
     _PENDING.pop(ck, None)
     _QUEUE.pop(ck, None)
     _DCC_NICK.pop(ck, None)
+    _REPLY_KEYS.pop(ck, None)
 
     pinfile = weechat.config_get_plugin("pinfile")
     if pinfile:
@@ -489,11 +638,21 @@ def _parse_in_line(line, verb):
     return nick, text
 
 
+def _in_reply(server, string, nick, text):
+    """A ~A2R PRIVMSG/NOTICE: the raw line with the frame replaced by the
+    marked plaintext, or "" to drop it (see _reply_for)."""
+    line = _reply_for((server, _lc(nick)), nick, text)
+    i = string.find(" :~A2R ")
+    return string[:i + 2] + line if line is not None and i >= 0 else ""
+
+
 def cb_notice(data, modifier, modifier_data, string):
     parsed = _parse_in_line(string, "NOTICE")
     if not parsed:
         return string
     nick, text = parsed
+    if text.startswith("~A2R "):
+        return _in_reply(modifier_data, string, nick, text)
     if not text.startswith("~A2K "):
         return string
 
@@ -560,6 +719,8 @@ def cb_privmsg(data, modifier, modifier_data, string):
     if not parsed:
         return string
     nick, text = parsed
+    if text.startswith("~A2R "):
+        return _in_reply(modifier_data, string, nick, text)
     f = text.strip("\x01").split()
     if (not (text.startswith("\x01DCC ") and len(f) == 6 and f[1].upper() == "CHAT"
              and f[4] == "0") or (modifier_data, _lc(nick)) not in _DCC_NICK):
@@ -570,14 +731,58 @@ def cb_privmsg(data, modifier, modifier_data, string):
 
 
 def cb_print(data, modifier, modifier_data, string):
-    """A command sent down a DCC chat is echoed there as our own line; the
-    frame is protocol traffic, so hide it.  modifier_data is "<buffer
-    pointer>;<tags>" (older WeeChat: "<plugin>;<buffer name>;<tags>")."""
-    if not string.split("\t", 1)[-1].startswith("~A2 "):
+    """Lines of a DCC chat.  A command sent down it is echoed as our own line:
+    the frame is protocol traffic, so it is hidden -- or, for text typed into
+    the chat (cb_input_text), shown as typed.  A bot's ~A2R reply is shown
+    decrypted and marked.  modifier_data is "<buffer pointer>;<tags>" (older
+    WeeChat: "<plugin>;<buffer name>;<tags>")."""
+    prefix, sep, msg = string.partition("\t")
+    if not sep or not msg.startswith(("~A2 ", "~A2S ", "~A2R ")):
         return string
     first = modifier_data.split(";", 1)[0]
     plugin = weechat.buffer_get_string(first, "plugin") if first.startswith("0x") else first
-    return "" if plugin == "xfer" else string
+    if plugin != "xfer":
+        return string
+    if msg.startswith("~A2R "):
+        chat = _xfer_chat_of(first) if first.startswith("0x") else None
+        line = _reply_for((chat[0], _lc(chat[1])), chat[1], msg) if chat else None
+        return prefix + "\t" + line if line is not None else ""
+    typed = _OWN_ECHO.pop(msg, None)
+    return prefix + "\t" + typed if typed is not None else ""
+
+
+def cb_input_text(data, modifier, modifier_data, string):
+    """Text typed into the chat buffer of a bot we asked for a DCC chat: the
+    chat only carries sealed frames (the bot closes it on anything else), so
+    the text is sealed like /botcmd -- and shown as typed (cb_print).  If it
+    cannot be sealed it is not sent.  Commands, frames and chats with anyone
+    else pass untouched."""
+    text = weechat.string_input_for_buffer(string)
+    if not text or text.startswith(("~A2 ", "~A2S ")):
+        return string
+    if weechat.buffer_get_string(modifier_data, "plugin") != "xfer":
+        return string
+    chat = _xfer_chat_of(modifier_data)
+    if not chat or (chat[0], _lc(chat[1])) not in _DCC_NICK:
+        return string
+    server, bot_nick = chat
+    ck = (server, _lc(bot_nick))
+    if not CRYPTO_OK:
+        weechat.prnt("", CRYPTO_HINT)
+        return ""
+    key, err = _load_key_pref()
+    bot_pub64 = _KEY_CACHE.get(ck)
+    if err or not bot_pub64:
+        weechat.prnt("", "bot_auth: %s -- not sent"
+                     % (err or "no key for %s this session (/botauth %s)" % (bot_nick, bot_nick)))
+        return ""
+    line = _seal_for(ck, bot_nick, _DCC_NICK[ck], key, bot_pub64, text)
+    if not line:
+        return ""
+    if len(_OWN_ECHO) > 32:
+        _OWN_ECHO.clear()
+    _OWN_ECHO[line] = text
+    return line
 
 
 def cb_timer(data, remaining_calls):
@@ -592,6 +797,10 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
         weechat.config_set_plugin("keyfile", "")
     if not weechat.config_is_set_plugin("pinfile"):
         weechat.config_set_plugin("pinfile", "")
+    if not weechat.config_is_set_plugin("sealed_replies"):
+        weechat.config_set_plugin("sealed_replies", "on")
+    if not weechat.config_is_set_plugin("sealed_marker"):
+        weechat.config_set_plugin("sealed_marker", DEFAULT_MARKER)
 
     weechat.hook_command(
         "botcmd",
@@ -616,6 +825,7 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
     weechat.hook_modifier("irc_in2_notice", "cb_notice", "")
     weechat.hook_modifier("irc_in2_privmsg", "cb_privmsg", "")
     weechat.hook_modifier("weechat_print", "cb_print", "")
+    weechat.hook_modifier("input_text_for_buffer", "cb_input_text", "")
     weechat.hook_timer(5000, 0, 0, "cb_timer", "")
 
     if not CRYPTO_OK:

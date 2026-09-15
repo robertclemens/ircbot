@@ -60,6 +60,33 @@ Old password-based scripts (~A1 / ~A1c) no longer work: the bot ignores them.
 
 
 
+// Sealed replies: the bot's answers are encrypted too
+
+    you -> bot   PRIVMSG  ~A2S <sealed command>            "and seal your answer"
+    bot -> you   PRIVMSG  ~A2R <sealed reply>              one per reply line (long lines: several)
+
+The irssi, HexChat and WeeChat scripts send ~A2S by default.  Only the
+sender of that one command can open the answers, and the script shows each
+one in place of the frame, decrypted, behind a lock:
+
+    <pwbot1> 🔒 | Pubkey   : H4Z+...
+
+A marked line provably came from the bot (only the bot and you can make it);
+an unmarked "reply" did not go through this protection.  Settings:
+
+    irssi     /set bot_auth_sealed_marker <text>     (empty = no marker)
+              /set bot_auth_sealed_replies OFF        (plain ~A2 again)
+    HexChat   /BOTCMD marker <text|off>     /BOTCMD sealed <on|off>
+    WeeChat   /set plugins.var.python.ircbot_weechat_auth.sealed_marker <text|off>
+              /set plugins.var.python.ircbot_weechat_auth.sealed_replies off
+
+Turn it off only for a bot older than ~A2S (it ignores ~A2S, so you would
+get no answer at all).  A plain ~A2 is still answered in plaintext, which is
+what mIRC (bot-auth.mrc) sends.  CLI: bot-auth cmd ... --sealed / bot-auth
+reply, below.
+
+
+
 // DCC chat (admins): long replies without IRC's flood pacing
 
     /botcmd <bot_nick> dcc
@@ -82,13 +109,18 @@ broadcast), and gives up after 120 s without a reply or 20 s of connecting.
     other     any client: /dcc chat <bot_nick> while the bot's offer is open
 
 While the chat is open, /botcmd <bot_nick> ... sends each sealed command down
-the chat instead of by PRIVMSG, and the bot answers on the chat.  A command
-sent by PRIVMSG is still answered by PRIVMSG.  The chat is only a transport:
-every line on it must be a sealed ~A2 frame from the admin who asked, for the
-nicks the chat was opened under (a later nick change on either side does not
-matter).  Anything else -- typed text, a replay, another user's key -- closes
-the chat, as does an hour without a command.  The CLI (bot-auth cmd) makes
-frames that work on a chat too: paste the line into the chat window.
+the chat instead of by PRIVMSG, and the bot answers on the chat.  With the
+irssi, HexChat or WeeChat script you can also just type commands into the
+chat window: the script seals each line before it is sent and shows it as
+typed, and the (sealed) answers show decrypted -- the chat reads like any
+other.  If the script cannot seal a line (no key cached, key file error) it
+does not send it.  A command sent by PRIVMSG is still answered by PRIVMSG.
+The chat is only a transport: every line on it must be a sealed ~A2/~A2S
+frame from the admin who asked, for the nicks the chat was opened under (a
+later nick change on either side does not matter).  Anything else -- typed
+text without the script, a replay, another user's key -- closes the chat, as
+does an hour without a command.  The CLI (bot-auth cmd) makes frames that
+work on a chat too: paste the line into the chat window.
 
 
 
@@ -141,6 +173,13 @@ Three steps, by hand (any client that can send a raw line works, e.g. repartee):
     echo "op #chan" | ./bot-auth cmd KEY.private.b64 <botnick> <yournick> <bot pubkey>
         -> ~A2 ...                                     send it:  /quote PRIVMSG <botnick> :<that line>
     ./bot-auth fp <pubkey|file>                        print a key's fingerprint
+
+Sealed replies from the command line:
+
+    echo "status" | ./bot-auth cmd KEY.private.b64 <botnick> <yournick> <bot pubkey> --sealed RK
+        -> ~A2S ...      (and RK, created 0600, holds that command's reply key)
+    ./bot-auth reply RK <botnick> <yournick> < lines-with-~A2R
+        -> the answer in plaintext, one line per reply line; delete RK afterwards
 
 The command is read from stdin, never from the command line (ps(1) would show
 it).  Exit status: 1 usage/IO error, 2 verification failure, 3 pinned key

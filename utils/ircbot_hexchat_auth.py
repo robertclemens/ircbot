@@ -38,11 +38,22 @@ Usage:
     /BOTAUTH  <bot_nick>                       - drop the cached key, re-auth now
     /BOTFORGET <bot_nick>                      - drop the cached key (and pin)
 
+Sealed replies (on by default): commands go out as "~A2S <b64>", which asks
+the bot to seal its answers too ("~A2R <b64>", only this command's sender can
+open them).  They are shown in place, decrypted, behind a lock marker:
+    /BOTCMD marker <text|off>    (default U+1F512)
+    /BOTCMD sealed off           (plain ~A2 / plaintext replies, for bots
+                                  older than ~A2S)
+A marked line provably came from the bot; an unmarked "reply" did not go
+through this protection.
+
 DCC chat: `/BOTCMD <bot> dcc` makes the bot offer a passive DCC chat; accept
 it in HexChat.  HexChat then listens (open its DCC port range in your
 firewall, and set its DCC IP to your public address if you are behind NAT)
 and the bot connects to it.  While that chat is open, /BOTCMD sends each
 sealed command down the chat instead of by PRIVMSG, and the bot answers there.
+Plain text typed into the bot's dialog while the chat is open is sealed the
+same way before it is sent (never sent as typed).
 
 Compare a bot's key fingerprint (printed here on every successful auth)
 against that bot's own 'status' output or hub_admin's bot list before
@@ -76,7 +87,7 @@ CRYPTO_HINT = ("bot_auth: the 'cryptography' module is not installed — this "
                "pip install cryptography")
 
 __module_name__ = "ircbot_hexchat_auth"
-__module_version__ = "6.0.0"
+__module_version__ = "6.1.0"
 __module_description__ = "Sends ~A2 admin commands to ircbot (Curve25519 + AES-256-GCM, passwordless)"
 
 AUTH_TIMEOUT = 60     # seconds a pending ~A2A stays valid
@@ -202,13 +213,13 @@ def open_lockbox(key, botnick, mynick, tsn, b64):
     return pt
 
 
-def build_command(key, bot_pub64, botnick, mynick, command):
-    """Build one ~A2 sealed command.  `bot_pub64` is the bot's raw 64-byte
-    combined public key (as returned by open_lockbox).  Returns the line to
-    send.  Raises ValueError if the command must be refused (control byte,
-    or the finished line would exceed the 400-char budget)."""
+def _seal_command(key, bot_pub64, botnick, mynick, command, sealed):
+    """(line, reply_key): a ~A2S frame and its reply key when `sealed`, else a
+    ~A2 frame and None.  Raises ValueError if the command must be refused
+    (control byte, or the finished line would exceed the 400-char budget)."""
     if any(b < 0x20 or b == 0x7F for b in command.encode("utf-8")):
         raise ValueError("command contains a control character")
+    label = b"ircbot-A2S-v1" if sealed else b"ircbot-A2-v1"
 
     nonce = os.urandom(8).hex()
     pt = ("%d:%s:%s" % (int(time.time()), nonce, command)).encode("utf-8")
@@ -223,19 +234,61 @@ def build_command(key, bot_pub64, botnick, mynick, command):
     if dh1 == b"\x00" * 32 or dh2 == b"\x00" * 32:
         raise ValueError("key exchange produced a degenerate shared secret")
 
-    info = b"ircbot-A2-v1" + key.x_pub + bot_x_pub
-    km = HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub, info=info).derive(dh1 + dh2)
+    def kdf(lbl):
+        return HKDF(algorithm=hashes.SHA256(), length=32, salt=eph_pub,
+                    info=lbl + key.x_pub + bot_x_pub).derive(dh1 + dh2)
+    km = kdf(label)
+    rk = kdf(b"ircbot-A2R-v1") if sealed else None
 
     iv = os.urandom(12)
-    aad = (b"ircbot-A2-v1\0" + _lc(botnick).encode("utf-8") + b"\0" +
+    aad = (label + b"\0" + _lc(botnick).encode("utf-8") + b"\0" +
            _lc(mynick).encode("utf-8"))
     ct_tag = AESGCM(km).encrypt(iv, pt, aad)
 
     frame = eph_pub + iv + ct_tag
-    line = "~A2 " + base64.b64encode(frame).decode("ascii")
+    line = ("~A2S " if sealed else "~A2 ") + base64.b64encode(frame).decode("ascii")
     if len(line) > 400:
         raise ValueError("command is too long (%d > 400 chars on the wire)" % len(line))
-    return line
+    return line, rk
+
+
+def build_command(key, bot_pub64, botnick, mynick, command):
+    """Build one ~A2 sealed command.  `bot_pub64` is the bot's raw 64-byte
+    combined public key (as returned by open_lockbox).  Returns the line to
+    send.  Raises ValueError if the command must be refused (control byte,
+    or the finished line would exceed the 400-char budget)."""
+    return _seal_command(key, bot_pub64, botnick, mynick, command, False)[0]
+
+
+def build_sealed_command(key, bot_pub64, botnick, mynick, command):
+    """Build one ~A2S command: like ~A2, but the bot seals its replies to it
+    (~A2R).  Returns (line, reply_key), the key being HKDF(same ikm, eph_pub,
+    "ircbot-A2R-v1" || my_x || bot_x).  Raises ValueError like build_command."""
+    return _seal_command(key, bot_pub64, botnick, mynick, command, True)
+
+
+def open_reply(reply_key, botnick, mynick, b64):
+    """Open one ~A2R reply to a ~A2S command, with that command's reply key and
+    context nicks.  Returns (seq, more, text): text is one piece of a reply
+    line, continued in the next frame when more is 1.  None on any failure."""
+    try:
+        frame = base64.b64decode(b64, validate=True)
+    except Exception:
+        return None
+    if len(frame) < 28 or len(frame) > 28 + 264:
+        return None
+    aad = (b"ircbot-A2R-v1\0" + _lc(botnick).encode("utf-8") + b"\0" +
+           _lc(mynick).encode("utf-8"))
+    try:
+        pt = AESGCM(reply_key).decrypt(frame[:12], frame[12:], aad)
+    except Exception:
+        return None
+    head, sep, text = pt.partition(b":")
+    more, sep2, text = text.partition(b":")
+    if (not sep or not sep2 or not head.isdigit() or len(head) > 19
+            or more not in (b"0", b"1")):
+        return None
+    return int(head), more == b"1", text.decode("utf-8", errors="replace")
 
 
 # =============================================================================
@@ -286,9 +339,67 @@ _KEY_CACHE = {}   # (network, bot_lc) -> bot_pub64 (raw 64 bytes)
 _PENDING = {}     # same key          -> (tsn, send_time)
 _QUEUE = {}       # same key          -> [command_line, ...]
 _DCC_NICK = {}    # same key          -> our nick when we asked for the DCC chat
+_REPLY_KEYS = {}  # same key          -> [{rk, bot, me, t, next, part}, ...] newest first
+_NOTED = {}       # same key          -> time of the last "could not open" note
+_EMITTING = [False]
 
 DCC_CHAT_TYPES = (2, 3)   # get_list("dcc") type: chat receive / chat send
 DCC_ACTIVE = 1            # get_list("dcc") status: active
+REPLY_KEY_TTL = 600       # seconds a ~A2S reply key lives after its last use
+MAX_REPLY_KEYS = 8        # reply keys kept per bot
+DEFAULT_MARKER = "\U0001F512"
+
+
+def _sealed_on():
+    return (hexchat.get_pluginpref("bot_auth_sealed_replies") or "on") != "off"
+
+
+def _marked(text):
+    m = hexchat.get_pluginpref("bot_auth_sealed_marker")
+    m = DEFAULT_MARKER if m is None else ("" if m == "off" else m)
+    return "%s %s" % (m, text) if m else text
+
+
+def _remember_reply_key(ck, rk, bot, me):
+    """A ~A2S command's reply key, with the nicks its replies are bound to."""
+    keys = _REPLY_KEYS.setdefault(ck, [])
+    keys.insert(0, {"rk": rk, "bot": bot, "me": me, "t": time.time(),
+                    "next": 0, "part": ""})
+    del keys[MAX_REPLY_KEYS:]
+
+
+def _reply_text(ck, b64):
+    """One ~A2R frame from a bot, tried against the keys of the commands we
+    sealed to it (newest first): ("show", line) for a complete reply line,
+    ("hold", None) for a piece of a longer line or a repeat, ("bad", None) if
+    no key opens it.  A missing piece is marked "[...]" in the joined line."""
+    now = time.time()
+    keys = [e for e in _REPLY_KEYS.get(ck, []) if now - e["t"] <= REPLY_KEY_TTL]
+    _REPLY_KEYS[ck] = keys
+    for e in keys:
+        got = open_reply(e["rk"], e["bot"], e["me"], b64)
+        if got is None:
+            continue
+        seq, more, text = got
+        if seq < e["next"]:
+            return "hold", None
+        if seq > e["next"] and e["part"]:
+            e["part"] += " [...] "
+        e["next"], e["t"] = seq + 1, now
+        e["part"] += text
+        if more:
+            return "hold", None
+        line, e["part"] = e["part"], ""
+        return "show", line
+    return "bad", None
+
+
+def _note_unopened(ck, nick):
+    if time.time() - _NOTED.get(ck, 0) < 30:
+        return
+    _NOTED[ck] = time.time()
+    hexchat.prnt("bot_auth: a sealed reply from %s could not be opened (it answers a "
+                 "command this session did not send); hidden." % nick)
 
 
 def _net_key():
@@ -338,21 +449,26 @@ def _dcc_chat_open(bot_nick):
 def _send_command(network, bot_nick, mynick, key, bot_pub64, command_line):
     """A command goes down the bot's DCC chat when one is open, else by
     PRIVMSG.  On the chat the bot takes the sender nick to be the one that
-    asked for it."""
+    asked for it.  Sealed replies on (the default): a ~A2S frame, and its
+    reply key is kept to open the answers.  True once sent."""
     ck = (network, _lc(bot_nick))
     dcc = _dcc_chat_open(bot_nick)
     as_nick = _DCC_NICK.get(ck, mynick) if dcc else mynick
     try:
-        line = build_command(key, bot_pub64, bot_nick, as_nick, command_line)
+        line, rk = _seal_command(key, bot_pub64, bot_nick, as_nick, command_line,
+                                 _sealed_on())
     except ValueError as exc:
         hexchat.prnt("bot_auth: %s" % exc)
-        return
+        return False
+    if rk:
+        _remember_reply_key(ck, rk, bot_nick, as_nick)
     if dcc:
         hexchat.command("MSG =%s %s" % (bot_nick, line))
-        return
+        return True
     if (command_line.split(None, 1) or [""])[0].lower() == "dcc":
         _DCC_NICK[ck] = mynick
     hexchat.command("QUOTE PRIVMSG %s :%s" % (bot_nick, line))
+    return True
 
 
 def _handle_botcmd(bot_nick, command_line):
@@ -416,6 +532,25 @@ def cb_botcmd(word, word_eol, userdata):
         hexchat.prnt("bot_auth: pinfile %s" % (("set to %s" % val) if val else "disabled"))
         return hexchat.EAT_ALL
 
+    if word[1].lower() == "sealed":
+        val = word[2].lower() if len(word) > 2 else ""
+        if val not in ("on", "off"):
+            hexchat.prnt("Usage: /BOTCMD sealed <on|off>   (now %s)"
+                         % ("on" if _sealed_on() else "off"))
+            return hexchat.EAT_ALL
+        hexchat.set_pluginpref("bot_auth_sealed_replies", val)
+        hexchat.prnt("bot_auth: sealed replies %s" % val)
+        return hexchat.EAT_ALL
+
+    if word[1].lower() == "marker":
+        if len(word) < 3 or not word_eol[2].strip():
+            hexchat.prnt("Usage: /BOTCMD marker <text|off>")
+            return hexchat.EAT_ALL
+        val = word_eol[2].strip()
+        hexchat.set_pluginpref("bot_auth_sealed_marker", "off" if val.lower() == "off" else val)
+        hexchat.prnt("bot_auth: sealed-reply marker %s" % ("off" if val.lower() == "off" else val))
+        return hexchat.EAT_ALL
+
     if len(word) < 3:
         hexchat.prnt("Usage: /BOTCMD <bot_nick> <command> [args...]")
         return hexchat.EAT_ALL
@@ -458,6 +593,7 @@ def cb_botforget(word, word_eol, userdata):
     _PENDING.pop(ck, None)
     _QUEUE.pop(ck, None)
     _DCC_NICK.pop(ck, None)
+    _REPLY_KEYS.pop(ck, None)
 
     pinfile = hexchat.get_pluginpref("bot_auth_pinfile")
     if pinfile:
@@ -537,9 +673,89 @@ def cb_notice(word, word_eol, userdata):
 def cb_msg_send(word, word_eol, userdata):
     # "/MSG =bot <frame>" (a command sent down a DCC chat) echoes the frame
     # as "Message Send"; it is protocol traffic, so hide it.
-    if len(word) >= 2 and word[1].startswith("~A2 "):
+    if len(word) >= 2 and word[1].startswith(("~A2 ", "~A2S ")):
         return hexchat.EAT_ALL
     return hexchat.EAT_NONE
+
+
+def _show_reply(ck, nick, text, show):
+    """A bot's ~A2R frame shown in place, decrypted and marked as sealed via
+    show(marked_line); pieces of a longer line wait for the last one; a frame
+    no key opens is hidden.  False if text is not a ~A2R frame."""
+    if not text.startswith("~A2R "):
+        return False
+    st, line = _reply_text(ck, text[5:].strip()) if CRYPTO_OK else ("bad", None)
+    if st == "show":
+        _EMITTING[0] = True
+        try:
+            show(_marked(line))
+        finally:
+            _EMITTING[0] = False
+    elif st == "bad":
+        _note_unopened(ck, nick)
+    return True
+
+
+def cb_reply_print(word, word_eol, event):
+    """"Private Message", "Private Message to Dialog", "Notice": word[0] is the
+    nick, word[1] the text."""
+    if _EMITTING[0] or len(word) < 2:
+        return hexchat.EAT_NONE
+    nick = word[0]
+    if _show_reply((_net_key(), _lc(hexchat.strip(nick))), nick, word[1],
+                   lambda line: hexchat.emit_print(event, nick, line)):
+        return hexchat.EAT_ALL
+    return hexchat.EAT_NONE
+
+
+def cb_dcc_text(word, word_eol, userdata):
+    """"DCC Chat Text": address, port, nick, text.  Eating it also stops
+    HexChat's own display of the line in the nick's dialog, so the decrypted
+    line is shown there instead."""
+    if _EMITTING[0] or len(word) < 4:
+        return hexchat.EAT_NONE
+    nick = word[2]
+    ctx = hexchat.find_context(channel=nick) or hexchat.get_context()
+    if _show_reply((_net_key(), _lc(nick)), nick, word[3],
+                   lambda line: ctx.emit_print("Private Message to Dialog", nick, line)):
+        return hexchat.EAT_ALL
+    return hexchat.EAT_NONE
+
+
+def _is_dialog():
+    ctx = hexchat.get_context()
+    for c in hexchat.get_list("channels") or []:
+        if c.context == ctx:
+            return c.type == 3
+    return False
+
+
+def cb_say(word, word_eol, userdata):
+    """Text typed into the dialog of a bot we asked for a DCC chat, while that
+    chat is open: the chat only carries sealed frames (the bot closes it on
+    anything else), so seal it like /BOTCMD and show it as typed.  If it
+    cannot be sealed it is not sent.  Dialogs with anyone else pass."""
+    if not word_eol or not _is_dialog():
+        return hexchat.EAT_NONE
+    bot = hexchat.get_info("channel") or ""
+    network = _net_key()
+    ck = (network, _lc(bot))
+    if ck not in _DCC_NICK or not _dcc_chat_open(bot):
+        return hexchat.EAT_NONE
+    text = word_eol[0]
+    if not CRYPTO_OK:
+        hexchat.prnt(CRYPTO_HINT)
+        return hexchat.EAT_ALL
+    key, err = _load_key_pref()
+    bot_pub64 = _KEY_CACHE.get(ck)
+    if err or not bot_pub64:
+        hexchat.prnt("bot_auth: %s -- not sent"
+                     % (err or "no key for %s this session (/BOTAUTH %s)" % (bot, bot)))
+        return hexchat.EAT_ALL
+    mynick = hexchat.get_info("nick") or ""
+    if _send_command(network, bot, mynick, key, bot_pub64, text):
+        hexchat.emit_print("Your Message", mynick, text)
+    return hexchat.EAT_ALL
 
 
 def cb_timer(userdata):
@@ -550,13 +766,18 @@ def cb_timer(userdata):
 
 hexchat.hook_command("BOTCMD", cb_botcmd,
                      help="/BOTCMD <bot_nick> <command> [args...]  |  "
-                          "/BOTCMD keyfile <path>  |  /BOTCMD pinfile <path|off>")
+                          "/BOTCMD keyfile <path>  |  /BOTCMD pinfile <path|off>  |  "
+                          "/BOTCMD sealed <on|off>  |  /BOTCMD marker <text|off>")
 hexchat.hook_command("BOTAUTH", cb_botauth,
                      help="/BOTAUTH <bot_nick> - drop the cached key and re-authenticate")
 hexchat.hook_command("BOTFORGET", cb_botforget,
                      help="/BOTFORGET <bot_nick> - drop the cached key (and pin) for a bot")
 hexchat.hook_server("NOTICE", cb_notice)
 hexchat.hook_print("Message Send", cb_msg_send)
+for _ev in ("Private Message", "Private Message to Dialog", "Notice"):
+    hexchat.hook_print(_ev, cb_reply_print, _ev)
+hexchat.hook_print("DCC Chat Text", cb_dcc_text)
+hexchat.hook_command("", cb_say)
 hexchat.hook_timer(5000, cb_timer)
 
 hexchat.prnt("%s %s loaded (~A2 / key-based, passwordless)."

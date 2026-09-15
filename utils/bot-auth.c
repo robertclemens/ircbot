@@ -1,5 +1,6 @@
 /* bot-auth.c — command-line client for ircbot's key-based admin/oper protocol
- * (~A2A auth request, ~A2K lockbox, ~A2 sealed command).  Also the backend
+ * (~A2A auth request, ~A2K lockbox, ~A2 / ~A2S sealed command, ~A2R sealed
+ * reply).  Also the backend
  * that bot-auth.mrc drives for mIRC (as bot-auth.exe).  Only dependency is
  * libcrypto.  Protocol: irchub/docs/passwordless.md §4; the bot side is
  * ircbot/commands.c (a2_handle_auth / a2_open_command).
@@ -18,8 +19,15 @@
  *          "<bot pubkey> <fingerprint>".  With --pin, the bot key is checked
  *          against / recorded in pinfile ("<lc botnick> <pubkey>" lines).
  *   bot-auth cmd <keyfile> <botnick> <yournick> <botpubkey|@file>
+ *                [--sealed <replykeyfile>]
  *       -> reads ONE command line from stdin (never argv: ps(1) would show
  *          it) and prints "~A2 <b64>"; send it:  /quote PRIVMSG <bot> :<line>
+ *          With --sealed it prints "~A2S <b64>" instead, which asks the bot
+ *          to seal its replies, and writes that command's reply key to
+ *          replykeyfile (created 0600; delete it when done).
+ *   bot-auth reply <replykeyfile> <botnick> <yournick>
+ *       -> reads the bot's reply lines (raw IRC lines or just "~A2R <b64>")
+ *          from stdin and prints each reply in plaintext.
  *   bot-auth fp <pubkey|file>
  *       -> prints the key fingerprint (compare with the bot's 'status').
  *
@@ -50,6 +58,9 @@
 #define A2A_LABEL "ircbot-A2A-v1"
 #define A2K_LABEL "ircbot-A2K-v1"
 #define A2_LABEL  "ircbot-A2-v1"
+#define A2S_LABEL "ircbot-A2S-v1"
+#define A2R_LABEL "ircbot-A2R-v1"
+#define A2R_PT_MAX 264           /* "<seq>:<more>:" + up to 240 bytes of text */
 #define KEY_LEN 64               /* ed25519(32) || x25519(32) */
 #define KEY_B64 88
 #define LOCKBOX_LEN (32 + 12 + KEY_LEN + 16)
@@ -322,8 +333,11 @@ static int cmd_open(const char *keyfile, const char *bot, const char *me,
   return 0;
 }
 
+/* With rkfile: a ~A2S frame, and its reply key HKDF(ikm, eph_pub, A2R_LABEL ||
+ * user_x || bot_x) written to rkfile (0600) for `bot-auth reply`. */
 static int cmd_cmd(const char *keyfile, const char *bot, const char *me,
-                   const char *botpub) {
+                   const char *botpub, const char *rkfile) {
+  const char *label = rkfile ? A2S_LABEL : A2_LABEL;
   unsigned char bpub[KEY_LEN];
   load_pub(botpub, bpub);
   char line_in[MAX_CMD + 2];
@@ -345,7 +359,7 @@ static int cmd_cmd(const char *keyfile, const char *bot, const char *me,
                     line_in);
   OPENSSL_cleanse(line_in, sizeof(line_in));
 
-  unsigned char eph_priv[32], eph_pub[32], ikm[64], key[32], info[96];
+  unsigned char eph_priv[32], eph_pub[32], ikm[64], key[32], rk[32], info[96];
   unsigned char aad[160], frame[sizeof(pt) + 60], tag[16];
   EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
   EVP_PKEY *ek = NULL;
@@ -355,16 +369,21 @@ static int cmd_cmd(const char *keyfile, const char *bot, const char *me,
             EVP_PKEY_get_raw_public_key(ek, eph_pub, &l2) == 1;
   EVP_PKEY_free(ek);
   EVP_PKEY_CTX_free(kc);
-  size_t il = strlen(A2_LABEL);
-  memcpy(info, A2_LABEL, il);
+  size_t il = strlen(label);
+  memcpy(info, label, il);
   memcpy(info + il, k.pub + 32, 32);
   memcpy(info + il + 32, bpub + 32, 32);
-  size_t al = context(aad, sizeof(aad), A2_LABEL, bot, me, NULL);
+  size_t al = context(aad, sizeof(aad), label, bot, me, NULL);
   ok = ok && al && pl > 0 && pl < (int)sizeof(pt) &&
        x25519(eph_priv, bpub + 32, ikm) && x25519(k.priv + 32, bpub + 32, ikm + 32) &&
        hkdf(ikm, 64, eph_pub, 32, info, il + 64, key) &&
        RAND_bytes(frame + 32, 12) == 1 &&
        gcm(true, key, frame + 32, aad, al, (unsigned char *)pt, pl, frame + 44, tag);
+  if (ok && rkfile) {
+    il = strlen(A2R_LABEL);
+    memcpy(info, A2R_LABEL, il);
+    ok = hkdf(ikm, 64, eph_pub, 32, info, il + 64, rk);
+  }
   OPENSSL_cleanse(&k, sizeof(k));
   OPENSSL_cleanse(eph_priv, sizeof(eph_priv));
   OPENSSL_cleanse(ikm, sizeof(ikm));
@@ -376,10 +395,94 @@ static int cmd_cmd(const char *keyfile, const char *bot, const char *me,
   int fl = 44 + pl + 16;
   char out[1024];
   if (b64enc(frame, fl, out, sizeof(out)) < 0) die(2, "encoding failed");
-  if (strlen(out) + 4 > MAX_LINE)
+  if (strlen(out) + (rkfile ? 5 : 4) > MAX_LINE)
     die(1, "command too long for one IRC line (keep it under ~200 chars)");
-  printf("~A2 %s\n", out);
+  if (rkfile) {
+    char rb[64];
+    b64enc(rk, 32, rb, sizeof(rb));
+    OPENSSL_cleanse(rk, sizeof(rk));
+#ifndef _WIN32
+    mode_t old = umask(077);
+#endif
+    FILE *f = fopen(rkfile, "w");
+#ifndef _WIN32
+    umask(old);
+    if (f) (void)fchmod(fileno(f), 0600);
+#endif
+    bool wrote = f && fprintf(f, "%s\n", rb) > 0;
+    if (f && fclose(f) != 0) wrote = false;
+    OPENSSL_cleanse(rb, sizeof(rb));
+    if (!wrote) die(1, "cannot write the reply key file");
+  }
+  printf("%s %s\n", rkfile ? "~A2S" : "~A2", out);
   return 0;
+}
+
+/* Open the bot's ~A2R replies to one ~A2S command (its reply key in rkfile):
+ * "<seq>:<more>:<text>" pieces, seq rising (a repeat is dropped), pieces with
+ * more = 1 joined to the next.  Control bytes are shown as '?'.  Exit 2 if any
+ * ~A2R line did not open. */
+static int cmd_reply(const char *rkfile, const char *bot, const char *me) {
+  char line[2048];
+  unsigned char rk[32];
+  if (!read_first_line(rkfile, line, sizeof(line))) die(1, "cannot read the reply key file");
+  int kl = b64dec(line, rk, sizeof(rk));
+  OPENSSL_cleanse(line, sizeof(line));
+  if (kl != 32) die(1, "not a reply key file (from bot-auth cmd --sealed)");
+  unsigned char aad[160];
+  size_t al = context(aad, sizeof(aad), A2R_LABEL, bot, me, NULL);
+  if (!al) die(1, "bot nick or your nick too long");
+
+  char joined[8192];
+  size_t jl = 0;
+  unsigned long next = 0;
+  bool seen = false;
+  int bad = 0;
+  while (fgets(line, sizeof(line), stdin)) {
+    char *p = strstr(line, "~A2R ");
+    if (!p) continue;
+    p += 5;
+    p[strcspn(p, "\r\n \t")] = '\0';
+    unsigned char fr[A2R_PT_MAX + 28 + 4], pt[A2R_PT_MAX + 1];
+    int fl = b64dec(p, fr, sizeof(fr));
+    int n = fl - 28;
+    if (fl < 28 || n > A2R_PT_MAX ||
+        !gcm(false, rk, fr, aad, al, fr + 12, n, pt, fr + fl - 16)) {
+      fprintf(stderr, "bot-auth: an ~A2R line did not open (a reply to another "
+                      "command, or the wrong nicks)\n");
+      bad++;
+      continue;
+    }
+    pt[n] = '\0';
+    char *e;
+    unsigned long seq = strtoul((char *)pt, &e, 10);
+    if (e == (char *)pt || e[0] != ':' || (e[1] != '0' && e[1] != '1') || e[2] != ':') {
+      OPENSSL_cleanse(pt, sizeof(pt));
+      bad++;
+      continue;
+    }
+    if (seen && seq < next) {  /* a repeat of a piece already shown */
+      OPENSSL_cleanse(pt, sizeof(pt));
+      continue;
+    }
+    if (seen && seq != next && jl) {  /* a piece went missing */
+      printf("%.*s [...]\n", (int)jl, joined);
+      jl = 0;
+    }
+    next = seq + 1;
+    seen = true;
+    for (char *t = e + 3; *t && jl < sizeof(joined) - 1; t++)
+      joined[jl++] = ((unsigned char)*t < 0x20 || *t == 0x7f) ? '?' : *t;
+    if (e[1] == '0') {
+      printf("%.*s\n", (int)jl, joined);
+      jl = 0;
+    }
+    OPENSSL_cleanse(pt, sizeof(pt));
+  }
+  if (jl) printf("%.*s [...]\n", (int)jl, joined);
+  OPENSSL_cleanse(joined, sizeof(joined));
+  OPENSSL_cleanse(rk, sizeof(rk));
+  return bad ? 2 : 0;
 }
 
 static int cmd_fp(const char *arg) {
@@ -395,7 +498,9 @@ static void usage(void) {
   fprintf(stderr,
           "usage: bot-auth auth <keyfile> <botnick> <yournick>\n"
           "       bot-auth open <keyfile> <botnick> <yournick> <ts:nonce> <~A2K reply> [--pin <pinfile>]\n"
-          "       bot-auth cmd  <keyfile> <botnick> <yournick> <botpubkey|@file>   (command on stdin)\n"
+          "       bot-auth cmd  <keyfile> <botnick> <yournick> <botpubkey|@file> [--sealed <replykeyfile>]\n"
+          "                     (command on stdin)\n"
+          "       bot-auth reply <replykeyfile> <botnick> <yournick>   (~A2R lines on stdin)\n"
           "       bot-auth fp   <pubkey|file>\n"
           "keyfile is your <ts>_<name>.private.b64 (chmod 600). See utils/README.txt.\n");
   exit(1);
@@ -417,7 +522,11 @@ int main(int argc, char **argv) {
     }
     return cmd_open(argv[2], argv[3], argv[4], argv[5], argv[6], pin);
   }
-  if (strcmp(sub, "cmd") == 0 && argc == 6) return cmd_cmd(argv[2], argv[3], argv[4], argv[5]);
+  if (strcmp(sub, "cmd") == 0 && argc == 6)
+    return cmd_cmd(argv[2], argv[3], argv[4], argv[5], NULL);
+  if (strcmp(sub, "cmd") == 0 && argc == 8 && strcmp(argv[6], "--sealed") == 0)
+    return cmd_cmd(argv[2], argv[3], argv[4], argv[5], argv[7]);
+  if (strcmp(sub, "reply") == 0 && argc == 5) return cmd_reply(argv[2], argv[3], argv[4]);
   if (strcmp(sub, "fp") == 0 && argc == 3) return cmd_fp(argv[2]);
   usage();
   return 1;

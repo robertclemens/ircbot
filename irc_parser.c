@@ -646,7 +646,15 @@ void parser_handle_line(bot_state_t *state, char *line) {
                  strcasecmp(nick, state->target_nick) == 0)) {
       char *chan_name = (*params == ':') ? params + 1 : params;
       chan_t *c = channel_find(state, chan_name);
-      if (c) {
+      if (c && !c->is_managed) {
+        /* Removed while this JOIN was on its way (a hub batch can carry the
+         * add and its remove together, before the server answers): the
+         * newest command wins, so leave again. */
+        log_message(L_INFO, state, "[INFO] %s was removed while joining; "
+                                   "parting\n", c->name);
+        irc_printf(state, "PART %s :Channel removed\r\n", c->name);
+        c->status = C_OUT;
+      } else if (c) {
         c->status = C_IN;
         c->roster_count = 0;
         c->i_am_opped = false;

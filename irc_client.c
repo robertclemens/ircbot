@@ -360,6 +360,10 @@ static bool irc_is_single_line(const char *buf, int len) {
   return true;
 }
 
+#define A2R_NOT_A_REPLY (-2)
+static int a2r_seal_reply(bot_state_t *state, const char *line, int len);
+static int irc_send_line(bot_state_t *state, const char *buffer, int len);
+
 int irc_printf(bot_state_t *state, const char *format, ...) {
   if (!(state->status & S_CONNECTED) && !state->dcc_reply) return -1;
   char buffer[MAX_BUFFER];
@@ -379,8 +383,76 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
                 "terminator\n", verb > 16 ? 16 : verb, buffer);
     return -1;
   }
-  /* A reply to a command that came down a DCC chat goes back down it, even
-   * while the IRC link is down (dcc_divert_reply). */
+  if (state->a2r.active) {
+    int r = a2r_seal_reply(state, buffer, len);
+    if (r != A2R_NOT_A_REPLY) return r;
+  }
+  return irc_send_line(state, buffer, len);
+}
+
+/* While a ~A2S command runs (state->a2r), its replies -- "PRIVMSG <asker>
+ * :<text>" or NOTICE -- leave as ~A2R frames: "<seq>:<more>:<text>" sealed
+ * under the command's reply key, the text cut into A2R_TEXT_MAX-byte pieces
+ * (not inside a UTF-8 sequence) with more = 1 on all but the last.  CTCP
+ * stays plain: the DCC offer has to reach the client's own DCC code.  If a
+ * piece cannot be sealed the rest of the reply is dropped, never sent plain.
+ * Returns A2R_NOT_A_REPLY for any other line, else the last send's result. */
+static int a2r_seal_reply(bot_state_t *state, const char *line, int len) {
+  const char *verb = strncmp(line, "PRIVMSG ", 8) == 0  ? "PRIVMSG"
+                     : strncmp(line, "NOTICE ", 7) == 0 ? "NOTICE"
+                                                         : NULL;
+  if (!verb) return A2R_NOT_A_REPLY;
+  size_t vl = strlen(verb) + 1, nl = strlen(state->a2r.nick);
+  size_t head = vl + nl + 2; /* "VERB " nick " :" */
+  if ((size_t)len < head + 2 || memcmp(line + vl, state->a2r.nick, nl) != 0 ||
+      memcmp(line + vl + nl, " :", 2) != 0)
+    return A2R_NOT_A_REPLY;
+  const char *text = line + head;
+  size_t tlen = (size_t)len - head - 2; /* without the "\r\n" */
+  if (tlen > 0 && text[0] == '\001') return A2R_NOT_A_REPLY;
+
+  int ret = -1;
+  size_t off = 0;
+  do {
+    size_t cut = tlen - off;
+    if (cut > A2R_TEXT_MAX) {
+      cut = A2R_TEXT_MAX;
+      while (cut > 1 && ((unsigned char)text[off + cut] & 0xC0) == 0x80)
+        cut--;
+    }
+    unsigned char pt[A2R_PT_MAX], frame[A2R_PT_MAX + A2R_OVERHEAD];
+    int hl = snprintf((char *)pt, sizeof(pt), "%lu:%d:", state->a2r.seq,
+                      off + cut < tlen ? 1 : 0);
+    int fl = -1;
+    if (hl > 0 && (size_t)hl + cut <= sizeof(pt)) {
+      memcpy(pt + hl, text + off, cut);
+      fl = crypto_reply_seal(state->a2r.key, state->a2r.aad, state->a2r.aad_len,
+                             pt, (size_t)hl + cut, frame, sizeof(frame));
+    }
+    secure_wipe(pt, sizeof(pt));
+    char *b64 = fl > 0 ? base64_encode(frame, fl) : NULL;
+    if (!b64) {
+      log_message(L_INFO, state, "[CMD] Could not seal a reply to %s; the rest "
+                                 "of it is dropped\n", state->a2r.nick);
+      return -1;
+    }
+    char out[640];
+    int ol = snprintf(out, sizeof(out), "%s %s :~A2R %s\r\n", verb,
+                      state->a2r.nick, b64);
+    free(b64);
+    if (ol <= 0 || ol >= (int)sizeof(out)) return -1;
+    ret = irc_send_line(state, out, ol);
+    if (ret < 0) return ret; /* link gone: the rest could not be sent either */
+    state->a2r.seq++;
+    off += cut;
+  } while (off < tlen);
+  return ret;
+}
+
+/* One finished line to the server -- or down a DCC chat, for a reply to a
+ * command that came from one (dcc_divert_reply), even while the IRC link is
+ * down. */
+static int irc_send_line(bot_state_t *state, const char *buffer, int len) {
   if (dcc_divert_reply(state, buffer, len)) return len;
   if (!(state->status & S_CONNECTED)) return -1;
   log_message(L_RAW, state, "[RAW_SEND] %s", buffer);

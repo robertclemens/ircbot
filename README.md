@@ -71,17 +71,19 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
 
 On IRC, `help +admin` and `help auth` explain the keypair and the handshake. Old password scripts (`~A1` / `~A1c`) no longer work.
 
-7) Long replies over DCC (optional, admins only): `/botcmd botnick dcc`. The bot never accepts connections. It sends a passive DCC CHAT offer, your client listens on a port from its own DCC range, and the bot connects out to it. So open your client's DCC port range in your firewall and set its DCC address to your public IP if you are behind NAT. Accept the offer (irssi: `/dcc chat botnick`; the WeeChat script answers it for you; HexChat and mIRC have not been tried yet). In any client, `/dcc chat botnick` while the offer is open also works. While the chat is open, `/botcmd` sends each sealed command down the chat, and the replies come back there without IRC's flood pacing. Commands sent by PRIVMSG are still answered by PRIVMSG. Every line on the chat must still be a sealed `~A2` frame from the admin who asked. Anything else closes the chat, as does an hour without a command. `help dcc` has the details.
+7) Long replies over DCC (optional, admins only): `/botcmd botnick dcc`. The bot never accepts connections. It sends a passive DCC CHAT offer, your client listens on a port from its own DCC range, and the bot connects out to it. So open your client's DCC port range in your firewall and set its DCC address to your public IP if you are behind NAT. Accept the offer (irssi: `/dcc chat botnick`; the WeeChat script answers it for you; HexChat and mIRC have not been tried yet). In any client, `/dcc chat botnick` while the offer is open also works. While the chat is open, `/botcmd` sends each sealed command down the chat (and the scripts seal whatever you type into the chat window), and the replies come back there without IRC's flood pacing. Commands sent by PRIVMSG are still answered by PRIVMSG. Every line on the chat must still be a sealed `~A2` frame from the admin who asked. Anything else closes the chat, as does an hour without a command. `help dcc` has the details.
 
 See `utils/README.txt` for the other transports and for why these scripts must not be reimplemented on top of the `openssl` CLI.
 
 ### Changelog
 
 * Unreleased (passwordless branch)
+    * Enhancement: Sealed replies. A command sent as `~A2S` (the irssi, HexChat and WeeChat scripts' default) is answered with `~A2R` frames only its sender can open; the scripts show them decrypted, marked with a lock. `~A2` is still answered in plaintext. In a DCC chat the scripts also seal text typed straight into the chat window. `bot-auth cmd --sealed` / `bot-auth reply` for the command line
     * Enhancement: `dcc` admin command: a passive DCC CHAT offer the bot completes by connecting out (it never listens). Sealed commands sent down the chat are answered there, unpaced; the client scripts route `/botcmd` through an open chat
     * Enhancement: Bot nicks set by `-setup`, `chnick` or a peer's `SETNICK` must be valid RFC 2812 nicks (length limit unchanged). A nick the server refuses (432) is not retried, and at registration the bot falls back to an alternate built from the nick's valid characters
     * Fix: A user/mask change made while the hub is unreachable survives a bot restart before the reconnect (persisted as `D|1`)
     * Fix: A channel removed in the same second it was added (`join`/`part`, hub_admin) now replicates
+    * Fix: A channel removed while the bot's JOIN was still on its way (e.g. the hub's add and remove in one sync) is left again as soon as the join completes, instead of the bot staying in it
     * Enhancement: Removed admin, oper and bot passwords. Admins and opers authenticate with their own Curve25519 keypair (signed `~A2A` auth, `~A2K` lockbox with the bot's key, sealed `~A2` commands); `~A1`/`~A1c` are retired
     * Enhancement: `+admin`/`+oper <name> <pubkey> <nick!user@host>`; new `chkey`; `botpass` and `chpass` removed; `+bot <mask> <uuid> <pubkey>`
     * Enhancement: Bot-to-bot PRIVMSG fallback (no hub) is sealed with the bots' keys (`~B2`); the shared `p|` bot password is gone

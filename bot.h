@@ -135,6 +135,8 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define A2A_LABEL "ircbot-A2A-v1"  /* ~A2A auth request (Ed25519 signature) */
 #define A2K_LABEL "ircbot-A2K-v1"  /* ~A2K lockbox: bot pubkey sealed to the user */
 #define A2_LABEL  "ircbot-A2-v1"   /* ~A2  sealed admin/oper command */
+#define A2S_LABEL "ircbot-A2S-v1"  /* ~A2S the same, asking for sealed replies */
+#define A2R_LABEL "ircbot-A2R-v1"  /* ~A2R sealed reply to a ~A2S command */
 #define B2_LABEL  "ircbot-B2-v1"   /* ~B2  sealed bot-to-bot command */
 #define A2_TS_SKEW 30              /* +/- seconds accepted on ~A2A / ~A2 */
 #define B2_TS_SKEW 60              /* +/- seconds accepted on ~B2 */
@@ -144,8 +146,16 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define SEAL_MAX_PLAINTEXT 1024         /* bound on any ~A2 / ~B2 plaintext */
 #define KEY_FP_LEN 19                   /* "ab12:cd34:ef56:7890" */
 #define A2_NICK_MAX 64                  /* longest nick a ~A2 context accepts */
-/* Longest "~A2 <b64>" line: the base64 of a maximal sealed frame. */
-#define A2_LINE_MAX (4 + 4 * ((SEAL_MAX_PLAINTEXT + SEAL_OVERHEAD + 2) / 3))
+/* Base64 of a maximal sealed frame, and the longest "~A2S <b64>" line. */
+#define A2_B64_MAX (4 * ((SEAL_MAX_PLAINTEXT + SEAL_OVERHEAD + 2) / 3))
+#define A2_LINE_MAX (5 + A2_B64_MAX)
+/* ~A2R reply frame: iv(12) || ct || tag(16), plaintext "<seq>:<more>:<text>".
+ * A reply line longer than A2R_TEXT_MAX bytes goes out as several frames
+ * (more = 1 on all but the last) so that "~A2R <b64>" stays inside the ~400
+ * chars an IRC line leaves after a worst-case prefix (passwordless.md §4.7). */
+#define A2R_OVERHEAD (12 + 16)
+#define A2R_TEXT_MAX 240
+#define A2R_PT_MAX (A2R_TEXT_MAX + 24)   /* + "<seq>:<more>:" */
 
 /* DCC CHAT (dcc.c).  Outbound only: the bot never listens.  The admin command
  * `dcc` answers with a passive offer, the admin's client opens a port from its
@@ -507,6 +517,17 @@ struct bot_state {
    * PRIVMSG replies down the chat instead of to the server. */
   dcc_session_t dcc[DCC_MAX_SESSIONS];
   dcc_session_t *dcc_reply;
+  /* Set only while a ~A2S command is dispatched: irc_printf then seals that
+   * command's replies to the asker into ~A2R frames.  Wiped right after, so
+   * the bot keeps no session state (passwordless.md §4.7). */
+  struct {
+    bool active;
+    unsigned char key[32];
+    unsigned char aad[A2_NICK_MAX * 2 + 16];
+    size_t aad_len;
+    char nick[A2_NICK_MAX];
+    unsigned long seq;
+  } a2r;
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
   char who_request_channel[MAX_CHAN];
   nonce_entry_t recent_nonces[NONCE_CACHE_SIZE];
@@ -694,6 +715,24 @@ int crypto_open(const unsigned char r_x_priv[32], const unsigned char r_x_pub[32
                 const unsigned char *aad, size_t aad_len,
                 const unsigned char *frame, size_t frame_len,
                 unsigned char *pt_out, size_t pt_cap);
+/* crypto_open that, when the frame opens, also derives rk_out = HKDF(ikm,
+ * salt = eph_pub, info = rk_label || s_x_pub || r_x_pub) from the same
+ * exchange: the ~A2S reply key, which the sender can derive too.  Needs
+ * s_x_pub (a static term); rk_out is untouched on failure. */
+int crypto_open_rk(const unsigned char r_x_priv[32], const unsigned char r_x_pub[32],
+                   const unsigned char *s_x_pub, const char *label,
+                   const unsigned char *aad, size_t aad_len,
+                   const unsigned char *frame, size_t frame_len,
+                   unsigned char *pt_out, size_t pt_cap,
+                   const char *rk_label, unsigned char rk_out[32]);
+/* ~A2R frame under a reply key: iv(12, random) || ct || tag(16).  Seal returns
+ * the frame length, open the plaintext length; -1 on any failure. */
+int crypto_reply_seal(const unsigned char key[32], const unsigned char *aad,
+                      size_t aad_len, const unsigned char *pt, size_t pt_len,
+                      unsigned char *out, size_t out_cap);
+int crypto_reply_open(const unsigned char key[32], const unsigned char *aad,
+                      size_t aad_len, const unsigned char *frame,
+                      size_t frame_len, unsigned char *pt_out, size_t pt_cap);
 /* Volatile-pointer secure zero. Compiler may NOT elide. */
 void secure_wipe(void *ptr, size_t len);
 char *base64_encode(const unsigned char *input, int length);

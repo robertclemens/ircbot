@@ -63,6 +63,11 @@ static const cmd_log_rule_t LOGGABLE_CMDS[] = {
  *                                   to the user's X25519 key
  *   ~A2  <b64(eph|iv|ct|tag)>       command, sealed to this bot's X25519 key
  *                                   with the user's static key mixed in
+ *   ~A2S <b64(eph|iv|ct|tag)>       the same under its own label, asking for
+ *                                   sealed replies (§4.7)
+ *   ~A2R <b64(iv|ct|tag)>           a reply to a ~A2S command: "<seq>:<more>:
+ *                                   <text>" under a key derived from that
+ *                                   command's exchange (crypto_open_rk)
  *
  * Every context string is  LABEL "\0" lc(botnick) "\0" lc(user nick) ...:
  * the bot nick is `dest` (our current nick) and the user nick the PRIVMSG
@@ -217,26 +222,30 @@ static void a2_handle_auth(bot_state_t *state, const char *nick,
               who->name, user_host);
 }
 
-/* ~A2: open a sealed command.  Tries the key of every record whose usermask
- * matches the sender; the one whose tag verifies is the sender.  only_uuid
- * (a DCC chat's owner, else NULL) limits that to one record.  Returns the
- * record with *cmd pointing into pt, or NULL (logged, silent on the wire).
- * pt must hold SEAL_MAX_PLAINTEXT + 1 bytes; the caller wipes it. */
+/* ~A2 / ~A2S: open a sealed command.  Tries the key of every record whose
+ * usermask matches the sender; the one whose tag verifies is the sender.
+ * only_uuid (a DCC chat's owner, else NULL) limits that to one record.  With
+ * rk (a ~A2S frame: its own label, so a rewritten tag does not open) the
+ * reply key is derived into rk.  Returns the record with *cmd pointing into
+ * pt, or NULL (logged, silent on the wire).  pt must hold SEAL_MAX_PLAINTEXT
+ * + 1 bytes; the caller wipes pt and rk. */
 static user_record_t *a2_open_command(bot_state_t *state, const char *nick,
                                       const char *user_host, const char *dest,
                                       const char *only_uuid, const char *b64,
-                                      char *pt, char **cmd) {
-  if (strlen(b64) > A2_LINE_MAX - 4) {
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: oversized\n", user_host);
+                                      unsigned char *rk, char *pt, char **cmd) {
+  const char *tag = rk ? "~A2S" : "~A2";
+  const char *label = rk ? A2S_LABEL : A2_LABEL;
+  if (strlen(b64) > A2_B64_MAX) {
+    log_message(L_CMD, state, "[CMD] %s from %s: oversized\n", tag, user_host);
     return NULL;
   }
   unsigned char aad[160];
-  size_t al = a2_context(aad, sizeof(aad), A2_LABEL, dest, nick, NULL);
+  size_t al = a2_context(aad, sizeof(aad), label, dest, nick, NULL);
   int flen = 0;
   unsigned char *frame = base64_decode(b64, &flen);
   if (!frame || flen < SEAL_OVERHEAD || al == 0 || !state->self_pub_set) {
     free(frame);
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: malformed\n", user_host);
+    log_message(L_CMD, state, "[CMD] %s from %s: malformed\n", tag, user_host);
     return NULL;
   }
 
@@ -251,9 +260,9 @@ static user_record_t *a2_open_command(bot_state_t *state, const char *nick,
       unsigned char upub[HUB_KEY_RAW_LEN];
       if (only_uuid && strcmp(cands[i]->uuid, only_uuid) != 0) continue;
       if (!crypto_pubkey_b64_decode(cands[i]->pubkey_b64, upub)) continue;
-      n = crypto_open(x_priv, state->self_pub + 32, upub + 32, A2_LABEL, aad,
-                      al, frame, (size_t)flen, (unsigned char *)pt,
-                      SEAL_MAX_PLAINTEXT);
+      n = crypto_open_rk(x_priv, state->self_pub + 32, upub + 32, label, aad,
+                         al, frame, (size_t)flen, (unsigned char *)pt,
+                         SEAL_MAX_PLAINTEXT, rk ? A2R_LABEL : NULL, rk);
       if (n >= 0) {
         who = cands[i];
         who_mask = midx[i];
@@ -264,9 +273,9 @@ static user_record_t *a2_open_command(bot_state_t *state, const char *nick,
   secure_wipe(x_priv, sizeof(x_priv));
   free(frame);
   if (!who) {
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: did not open for any "
-                              "matching key (%d candidate%s)\n", user_host, nc,
-                nc == 1 ? "" : "s");
+    log_message(L_CMD, state, "[CMD] %s from %s: did not open for any "
+                              "matching key (%d candidate%s)\n", tag, user_host,
+                nc, nc == 1 ? "" : "s");
     return NULL;
   }
   pt[n] = '\0';
@@ -277,28 +286,29 @@ static user_record_t *a2_open_command(bot_state_t *state, const char *nick,
   uint64_t nonce;
   time_t now = time(NULL);
   if (has_control_bytes(pt, (size_t)n)) {
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: control character in "
-                              "command; dropped\n", user_host);
+    log_message(L_CMD, state, "[CMD] %s from %s: control character in "
+                              "command; dropped\n", tag, user_host);
     return NULL;
   }
   if (!envelope_parse(pt, &ts, &nonce, cmd)) {
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: bad envelope\n", user_host);
+    log_message(L_CMD, state, "[CMD] %s from %s: bad envelope\n", tag,
+                user_host);
     return NULL;
   }
   if (llabs((long long)(now - ts)) > A2_TS_SKEW) {
-    log_message(L_CMD, state, "[CMD] ~A2 from %s: timestamp skew %lds\n",
+    log_message(L_CMD, state, "[CMD] %s from %s: timestamp skew %lds\n", tag,
                 user_host, (long)(now - ts));
     return NULL;
   }
   if (admin_nonce_seen(state, nonce, now)) {
-    log_message(L_CMD, state, "[CMD] ~A2 replay from %s\n", user_host);
+    log_message(L_CMD, state, "[CMD] %s replay from %s\n", tag, user_host);
     return NULL;
   }
   admin_nonce_record(state, nonce, now);
   auth_mark_used(state, who, who_mask, now);
   /* No command text here: log_user_command records it. */
-  log_message(L_DEBUG, state, "[CMD_DEBUG] ~A2 verified: User='%s' Type=%c\n",
-              who->name, who->type);
+  log_message(L_DEBUG, state, "[CMD_DEBUG] %s verified: User='%s' Type=%c\n",
+              tag, who->name, who->type);
   return who;
 }
 
@@ -399,6 +409,33 @@ static void run_user_command(bot_state_t *state, const char *nick,
   }
 }
 
+/* Run an opened command.  For ~A2S (rk set) its replies to nick are sealed
+ * under rk with the ~A2R context (botnick, nick) while it runs
+ * (irc_client.c); the reply state is wiped afterwards either way.  A context
+ * that cannot be built drops the command rather than answer in plaintext. */
+static void a2_dispatch(bot_state_t *state, const char *nick,
+                        const char *user_host, const char *botnick,
+                        user_record_t *who, char *cmd_line,
+                        const unsigned char *rk) {
+  if (rk) {
+    size_t al = a2_context(state->a2r.aad, sizeof(state->a2r.aad), A2R_LABEL,
+                           botnick, nick, NULL);
+    if (al == 0 || strlen(nick) >= sizeof(state->a2r.nick)) {
+      log_message(L_CMD, state, "[CMD] ~A2S from %s: no reply context; "
+                                "dropped\n", user_host);
+      secure_wipe(&state->a2r, sizeof(state->a2r));
+      return;
+    }
+    memcpy(state->a2r.key, rk, sizeof(state->a2r.key));
+    state->a2r.aad_len = al;
+    snprintf(state->a2r.nick, sizeof(state->a2r.nick), "%s", nick);
+    state->a2r.seq = 0;
+    state->a2r.active = true;
+  }
+  run_user_command(state, nick, user_host, who, cmd_line);
+  secure_wipe(&state->a2r, sizeof(state->a2r));
+}
+
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message) {
@@ -416,8 +453,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   /* --- Block 2: admin/oper (irchub/docs/passwordless.md §4) ---
    * ~A2A is the auth request, answered with a ~A2K lockbox and nothing else;
-   * ~A2 carries a sealed command.  Anything else — including the retired
-   * password formats ~A1 / ~A1c — is unauthenticated and dropped below. */
+   * ~A2 / ~A2S carry a sealed command (~A2S: sealed replies).  Anything else
+   * — including the retired password formats ~A1 / ~A1c — is
+   * unauthenticated and dropped below. */
   if (strncmp(message, "~A2A ", 5) == 0) {
     a2_handle_auth(state, nick, user_host, dest, message + 5);
     return;
@@ -426,11 +464,14 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   char cmd_plaintext[SEAL_MAX_PLAINTEXT + 1];  /* decrypted command */
   char *cmd_line = NULL;
   user_record_t *auth_user = NULL;
+  unsigned char rk[32];                        /* ~A2S reply key */
+  bool sealed = strncmp(message, "~A2S ", 5) == 0;
   cmd_plaintext[0] = '\0';
 
-  if (strncmp(message, "~A2 ", 4) == 0) {
+  if (sealed || strncmp(message, "~A2 ", 4) == 0) {
     auth_user = a2_open_command(state, nick, user_host, dest, NULL,
-                                message + 4, cmd_plaintext, &cmd_line);
+                                message + (sealed ? 5 : 4), sealed ? rk : NULL,
+                                cmd_plaintext, &cmd_line);
   } else if (strncmp(message, "~A1", 3) == 0) {
     log_message(L_CMD, state,
                 "[CMD] Retired password frame (~A1/~A1c) from %s; the client "
@@ -438,39 +479,47 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   }
   /* Nothing past this point may run for an unauthenticated sender. */
   if (auth_user && cmd_line)
-    run_user_command(state, nick, user_host, auth_user, cmd_line);
+    a2_dispatch(state, nick, user_host, dest, auth_user, cmd_line,
+                sealed ? rk : NULL);
   else
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
   /* The decrypted command (channel keys, masks, hub addresses) never outlives
    * its processing; nothing points into it once dispatch has returned. */
   secure_wipe(cmd_plaintext, sizeof(cmd_plaintext));
+  secure_wipe(rk, sizeof(rk));
 }
 
 bool commands_handle_dcc_line(bot_state_t *state, dcc_session_t *s,
                               char *line) {
-  if (strncmp(line, "~A2 ", 4) != 0) {
+  bool sealed = strncmp(line, "~A2S ", 5) == 0;
+  if (!sealed && strncmp(line, "~A2 ", 4) != 0) {
     log_message(L_CMD, state, "[CMD] DCC line from %s (%s) is not a sealed "
                               "command\n", s->name, s->user_host);
     return false;
   }
   char cmd_plaintext[SEAL_MAX_PLAINTEXT + 1];
   char *cmd_line = NULL;
+  unsigned char rk[32];
   cmd_plaintext[0] = '\0';
   /* Same checks as PRIVMSG (usermask, key, timestamp, replay), with the chat's
    * owner as the only key that may open it and the chat's nicks as the
    * context.  The chat was granted to an admin: a record demoted since then
    * ends it. */
   user_record_t *who = a2_open_command(state, s->nick, s->user_host,
-                                       s->botnick, s->uuid, line + 4,
-                                       cmd_plaintext, &cmd_line);
+                                       s->botnick, s->uuid,
+                                       line + (sealed ? 5 : 4),
+                                       sealed ? rk : NULL, cmd_plaintext,
+                                       &cmd_line);
   bool ok = who && cmd_line && who->type == 'a';
   if (ok) {
     s->last_active = time(NULL);
     state->dcc_reply = s;
-    run_user_command(state, s->nick, s->user_host, who, cmd_line);
+    a2_dispatch(state, s->nick, s->user_host, s->botnick, who, cmd_line,
+                sealed ? rk : NULL);
     state->dcc_reply = NULL;
   }
   secure_wipe(cmd_plaintext, sizeof(cmd_plaintext));
+  secure_wipe(rk, sizeof(rk));
   return ok;
 }
 
@@ -555,7 +604,9 @@ static void help_auth(bot_state_t *state, const char *nick) {
     ".private.b64.",
     "On the first command to a bot the script sends a signed ~A2A request; "
     "the bot answers with a ~A2K notice carrying its public key (the script "
-    "shows its fingerprint). Commands then travel sealed as ~A2 frames.",
+    "shows its fingerprint). Commands then travel sealed as ~A2 frames; as "
+    "~A2S, the bot's replies are sealed too (~A2R) and the script shows them "
+    "decrypted, marked with a lock.",
     "Compare that fingerprint once with this bot's 'status' or hub_admin's "
     "bot list. After a bot 'rekey', run /botforget <bot> so the script "
     "fetches the new key.",
@@ -2063,10 +2114,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "IP.\r\n", nick);
           irc_printf(state,
                      "PRIVMSG %s :Commands in the chat are still sealed: "
-                     "while it is open, /botcmd <bot> <command> sends them "
-                     "down it and the replies come back there; anything else "
-                     "typed there closes it. A command sent by PRIVMSG is "
-                     "still answered by PRIVMSG. Admins only.\r\n", nick);
+                     "while it is open, the client script seals what you "
+                     "type there (and /botcmd <bot> <command>) and the replies "
+                     "come back there; anything unsealed closes it. A command "
+                     "sent by PRIVMSG is still answered by PRIVMSG. Admins "
+                     "only.\r\n", nick);
         } else if (strcasecmp(arg1, "match") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: match <name|*> - Show all records for a user, or * for all users.\r\n", nick);
