@@ -73,6 +73,7 @@ static void state_init(bot_state_t *state) {
   state->config_dirty = false;
   state->last_config_write = 0;
   hub_client_init(state);
+  dcc_init(state);
   srand(time(NULL));
 }
 
@@ -462,14 +463,17 @@ static void run_config_wizard(void) {
     printf("\n--- Setup Bot Nickname ---\n");
     while (true) {
       get_input("Enter bot nick", state.target_nick, MAX_NICK);
-      if (is_valid_bot_nick(state.target_nick)) {
+      if (is_rfc_nick(state.target_nick)) {
         snprintf(state.current_nick, MAX_NICK, "%s", state.target_nick);
         break;
       }
       if (strchr(state.target_nick, '|'))
         printf("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).\n");
+      else if (!is_valid_bot_nick(state.target_nick))
+        printf("ERROR: Invalid nick length (1-%d characters).\n", MAX_NICK - 1);
       else
-        printf("ERROR: Invalid nick length.\n");
+        printf("ERROR: Not a valid IRC nick: start with a letter or one of "
+               "[]\\`_^{}, then letters, digits, those or '-'.\n");
     }
 
     get_input("Enter bot username (ident)", state.user, sizeof(state.user));
@@ -896,6 +900,8 @@ int main(int argc, char *argv[]) {
       }
     }
 
+    dcc_check_timeouts(&state);
+
     // --- HUB GATEKEEPER ---
     // Only execute hub logic if we actually have hubs configured
     if (state.hub_count > 0) {
@@ -925,6 +931,9 @@ int main(int argc, char *argv[]) {
         max_fd = state.hub_fd;
     }
 
+    // DCC chats (connect in progress, or open)
+    dcc_fill_fds(&state, &read_fds, &write_fds, &max_fd);
+
     struct timeval tv = {1, 0}; // 1 second timeout
     if (max_fd == -1) {
       select(0, NULL, NULL, NULL, &tv);
@@ -950,10 +959,13 @@ int main(int argc, char *argv[]) {
       if (state.hub_fd != -1 && FD_ISSET(state.hub_fd, &read_fds)) {
         hub_client_process(&state);
       }
+
+      dcc_process(&state, &read_fds, &write_fds);
     }
   }
 
   // --- CLEANUP ---
+  dcc_close_all(&state, "Bot shutting down.");
   config_write_with_state_pass(&state);
   irc_disconnect(&state);
   if (state.hub_fd != -1)

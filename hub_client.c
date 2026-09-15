@@ -493,11 +493,19 @@ void hub_client_promote_local_config(bot_state_t *state) {
 void hub_client_push_admin_delta(bot_state_t *state) {
   if (!state->hub_authenticated || state->hub_fd == -1) {
     /* No hub link: send it after the next authentication (see
-     * admin_delta_pending).  A restart before that still loses it. */
-    if (state->hub_count > 0) state->admin_delta_pending = true;
+     * admin_delta_pending).  The flag is saved at once, so a restart before
+     * then still pushes: the records carry their newer timestamps, and the
+     * hub's LWW keeps whichever side changed last. */
+    if (state->hub_count > 0 && !state->admin_delta_pending) {
+      state->admin_delta_pending = true;
+      config_write_local_with_state_pass(state);
+    }
     return;
   }
-  state->admin_delta_pending = true;   /* cleared once every frame went out */
+  /* Cleared once every frame went out; either way the debounced flush saves
+   * the flag's new value. */
+  state->admin_delta_pending = true;
+  state->config_dirty = true;
 
   /* Every record goes out: when the lines exceed one frame they are split
    * across several CMD_CONFIG_PUSH frames at line boundaries (the hub applies

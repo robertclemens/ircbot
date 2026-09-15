@@ -39,6 +39,15 @@ Usage:
     /botauth  <bot_nick>                       - drop the cached key, re-auth now
     /botforget <bot_nick>                      - drop the cached key (and pin)
 
+DCC chat: `/botcmd <bot> dcc` makes the bot offer a passive DCC chat.  The
+bot never accepts connections: it connects to a port your client listens on,
+so open WeeChat's DCC port range (xfer.network.port_range) in your firewall
+and set xfer.network.own_ip if you are behind NAT.  WeeChat cannot take a
+passive offer, so this script answers the bot's with a /dcc chat of its own
+(WeeChat listens, the bot connects out).  While the chat is open, /botcmd
+sends each sealed command down the chat instead of by PRIVMSG, and the bot
+answers there.
+
 Compare a bot's key fingerprint (printed here on every successful auth)
 against that bot's own 'status' output or hub_admin's bot list before
 trusting it for the first time.
@@ -283,6 +292,7 @@ def pin_remove(pinfile, bot_lc):
 _KEY_CACHE = {}   # (server, bot_lc) -> bot_pub64 (raw 64 bytes)
 _PENDING = {}     # same key         -> (tsn, send_time)
 _QUEUE = {}       # same key         -> [command_line, ...]
+_DCC_NICK = {}    # same key         -> our nick when we asked for the DCC chat
 
 
 def _load_key_pref():
@@ -322,12 +332,38 @@ def _send_auth(buffer, server, mynick, bot_nick, key):
     weechat.prnt("", "bot_auth: authenticating with %s..." % bot_nick)
 
 
+def _dcc_chat_buffer(server, bot_nick):
+    """The buffer of the open DCC chat with bot_nick on server, or ""."""
+    found = ""
+    il = weechat.infolist_get("xfer", "", "")
+    if il:
+        while not found and weechat.infolist_next(il):
+            if (weechat.infolist_string(il, "type_string") in ("chat_recv", "chat_send")
+                    and weechat.infolist_string(il, "status_string") == "active"
+                    and weechat.infolist_string(il, "plugin_id") == server
+                    and _lc(weechat.infolist_string(il, "remote_nick")) == _lc(bot_nick)):
+                found = weechat.infolist_pointer(il, "buffer") or ""
+        weechat.infolist_free(il)
+    return found
+
+
 def _send_command(buffer, server, mynick, key, bot_nick, bot_pub64, command_line):
+    """A command goes down the bot's DCC chat when one is open, else by
+    PRIVMSG.  On the chat the bot takes the sender nick to be the one that
+    asked for it."""
+    ck = (server, _lc(bot_nick))
+    chat = _dcc_chat_buffer(server, bot_nick)
+    as_nick = _DCC_NICK.get(ck, mynick) if chat else mynick
     try:
-        line = build_command(key, bot_pub64, bot_nick, mynick, command_line)
+        line = build_command(key, bot_pub64, bot_nick, as_nick, command_line)
     except ValueError as exc:
         weechat.prnt("", "bot_auth: %s" % exc)
         return
+    if chat:
+        weechat.command(chat, line)   # text, not a /command: sent down the chat
+        return
+    if (command_line.split(None, 1) or [""])[0].lower() == "dcc":
+        _DCC_NICK[ck] = mynick
     _send_line(buffer, server, bot_nick, line)
 
 
@@ -417,6 +453,7 @@ def cb_botforget(data, buffer, args):
     had = _KEY_CACHE.pop(ck, None) is not None
     _PENDING.pop(ck, None)
     _QUEUE.pop(ck, None)
+    _DCC_NICK.pop(ck, None)
 
     pinfile = weechat.config_get_plugin("pinfile")
     if pinfile:
@@ -426,8 +463,8 @@ def cb_botforget(data, buffer, args):
     return weechat.WEECHAT_RC_OK
 
 
-def _parse_notice_line(line):
-    """Parse a raw irc_in2_notice line into (nick, text), or None.  Handles
+def _parse_in_line(line, verb):
+    """Parse a raw irc_in2_<verb> line into (nick, text), or None.  Handles
     an optional leading IRCv3 "@tags " prefix.  Not a `weechat` call."""
     s = line
     if s.startswith("@"):
@@ -443,7 +480,7 @@ def _parse_notice_line(line):
     prefix = s[1:sp]
     rest = s[sp + 1:]
     parts = rest.split(" ", 2)
-    if len(parts) < 3 or parts[0].upper() != "NOTICE":
+    if len(parts) < 3 or parts[0].upper() != verb:
         return None
     text = parts[2]
     if text.startswith(":"):
@@ -453,7 +490,7 @@ def _parse_notice_line(line):
 
 
 def cb_notice(data, modifier, modifier_data, string):
-    parsed = _parse_notice_line(string)
+    parsed = _parse_in_line(string, "NOTICE")
     if not parsed:
         return string
     nick, text = parsed
@@ -514,6 +551,35 @@ def cb_notice(data, modifier, modifier_data, string):
     return ""
 
 
+def cb_privmsg(data, modifier, modifier_data, string):
+    """WeeChat cannot take a passive DCC chat offer (it would dial port 0).
+    When a bot we asked with `dcc` sends one, hide it and make an ordinary
+    /dcc chat offer instead: WeeChat listens, and the bot -- whose offer is
+    still open -- connects out to it."""
+    parsed = _parse_in_line(string, "PRIVMSG")
+    if not parsed:
+        return string
+    nick, text = parsed
+    f = text.strip("\x01").split()
+    if (not (text.startswith("\x01DCC ") and len(f) == 6 and f[1].upper() == "CHAT"
+             and f[4] == "0") or (modifier_data, _lc(nick)) not in _DCC_NICK):
+        return string
+    weechat.command(weechat.buffer_search("irc", "server." + modifier_data),
+                    "/dcc chat " + nick)
+    return ""
+
+
+def cb_print(data, modifier, modifier_data, string):
+    """A command sent down a DCC chat is echoed there as our own line; the
+    frame is protocol traffic, so hide it.  modifier_data is "<buffer
+    pointer>;<tags>" (older WeeChat: "<plugin>;<buffer name>;<tags>")."""
+    if not string.split("\t", 1)[-1].startswith("~A2 "):
+        return string
+    first = modifier_data.split(";", 1)[0]
+    plugin = weechat.buffer_get_string(first, "plugin") if first.startswith("0x") else first
+    return "" if plugin == "xfer" else string
+
+
 def cb_timer(data, remaining_calls):
     for ck in list(_PENDING.keys()):
         _expire_pending(ck)
@@ -548,6 +614,8 @@ if weechat.register(SCRIPT_NAME, SCRIPT_AUTHOR, SCRIPT_VERSION, SCRIPT_LICENSE,
         "<bot_nick>", "", "", "cb_botforget", "")
 
     weechat.hook_modifier("irc_in2_notice", "cb_notice", "")
+    weechat.hook_modifier("irc_in2_privmsg", "cb_privmsg", "")
+    weechat.hook_modifier("weechat_print", "cb_print", "")
     weechat.hook_timer(5000, 0, 0, "cb_timer", "")
 
     if not CRYPTO_OK:

@@ -305,10 +305,33 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * (pre-resolution / pre-cloak) host that no other client is ever shown.
      * Ask instead, and take the answer only from the 352. */
     request_own_hostmask(state);
-  } else if (strcmp(command, "433") == 0) {
-    state->nick_change_pending = false;
-    if (!(state->status & S_AUTHED)) {
-      irc_generate_new_nick(state);
+  } else if (strcmp(command, "433") == 0 || strcmp(command, "432") == 0 ||
+             strcmp(command, "437") == 0) {
+    /* A NICK was refused: 433 in use, 437 held (nick delay, jupe), 432
+     * erroneous -- this server's rules are narrower than RFC 2812 (a shorter
+     * NICKLEN, reserved names).  "<me> <nick> :<reason>"; a 437 can name a
+     * channel instead, which is not ours to handle here. */
+    strtok_r(params, " ", &saveptr_irc);
+    char *refused = strtok_r(NULL, " ", &saveptr_irc);
+    if (!refused || (*refused != '#' && *refused != '&')) {
+      state->nick_change_pending = false;
+      /* 432 is final for that nick on this server: stop re-sending it every
+       * NICK_RETRY_TIME (the server keeps our current nick) until the target
+       * changes or the bot reconnects. */
+      if (refused && strcmp(command, "432") == 0 &&
+          strcasecmp(refused, state->target_nick) == 0 &&
+          strcasecmp(state->nick_refused, refused) != 0) {
+        snprintf(state->nick_refused, sizeof(state->nick_refused), "%s",
+                 state->target_nick);
+        log_message(L_INFO, state,
+                    "[INFO] Server refuses nick '%s' (432: %s); not retrying "
+                    "it here. Pick another with chnick.\n",
+                    state->target_nick, irc_trailing(saveptr_irc ? saveptr_irc
+                                                                 : ""));
+      }
+      /* Not registered yet: without an accepted nick there is no 001. */
+      if (!(state->status & S_AUTHED))
+        irc_generate_new_nick(state);
     }
   } else if (strcmp(command, "465") == 0 || strcmp(command, "463") == 0) {
     /* ERR_YOUREBANNEDCREEP / ERR_NOPERMFORHOST: this server is refusing us.
@@ -381,7 +404,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       if (strchr(modes, 'k') || strchr(modes, 'i')) {
         chan_t *mc = channel_find(state, target);
         if (mc && mc->is_managed) {
-          mc->timestamp = time(NULL);
+          mc->timestamp = lww_next_ts(mc->timestamp);
           hub_client_push_channel(state, mc);
         }
       }
@@ -578,7 +601,15 @@ void parser_handle_line(bot_state_t *state, char *line) {
         message[msg_len - 1] = '\0';
         char *ctcp_command = message + 1;
 
-        if (strcasecmp(ctcp_command, "VERSION") == 0) {
+        if (strncasecmp(ctcp_command, "DCC ", 4) == 0) {
+          /* Only ever the reply to this bot's own passive offer (dcc.c). */
+          if (user && host && strcasecmp(dest, state->current_nick) == 0) {
+            char user_host[256];
+            snprintf(user_host, sizeof(user_host), "%s!%s@%s", nick, user,
+                     host);
+            dcc_handle_ctcp(state, user_host, ctcp_command);
+          }
+        } else if (strcasecmp(ctcp_command, "VERSION") == 0) {
           irc_printf(state, "NOTICE %s :\001VERSION %s\001\r\n", nick,
                      VERSION_RESPONSE);
         } else if (strncasecmp(ctcp_command, "PING ", 5) == 0) {

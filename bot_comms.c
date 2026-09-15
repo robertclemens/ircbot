@@ -137,11 +137,15 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
           irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, sender_nick);
       } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "SETNICK") == 0) {
-        if (is_valid_bot_nick(bot_arg1)) {
+        if (is_rfc_nick(bot_arg1)) {
           snprintf(state->target_nick, MAX_NICK, "%s", bot_arg1);
           state->current_nick_ts = time(NULL);
           hub_client_push_delta(state, "n", bot_arg1, state->current_nick_ts);
           config_write_with_state_pass(state);
+        } else {
+          log_message(L_INFO, state, "[BOT-COMM] SETNICK from %s refused: "
+                                     "'%s' is not a valid IRC nick\n",
+                      sender->uuid, bot_arg1);
         }
       } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "INVITE") == 0) {

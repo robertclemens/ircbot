@@ -654,6 +654,8 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
 
   irc_printf(state, "QUIT :Upgrading to %s...\r\n", version_to_install);
   irc_disconnect(state);
+  /* The chats' fds are close-on-exec anyway; this says goodbye first. */
+  dcc_close_all(state, "Bot upgrading; closing.");
   close(state->pid_fd);
 
   sleep(1);

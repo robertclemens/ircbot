@@ -361,7 +361,7 @@ static bool irc_is_single_line(const char *buf, int len) {
 }
 
 int irc_printf(bot_state_t *state, const char *format, ...) {
-  if (!(state->status & S_CONNECTED)) return -1;
+  if (!(state->status & S_CONNECTED) && !state->dcc_reply) return -1;
   char buffer[MAX_BUFFER];
   va_list args;
   va_start(args, format);
@@ -379,6 +379,10 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
                 "terminator\n", verb > 16 ? 16 : verb, buffer);
     return -1;
   }
+  /* A reply to a command that came down a DCC chat goes back down it, even
+   * while the IRC link is down (dcc_divert_reply). */
+  if (dcc_divert_reply(state, buffer, len)) return len;
+  if (!(state->status & S_CONNECTED)) return -1;
   log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
   if (state->is_ssl) {
     int sent = SSL_write(state->ssl, buffer, len);
@@ -418,6 +422,7 @@ void irc_connect(bot_state_t *state) {
   state->last_irc_attempt = attempt_now;
   state->irc_refusal[0] = '\0';
   state->irc_refusal_ban = false;
+  state->nick_refused[0] = '\0'; /* another server may take the target nick */
 
   char server_str[256];
   snprintf(server_str, sizeof(server_str), "%s",
@@ -687,7 +692,8 @@ void irc_check_status(bot_state_t *state) {
     channel_manager_check_joins(state);
     
     if (!state->nick_change_pending) {
-      if (strcasecmp(state->current_nick, state->target_nick) != 0) {
+      if (strcasecmp(state->current_nick, state->target_nick) != 0 &&
+          strcasecmp(state->nick_refused, state->target_nick) != 0) {
         if (now - state->nick_release_time > NICK_TAKE_TIME) {
           if (now - state->last_nick_attempt > NICK_RETRY_TIME) {
             log_message(L_INFO, state,
@@ -720,11 +726,22 @@ void irc_generate_new_nick(bot_state_t *state) {
   char new_nick[MAX_NICK];
   int attempt = state->nick_generation_attempt;
 
+  /* Alternates are the target cut to 8 characters plus one suffix.  A target
+   * no ircd accepts (a nick loaded from an old config) would make every
+   * alternate fail the same way, so only its RFC 2812 characters are kept,
+   * and "bot" stands in if none can lead. */
   char base_nick[9];
-  size_t base_len = strlen(state->target_nick);
-  if (base_len >= sizeof(base_nick)) base_len = sizeof(base_nick) - 1;
-  memcpy(base_nick, state->target_nick, base_len);
+  size_t base_len = 0;
+  for (const char *p = state->target_nick;
+       *p && base_len < sizeof(base_nick) - 1; p++) {
+    char one[2] = {*p, '\0'};
+    char probe[3] = {'a', *p, '\0'};
+    if (base_len == 0 ? is_rfc_nick(one) : is_rfc_nick(probe))
+      base_nick[base_len++] = *p;
+  }
   base_nick[base_len] = '\0';
+  if (base_len == 0)
+    snprintf(base_nick, sizeof(base_nick), "bot");
 
   if (attempt < num_special_chars) {
     snprintf(new_nick, MAX_NICK, "%s%c", base_nick, nick_append_chars[attempt]);

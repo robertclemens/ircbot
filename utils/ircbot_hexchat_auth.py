@@ -38,6 +38,12 @@ Usage:
     /BOTAUTH  <bot_nick>                       - drop the cached key, re-auth now
     /BOTFORGET <bot_nick>                      - drop the cached key (and pin)
 
+DCC chat: `/BOTCMD <bot> dcc` makes the bot offer a passive DCC chat; accept
+it in HexChat.  HexChat then listens (open its DCC port range in your
+firewall, and set its DCC IP to your public address if you are behind NAT)
+and the bot connects to it.  While that chat is open, /BOTCMD sends each
+sealed command down the chat instead of by PRIVMSG, and the bot answers there.
+
 Compare a bot's key fingerprint (printed here on every successful auth)
 against that bot's own 'status' output or hub_admin's bot list before
 trusting it for the first time.
@@ -279,6 +285,10 @@ def pin_remove(pinfile, bot_lc):
 _KEY_CACHE = {}   # (network, bot_lc) -> bot_pub64 (raw 64 bytes)
 _PENDING = {}     # same key          -> (tsn, send_time)
 _QUEUE = {}       # same key          -> [command_line, ...]
+_DCC_NICK = {}    # same key          -> our nick when we asked for the DCC chat
+
+DCC_CHAT_TYPES = (2, 3)   # get_list("dcc") type: chat receive / chat send
+DCC_ACTIVE = 1            # get_list("dcc") status: active
 
 
 def _net_key():
@@ -317,12 +327,31 @@ def _send_auth(network, bot_nick, mynick, key):
     hexchat.prnt("bot_auth: authenticating with %s..." % bot_nick)
 
 
+def _dcc_chat_open(bot_nick):
+    for d in hexchat.get_list("dcc") or []:
+        if (d.type in DCC_CHAT_TYPES and d.status == DCC_ACTIVE
+                and _lc(d.nick) == _lc(bot_nick)):
+            return True
+    return False
+
+
 def _send_command(network, bot_nick, mynick, key, bot_pub64, command_line):
+    """A command goes down the bot's DCC chat when one is open, else by
+    PRIVMSG.  On the chat the bot takes the sender nick to be the one that
+    asked for it."""
+    ck = (network, _lc(bot_nick))
+    dcc = _dcc_chat_open(bot_nick)
+    as_nick = _DCC_NICK.get(ck, mynick) if dcc else mynick
     try:
-        line = build_command(key, bot_pub64, bot_nick, mynick, command_line)
+        line = build_command(key, bot_pub64, bot_nick, as_nick, command_line)
     except ValueError as exc:
         hexchat.prnt("bot_auth: %s" % exc)
         return
+    if dcc:
+        hexchat.command("MSG =%s %s" % (bot_nick, line))
+        return
+    if (command_line.split(None, 1) or [""])[0].lower() == "dcc":
+        _DCC_NICK[ck] = mynick
     hexchat.command("QUOTE PRIVMSG %s :%s" % (bot_nick, line))
 
 
@@ -428,6 +457,7 @@ def cb_botforget(word, word_eol, userdata):
     had = _KEY_CACHE.pop(ck, None) is not None
     _PENDING.pop(ck, None)
     _QUEUE.pop(ck, None)
+    _DCC_NICK.pop(ck, None)
 
     pinfile = hexchat.get_pluginpref("bot_auth_pinfile")
     if pinfile:
@@ -504,6 +534,14 @@ def cb_notice(word, word_eol, userdata):
     return hexchat.EAT_ALL
 
 
+def cb_msg_send(word, word_eol, userdata):
+    # "/MSG =bot <frame>" (a command sent down a DCC chat) echoes the frame
+    # as "Message Send"; it is protocol traffic, so hide it.
+    if len(word) >= 2 and word[1].startswith("~A2 "):
+        return hexchat.EAT_ALL
+    return hexchat.EAT_NONE
+
+
 def cb_timer(userdata):
     for ck in list(_PENDING.keys()):
         _expire_pending(ck)
@@ -518,6 +556,7 @@ hexchat.hook_command("BOTAUTH", cb_botauth,
 hexchat.hook_command("BOTFORGET", cb_botforget,
                      help="/BOTFORGET <bot_nick> - drop the cached key (and pin) for a bot")
 hexchat.hook_server("NOTICE", cb_notice)
+hexchat.hook_print("Message Send", cb_msg_send)
 hexchat.hook_timer(5000, cb_timer)
 
 hexchat.prnt("%s %s loaded (~A2 / key-based, passwordless)."

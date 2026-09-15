@@ -22,6 +22,12 @@
 ;   /botforget <bot_nick>                         drop the cached key (and pin)
 ; On first contact the bot's key fingerprint is echoed; compare it once with
 ; the bot's 'status' output or hub_admin's bot list.
+;
+; DCC chat: /botcmd <bot> dcc makes the bot offer a passive DCC chat; accept
+; it.  mIRC then listens (open its DCC port range in your firewall; set its
+; DCC IP to your public address if you are behind NAT) and the bot connects
+; to it.  While that chat is open, /botcmd sends each sealed command down the
+; chat instead of by PRIVMSG, and the bot answers there.
 
 alias -l ba.net { return $iif($network != $null, $network, $server) }
 alias -l ba.key { return $+($ba.net, ., $lower($1)) }
@@ -66,6 +72,7 @@ alias botforget {
   hdel botauth $+(pend., %k)
   hdel botauth $+(pendt., %k)
   hdel botauth $+(q., %k)
+  hdel botauth $+(dnick., %k)
   if ((%bot_auth_pinfile != $null) && ($isfile(%bot_auth_pinfile))) {
     ; remove the "<lc botnick> <pubkey>" line so a rekeyed bot can be learned
     var %n = $lines(%bot_auth_pinfile)
@@ -135,29 +142,37 @@ alias -l ba.openpoll {
 
 ; ---- step 3: ~A2 sealed command ------------------------------------------
 alias -l ba.send {
-  ; $1 = bot, $2 = bot pubkey, $3- = command
-  var %in = $ba.tmp(in), %out = $ba.tmp(cmd)
+  ; $1 = bot, $2 = bot pubkey, $3- = command.  It goes down the bot's DCC chat
+  ; when one is open (sealed for the nick that asked for the chat), else by
+  ; PRIVMSG.
+  var %in = $ba.tmp(in), %out = $ba.tmp(cmd), %k = $ba.key($1), %via = irc, %as = $me
+  if ($chat($1).status == active) {
+    var %via = dcc
+    if ($hget(botauth, $+(dnick., %k)) != $null) var %as = $v1
+  }
+  elseif ($3 == dcc) hadd -m botauth $+(dnick., %k) $me
   write -c $ba.q(%in) $3-
-  .run -nh cmd /c $ba.q($ba.q(%bot_auth_exe) cmd $ba.q(%bot_auth_keyfile) $1 $me $2 < $ba.q(%in) > $ba.q(%out) 2>&1)
-  .timer 1 1 ba.sendpoll $1 %in %out 1
+  .run -nh cmd /c $ba.q($ba.q(%bot_auth_exe) cmd $ba.q(%bot_auth_keyfile) $1 %as $2 < $ba.q(%in) > $ba.q(%out) 2>&1)
+  .timer 1 1 ba.sendpoll $1 %in %out 1 %via
 }
 
 alias -l ba.sendpoll {
-  var %bot = $1, %in = $2, %out = $3, %try = $4
+  var %bot = $1, %in = $2, %out = $3, %try = $4, %via = $5
   var %line = $iif($isfile(%out), $read(%out, n, 1))
   if ($gettok(%line, 1, 32) == ~A2) {
     .remove %in | .remove %out
-    .quote PRIVMSG %bot : $+ %line
+    if (%via == dcc) .msg = $+ %bot %line
+    else .quote PRIVMSG %bot : $+ %line
     return
   }
-  if ((%line == $null) && (%try < 10)) { .timer 1 1 ba.sendpoll %bot %in %out $calc(%try + 1) | return }
+  if ((%line == $null) && (%try < 10)) { .timer 1 1 ba.sendpoll %bot %in %out $calc(%try + 1) %via | return }
   echo -a bot_auth: bot-auth.exe refused the command: %line
   if ($isfile(%in)) .remove %in
   if ($isfile(%out)) .remove %out
 }
 
 on *:LOAD: {
-  echo -a -- bot-auth.mrc (v5.0, key-based, uses bot-auth.exe) loaded --
+  echo -a -- bot-auth.mrc (v5.1, key-based, uses bot-auth.exe) loaded --
   echo -a Required: /set % $+ bot_auth_exe C:\path\to\bot-auth.exe
   echo -a           /set % $+ bot_auth_keyfile C:\path\to\NAME.private.b64
   echo -a Optional: /set % $+ bot_auth_pinfile C:\path\to\bot_pins.txt

@@ -60,6 +60,38 @@ Old password-based scripts (~A1 / ~A1c) no longer work: the bot ignores them.
 
 
 
+// DCC chat (admins): long replies without IRC's flood pacing
+
+    /botcmd <bot_nick> dcc
+
+The bot never accepts a connection.  It answers `dcc` with a passive offer
+(PRIVMSG you :\1DCC CHAT chat <ip> 0 <token>\1); your client listens on a
+port from its own DCC range and replies with it, and the bot connects out.
+So: open your client's DCC port range in your firewall, and set its DCC
+address to your public IP if you are behind NAT.  The bot refuses ports
+below 1024 and unusable addresses (0.0.0.0, link-local, multicast,
+broadcast), and gives up after 120 s without a reply or 20 s of connecting.
+
+    irssi     accept with /dcc chat <bot_nick>   (dcc_port range, dcc_own_ip)
+    HexChat   accept the chat request            (DCC ports / DCC IP in Preferences;
+              not yet tried in HexChat)
+    WeeChat   nothing to do: WeeChat cannot take a passive offer, so the script
+              answers it with /dcc chat <bot_nick>, which the bot takes while
+              its offer is open  (xfer.network.port_range, xfer.network.own_ip)
+    mIRC      accept the chat request            (not yet tried in mIRC)
+    other     any client: /dcc chat <bot_nick> while the bot's offer is open
+
+While the chat is open, /botcmd <bot_nick> ... sends each sealed command down
+the chat instead of by PRIVMSG, and the bot answers on the chat.  A command
+sent by PRIVMSG is still answered by PRIVMSG.  The chat is only a transport:
+every line on it must be a sealed ~A2 frame from the admin who asked, for the
+nicks the chat was opened under (a later nick change on either side does not
+matter).  Anything else -- typed text, a replay, another user's key -- closes
+the chat, as does an hour without a command.  The CLI (bot-auth cmd) makes
+frames that work on a chat too: paste the line into the chat window.
+
+
+
 /* ircbot_irssi_auth.pl  (Irssi, requires CryptX) */
 
     cpan CryptX            (or: apt install libcryptx-perl)

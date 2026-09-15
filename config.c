@@ -548,6 +548,11 @@ bool config_load(bot_state_t *state, const char *password,
         snprintf(state->bot_uuid, sizeof(state->bot_uuid), "%s", data);
         break;
 
+      case 'D': /* D|1: user/mask changes made while the hub was unreachable
+                 * are still to be pushed (admin_delta_pending). */
+        state->admin_delta_pending = (strcmp(data, "1") == 0);
+        break;
+
       case 'O': /* Network options string: O|<letters>|<timestamp>
                  * (Stored under the 'O' line — single capital letter so it
                  * cannot collide with the existing 'o' oper record line.) */
@@ -905,6 +910,9 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   /* Written with a timestamp even when empty, so a clear survives restart. */
   if (state->opt_flags[0] != '\0' || state->opt_flags_ts > 0)
     CFG_WRITE("O|%s|%lld\n", state->opt_flags, (long long)state->opt_flags_ts);
+
+  if (state->admin_delta_pending)
+    CFG_WRITE("D|1\n");
 
 #undef CFG_WRITE
 

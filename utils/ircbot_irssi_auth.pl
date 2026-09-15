@@ -62,6 +62,12 @@ sub cryptx_hint {
 #   /botauth  <bot_nick>                       - drop the cached key, re-auth now
 #   /botforget <bot_nick>                      - drop the cached key (and pin)
 #
+# DCC chat: `/botcmd <bot> dcc` makes the bot offer a passive DCC chat; accept
+# it with /dcc chat <bot>.  irssi then listens (open its dcc_port range in
+# your firewall, and set dcc_own_ip if you are behind NAT) and the bot
+# connects to it.  While that chat is open, /botcmd sends each sealed command
+# down the chat instead of by PRIVMSG, and the bot answers there.
+#
 # Compare a bot's key fingerprint (printed here on every successful auth)
 # against that bot's own 'status' output or hub_admin's bot list before
 # trusting it for the first time.
@@ -262,6 +268,7 @@ use constant MAX_QUEUE    => 5;    # queued commands per bot while authenticatin
 our %KEY_CACHE;   # "$net\x1e$bot_lc" => bot_pub64 (raw 64 bytes)
 our %PENDING;     # same key         => [$tsn, $send_time]
 our %QUEUE;       # same key         => [ $command_line, ... ]
+our %DCC_NICK;    # same key         => our nick when we asked for the DCC chat
 
 sub _ck { my ($net, $bot) = @_; return (defined $net ? $net : '') . "\x1e" . lc_ascii($bot); }
 
@@ -341,14 +348,36 @@ sub _send_auth {
     Irssi::print("bot_auth: authenticating with $bot_nick...");
 }
 
+# The open DCC chat with $bot_nick on this network, if any.
+sub _dcc_chat {
+    my ($server, $bot_nick) = @_;
+    for my $dcc (Irssi::Irc::dccs()) {
+        next unless $dcc->{type} eq 'CHAT' && $dcc->{starttime};
+        next unless lc_ascii($dcc->{nick}) eq lc_ascii($bot_nick);
+        next if $server && $dcc->{servertag} && $dcc->{servertag} ne $server->{tag};
+        return $dcc;
+    }
+    return undef;
+}
+
+# A command goes down the bot's DCC chat when one is open, else by PRIVMSG.
+# On the chat the bot takes the sender nick to be the one that asked for it.
 sub _send_command {
     my ($server, $bot_nick, $mynick, $key, $bot_pub64, $command_line) = @_;
-    my $line = eval { build_command($key, $bot_pub64, $bot_nick, $mynick, $command_line) };
+    my $ck  = _ck($server->{tag}, $bot_nick);
+    my $dcc = _dcc_chat($server, $bot_nick);
+    my $as  = $dcc ? ($DCC_NICK{$ck} // $mynick) : $mynick;
+    my $line = eval { build_command($key, $bot_pub64, $bot_nick, $as, $command_line) };
     if ($@) {
         (my $e = $@) =~ s/\n\z//;
         Irssi::print("bot_auth: $e");
         return;
     }
+    if ($dcc) {
+        Irssi::Irc::dcc_chat_send($dcc, $line);
+        return;
+    }
+    $DCC_NICK{$ck} = $mynick if $command_line =~ /^dcc(?:\s|$)/i;
     $server->command("QUOTE PRIVMSG $bot_nick :$line");
 }
 
@@ -434,6 +463,7 @@ sub cmd_botforget {
     delete $KEY_CACHE{$ck};
     delete $PENDING{$ck};
     delete $QUEUE{$ck};
+    delete $DCC_NICK{$ck};
 
     my $pinfile = Irssi::settings_get_str('bot_auth_pinfile');
     pin_remove($pinfile, lc_ascii($bot_nick)) if defined $pinfile && length $pinfile;

@@ -11,6 +11,7 @@
 #include <stdbool.h>
 #include <stdio.h>
 #include <string.h>
+#include <sys/select.h>
 #include <sys/socket.h>
 #include <time.h>
 
@@ -142,6 +143,20 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define SEAL_OVERHEAD (32 + 12 + 16)    /* eph_pub || iv(GCM_IV_LEN) || .. || tag */
 #define SEAL_MAX_PLAINTEXT 1024         /* bound on any ~A2 / ~B2 plaintext */
 #define KEY_FP_LEN 19                   /* "ab12:cd34:ef56:7890" */
+#define A2_NICK_MAX 64                  /* longest nick a ~A2 context accepts */
+/* Longest "~A2 <b64>" line: the base64 of a maximal sealed frame. */
+#define A2_LINE_MAX (4 + 4 * ((SEAL_MAX_PLAINTEXT + SEAL_OVERHEAD + 2) / 3))
+
+/* DCC CHAT (dcc.c).  Outbound only: the bot never listens.  The admin command
+ * `dcc` answers with a passive offer, the admin's client opens a port from its
+ * own DCC range and replies with it, and the bot connects out.  Every line on
+ * the chat must still be a sealed ~A2 frame from the user who asked. */
+#define DCC_MAX_SESSIONS 4        /* offered + connecting + open, all users */
+#define DCC_OFFER_TIMEOUT 120     /* s for the client to answer the offer */
+#define DCC_CONNECT_TIMEOUT 20    /* s for the outbound TCP connect */
+#define DCC_IDLE_TIMEOUT 3600     /* s without a command before the chat closes */
+#define DCC_MIN_PORT 1024         /* never connect to a privileged port */
+#define DCC_OUTBUF_MAX (512 * 1024) /* unsent reply bytes before the chat is dropped */
 /* Protocol version this bot advertises to the hub as "v|2|<ts>".  A hub sends
  * the new a|/o|/b| record shapes only to bots at >= 2; older bots get records
  * with an empty password slot so they refuse admin commands (fail closed). */
@@ -374,6 +389,36 @@ typedef struct {
   bool ed_pub_set;
 } hub_entry_t;
 
+typedef enum {
+  DCC_FREE = 0,    /* slot unused */
+  DCC_OFFERED,     /* passive offer sent; waiting for the client's address */
+  DCC_CONNECTING,  /* non-blocking connect() to that address in progress */
+  DCC_OPEN         /* chat established */
+} dcc_phase_t;
+
+/* One DCC chat (dcc.c).  All of it is fixed when the admin asks: the
+ * client's reply must come from user_host, and only uuid's key opens a frame
+ * on the chat, with nick and botnick as the ~A2 context's nicks -- a nick
+ * change on either side during the chat does not break it. */
+typedef struct {
+  dcc_phase_t phase;
+  int fd;                        /* -1 unless CONNECTING or OPEN */
+  uint32_t token;                /* passive-DCC id sent in the offer */
+  time_t phase_since;            /* when the current phase began */
+  time_t last_active;            /* last valid command (OPEN) */
+  bool failed;                   /* write error or overflow: close at next check */
+  char nick[A2_NICK_MAX];
+  char botnick[MAX_NICK];        /* our nick when the chat was offered */
+  char user_host[MAX_MASK_LEN];
+  char uuid[37];
+  char name[64];                 /* the user record's name, for logs */
+  char peer[64];                 /* "addr port", for logs and replies */
+  char inbuf[A2_LINE_MAX + 2];   /* one partial inbound line */
+  size_t inlen;
+  char *outbuf;                  /* unsent replies (heap, <= DCC_OUTBUF_MAX) */
+  size_t outlen, outcap;
+} dcc_session_t;
+
 /* Why a server_list[] slot is being skipped (irc_client.c). */
 typedef enum {
   SB_NONE = 0,    /* eligible */
@@ -423,6 +468,10 @@ struct bot_state {
   time_t last_pong_time;
   time_t nick_release_time;
   time_t last_nick_attempt;
+  /* Runtime only: target nick this server answered with 432 (erroneous).  The
+   * server keeps our current nick, so it is not retried until the target
+   * changes or the bot reconnects. */
+  char nick_refused[MAX_NICK];
   bool pong_pending;
   bool nick_change_pending;
   bool default_server_ignored;
@@ -447,11 +496,17 @@ struct bot_state {
   trusted_bot_t trusted_bots[MAX_TRUSTED_BOTS];
   int trusted_bot_count;
   time_t last_auth_reply_any; // ~A2K global rate limit (runtime only)
-  /* Runtime only: a local user/mask change (+admin, -oper, chkey, ...) could
-   * not be pushed because the hub link was down.  Pushed right after the next
-   * hub authentication — otherwise that connect's config would rebuild the
-   * user table and silently undo it (a revoked key coming back). */
+  /* A local user/mask change (+admin, -oper, chkey, ...) could not be pushed
+   * because the hub link was down.  Pushed right after the next hub
+   * authentication — otherwise that connect's config would rebuild the user
+   * table and silently undo it (a revoked key coming back).  Persisted as the
+   * config line "D|1" so a restart before that push does not drop it. */
   bool admin_delta_pending;
+  /* DCC chats (dcc.c).  dcc_reply is set only while a command that arrived
+   * over a chat is being dispatched: irc_printf then sends that command's
+   * PRIVMSG replies down the chat instead of to the server. */
+  dcc_session_t dcc[DCC_MAX_SESSIONS];
+  dcc_session_t *dcc_reply;
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
   char who_request_channel[MAX_CHAN];
   nonce_entry_t recent_nonces[NONCE_CACHE_SIZE];
@@ -558,6 +613,23 @@ void parser_handle_line(bot_state_t *state, char *line);
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message);
+/* One line from an open DCC chat.  Only a sealed ~A2 frame from the admin who
+ * opened the chat is run; false means the chat must be closed. */
+bool commands_handle_dcc_line(bot_state_t *state, dcc_session_t *s,
+                              char *line);
+/* DCC CHAT (dcc.c) */
+void dcc_init(bot_state_t *state);
+void dcc_offer(bot_state_t *state, const char *nick, const char *user_host,
+               const user_record_t *who);
+/* A "DCC ..." CTCP to us: completes this bot's own pending offer, if it is
+ * the reply to one; every other DCC request is ignored. */
+void dcc_handle_ctcp(bot_state_t *state, const char *user_host,
+                     const char *ctcp);
+void dcc_fill_fds(bot_state_t *state, fd_set *rfds, fd_set *wfds, int *max_fd);
+void dcc_process(bot_state_t *state, const fd_set *rfds, const fd_set *wfds);
+void dcc_check_timeouts(bot_state_t *state);
+bool dcc_divert_reply(bot_state_t *state, const char *line, int len);
+void dcc_close_all(bot_state_t *state, const char *reason);
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...);
 void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
@@ -676,6 +748,25 @@ static inline time_t lww_next_ts(time_t prev) {
 static inline bool is_valid_bot_nick(const char *nick) {
   return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&
          strchr(nick, '|') == NULL;
+}
+
+/* A nick every ircd accepts (RFC 2812): a letter or one of []\`_^{} first,
+ * then letters, digits, those or '-', within is_valid_bot_nick's length.
+ * '|' is an RFC special too but stays out: it is the record delimiter.
+ * Checked wherever a bot's nick is set or changed (wizard, chnick, SETNICK);
+ * a nick already in a config still loads. */
+static inline bool is_rfc_nick(const char *nick) {
+  if (!is_valid_bot_nick(nick))
+    return false;
+  for (const char *p = nick; *p; p++) {
+    unsigned char c = (unsigned char)*p;
+    bool letter = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z');
+    bool special = strchr("[]\\`_^{}", c) != NULL;
+    bool later = (c >= '0' && c <= '9') || c == '-';
+    if (!letter && !special && !(later && p != nick))
+      return false;
+  }
+  return true;
 }
 
 /* True if buf[0..len) holds a C0 control byte (NUL, CR, LF, ...) or DEL.
