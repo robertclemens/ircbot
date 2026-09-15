@@ -48,9 +48,16 @@ OBJS = $(SRCS:.c=.o)
 # Executable name
 TARGET = ircbot
 
-.PHONY: all clean
+.PHONY: all clean keygen
 
 all: $(TARGET)
+
+# utils/keygen.c is byte-identical to irchub/keygen.c (self-contained,
+# OpenSSL only).  Not part of `all`: build it where users make their keys.
+keygen: utils/keygen
+
+utils/keygen: utils/keygen.c
+	$(CC) $(CFLAGS) -o $@ $< -lcrypto
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
@@ -60,7 +67,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -c $< -o $@
 
 clean:
-	rm -f $(OBJS) $(TARGET)
+	rm -f $(OBJS) $(TARGET) utils/keygen
 
 install:
 	rm -rf $(OBJS) *.c *.h README.md LICENSE Makefile .gitignore .git releases

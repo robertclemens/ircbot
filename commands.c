@@ -2,7 +2,6 @@
 #include <math.h>
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
-#include <openssl/hmac.h>
 #include <openssl/rand.h>
 #include <stdlib.h>
 #include <string.h>
@@ -20,11 +19,13 @@ static void status_fmt_elapsed(char *buf, size_t len, time_t since) {
            (d % 3600) / 60, d % 60);
 }
 
-/* CMD-log redaction.  `secret` flags the argument positions that carry a
- * password; those are logged as REDACT_MASK, never as typed.
- * This is an allowlist: a verb missing from the table is logged without its
- * name or arguments, because a mistyped command can put a password in any
- * position.  A new command belongs here, with its secret arguments flagged. */
+/* CMD-log redaction.  `secret` flags argument positions that carry a secret;
+ * those are logged as REDACT_MASK, never as typed.  Since the passwordless
+ * change no command takes one (public keys are not secret; channel keys have
+ * always been logged as typed), but the table stays an allowlist: a verb
+ * missing from it is logged without its name or arguments, because a typo can
+ * put anything in any position.  A new command belongs here, with any secret
+ * arguments flagged. */
 #define REDACT_ARG1 1u
 #define REDACT_ARG2 2u
 #define REDACT_ARG3 4u
@@ -36,10 +37,7 @@ typedef struct {
 } cmd_log_rule_t;
 
 static const cmd_log_rule_t LOGGABLE_CMDS[] = {
-  {"botpass", REDACT_ARG1}, /* botpass <password> */
-  {"+admin",  REDACT_ARG2}, /* +admin <name> <password> <mask> */
-  {"+oper",   REDACT_ARG2}, /* +oper <name> <password> <mask> */
-  {"chpass",  REDACT_ARG2}, /* chpass <name> <newpassword> */
+  {"+admin", 0},   {"+oper", 0},    {"chkey", 0},
   {"die", 0},      {"jump", 0},     {"join", 0},      {"part", 0},
   {"op", 0},       {"invite", 0},   {"+bot", 0},      {"-bot", 0},
   {"status", 0},   {"givenick", 0}, {"chnick", 0},    {"saveconf", 0},
@@ -49,6 +47,250 @@ static const cmd_log_rule_t LOGGABLE_CMDS[] = {
   {"+hub", 0},     {"-hub", 0},     {"rekey", 0},     {"help", 0},
   {NULL, 0}
 };
+
+/* ---- Passwordless admin/oper transport (irchub/docs/passwordless.md §4) ----
+ *
+ *   ~A2A <sig_b64> <ts>:<nonce>     auth request, Ed25519-signed
+ *   ~A2K <b64(eph|iv|ct|tag)>       NOTICE reply: this bot's pubkey, sealed
+ *                                   to the user's X25519 key
+ *   ~A2  <b64(eph|iv|ct|tag)>       command, sealed to this bot's X25519 key
+ *                                   with the user's static key mixed in
+ *
+ * Every context string is  LABEL "\0" lc(botnick) "\0" lc(user nick) ...:
+ * the bot nick is `dest` (our current nick) and the user nick the PRIVMSG
+ * source, so a frame is only valid for one bot and one sender nick. */
+
+#define A2_NICK_MAX 64
+
+/* ASCII-lowercase copy; false if in does not fit. */
+static bool lc_copy(char *out, size_t cap, const char *in) {
+  size_t n = strlen(in);
+  if (n == 0 || n >= cap) return false;
+  for (size_t i = 0; i <= n; i++) {
+    unsigned char c = (unsigned char)in[i];
+    out[i] = (c >= 'A' && c <= 'Z') ? (char)(c + 32) : (char)c;
+  }
+  return true;
+}
+
+/* label "\0" lc(botnick) "\0" lc(usernick) [ "\0" extra ] -> buf; 0 on error */
+static size_t a2_context(unsigned char *buf, size_t cap, const char *label,
+                         const char *botnick, const char *usernick,
+                         const char *extra) {
+  char b[A2_NICK_MAX], u[A2_NICK_MAX];
+  if (!lc_copy(b, sizeof(b), botnick) || !lc_copy(u, sizeof(u), usernick))
+    return 0;
+  int n = extra
+      ? snprintf((char *)buf, cap, "%s%c%s%c%s%c%s", label, 0, b, 0, u, 0, extra)
+      : snprintf((char *)buf, cap, "%s%c%s%c%s", label, 0, b, 0, u);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+static bool admin_nonce_seen(const bot_state_t *state, uint64_t nonce,
+                             time_t now) {
+  for (int i = 0; i < MAX_SEEN_HASHES; i++)
+    if (state->admin_nonces[i].nonce == nonce &&
+        now - state->admin_nonces[i].ts <= NONCE_TTL_SECONDS)
+      return true;
+  return false;
+}
+
+static void admin_nonce_record(bot_state_t *state, uint64_t nonce, time_t now) {
+  state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){nonce, now};
+  state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
+}
+
+/* ~A2A: verify the signed auth request and answer with the ~A2K lockbox.
+ * Silent on the wire for every failure (no oracle for which usermasks
+ * exist); each is logged at L_CMD. */
+static void a2_handle_auth(bot_state_t *state, const char *nick,
+                           const char *user_host, const char *dest,
+                           const char *arg) {
+  /* arg = "<sig_b64:88> <ts>:<nonce:16 hex>" */
+  const char *sp = strchr(arg, ' ');
+  if (!sp || sp - arg != 88) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: malformed\n", user_host);
+    return;
+  }
+  char sig_b64[89];
+  memcpy(sig_b64, arg, 88);
+  sig_b64[88] = '\0';
+  char tsn[40];
+  if (strlen(sp + 1) >= sizeof(tsn)) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: malformed\n", user_host);
+    return;
+  }
+  snprintf(tsn, sizeof(tsn), "%s", sp + 1);
+
+  /* Validate "<ts>:<nonce>" by reusing the envelope parser on a copy with a
+   * dummy command appended. */
+  char probe[48];
+  snprintf(probe, sizeof(probe), "%s:x", tsn);
+  time_t ts;
+  uint64_t nonce;
+  char *dummy;
+  if (!envelope_parse(probe, &ts, &nonce, &dummy) || strcmp(dummy, "x") != 0) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: bad ts/nonce\n", user_host);
+    return;
+  }
+  time_t now = time(NULL);
+  if (llabs((long long)(now - ts)) > A2_TS_SKEW) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: timestamp skew %lds\n",
+                user_host, (long)(now - ts));
+    return;
+  }
+
+  int sl = 0;
+  unsigned char *sig = base64_decode(sig_b64, &sl);
+  unsigned char msg[256];
+  size_t ml = a2_context(msg, sizeof(msg), A2A_LABEL, dest, nick, tsn);
+  if (!sig || sl != 64 || ml == 0) {
+    free(sig);
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: malformed\n", user_host);
+    return;
+  }
+
+  user_record_t *cands[MAX_USER_RECORDS];
+  int midx[MAX_USER_RECORDS];
+  int nc = auth_user_candidates(state, user_host, cands, midx, MAX_USER_RECORDS);
+  user_record_t *who = NULL;
+  int who_mask = -1;
+  for (int i = 0; i < nc && !who; i++) {
+    unsigned char pub[HUB_KEY_RAW_LEN];
+    if (crypto_pubkey_b64_decode(cands[i]->pubkey_b64, pub) &&
+        crypto_ed25519_verify(pub, msg, ml, sig)) {
+      who = cands[i];
+      who_mask = midx[i];
+    }
+  }
+  free(sig);
+  if (!who) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s: no matching key verified "
+                              "(%d candidate%s)\n", user_host, nc,
+                nc == 1 ? "" : "s");
+    return;
+  }
+  if (admin_nonce_seen(state, nonce, now)) {
+    log_message(L_CMD, state, "[CMD] ~A2A replay from %s\n", user_host);
+    return;
+  }
+  admin_nonce_record(state, nonce, now);
+  if (now - who->last_auth_reply < A2_AUTH_REPLY_MIN_INTERVAL ||
+      now - state->last_auth_reply_any < A2_AUTH_REPLY_GLOBAL_INTERVAL) {
+    log_message(L_CMD, state, "[CMD] ~A2A from %s (%s): throttled\n",
+                who->name, user_host);
+    return;
+  }
+  if (!state->self_pub_set) {
+    log_message(L_CMD, state, "[CMD] ~A2A: this bot has no identity key\n");
+    return;
+  }
+
+  /* Lockbox: our public key, sealed anonymously to the user's X25519 key and
+   * bound to this request's ts:nonce so the client accepts only the reply
+   * to a request it sent. */
+  unsigned char upub[HUB_KEY_RAW_LEN], aad[256];
+  size_t al = a2_context(aad, sizeof(aad), A2K_LABEL, dest, nick, tsn);
+  unsigned char frame[HUB_KEY_RAW_LEN + SEAL_OVERHEAD];
+  int fl = -1;
+  if (al && crypto_pubkey_b64_decode(who->pubkey_b64, upub))
+    fl = crypto_seal(NULL, NULL, upub + 32, A2K_LABEL, aad, al, state->self_pub,
+                     HUB_KEY_RAW_LEN, frame, sizeof(frame));
+  char *b64 = (fl > 0) ? base64_encode(frame, fl) : NULL;
+  if (!b64) {
+    log_message(L_CMD, state, "[CMD] ~A2A: sealing the lockbox failed\n");
+    return;
+  }
+  who->last_auth_reply = now;
+  state->last_auth_reply_any = now;
+  auth_mark_used(state, who, who_mask, now);
+  irc_printf(state, "NOTICE %s :~A2K %s\r\n", nick, b64);
+  free(b64);
+  log_message(L_CMD, state, "[CMD] ~A2A: %s (%s) authenticated; key sent\n",
+              who->name, user_host);
+}
+
+/* ~A2: open a sealed command.  Tries the key of every record whose usermask
+ * matches the sender; the one whose tag verifies is the sender.  Returns
+ * that record with *cmd pointing into pt, or NULL (logged, silent on the
+ * wire).  pt must hold SEAL_MAX_PLAINTEXT + 1 bytes; the caller wipes it. */
+static user_record_t *a2_open_command(bot_state_t *state, const char *nick,
+                                      const char *user_host, const char *dest,
+                                      const char *b64, char *pt, char **cmd) {
+  if (strlen(b64) > 4 * ((SEAL_MAX_PLAINTEXT + SEAL_OVERHEAD + 2) / 3)) {
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: oversized\n", user_host);
+    return NULL;
+  }
+  unsigned char aad[160];
+  size_t al = a2_context(aad, sizeof(aad), A2_LABEL, dest, nick, NULL);
+  int flen = 0;
+  unsigned char *frame = base64_decode(b64, &flen);
+  if (!frame || flen < SEAL_OVERHEAD || al == 0 || !state->self_pub_set) {
+    free(frame);
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: malformed\n", user_host);
+    return NULL;
+  }
+
+  user_record_t *cands[MAX_USER_RECORDS];
+  int midx[MAX_USER_RECORDS];
+  int nc = auth_user_candidates(state, user_host, cands, midx, MAX_USER_RECORDS);
+  user_record_t *who = NULL;
+  int who_mask = -1, n = -1;
+  unsigned char ed_priv[32], x_priv[32];
+  if (nc > 0 && bot_key_decode(state, ed_priv, x_priv)) {
+    for (int i = 0; i < nc && !who; i++) {
+      unsigned char upub[HUB_KEY_RAW_LEN];
+      if (!crypto_pubkey_b64_decode(cands[i]->pubkey_b64, upub)) continue;
+      n = crypto_open(x_priv, state->self_pub + 32, upub + 32, A2_LABEL, aad,
+                      al, frame, (size_t)flen, (unsigned char *)pt,
+                      SEAL_MAX_PLAINTEXT);
+      if (n >= 0) {
+        who = cands[i];
+        who_mask = midx[i];
+      }
+    }
+  }
+  secure_wipe(ed_priv, sizeof(ed_priv));
+  secure_wipe(x_priv, sizeof(x_priv));
+  free(frame);
+  if (!who) {
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: did not open for any "
+                              "matching key (%d candidate%s)\n", user_host, nc,
+                nc == 1 ? "" : "s");
+    return NULL;
+  }
+  pt[n] = '\0';
+
+  /* Reject, don't repair: a CR/LF in an argument would reach irc_printf and
+   * split into a second IRC command. */
+  time_t ts;
+  uint64_t nonce;
+  time_t now = time(NULL);
+  if (has_control_bytes(pt, (size_t)n)) {
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: control character in "
+                              "command; dropped\n", user_host);
+    return NULL;
+  }
+  if (!envelope_parse(pt, &ts, &nonce, cmd)) {
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: bad envelope\n", user_host);
+    return NULL;
+  }
+  if (llabs((long long)(now - ts)) > A2_TS_SKEW) {
+    log_message(L_CMD, state, "[CMD] ~A2 from %s: timestamp skew %lds\n",
+                user_host, (long)(now - ts));
+    return NULL;
+  }
+  if (admin_nonce_seen(state, nonce, now)) {
+    log_message(L_CMD, state, "[CMD] ~A2 replay from %s\n", user_host);
+    return NULL;
+  }
+  admin_nonce_record(state, nonce, now);
+  auth_mark_used(state, who, who_mask, now);
+  /* No command text here: log_user_command records it. */
+  log_message(L_DEBUG, state, "[CMD_DEBUG] ~A2 verified: User='%s' Type=%c\n",
+              who->name, who->type);
+  return who;
+}
 
 /* Append src to dst (current length *len, capacity cap), stopping at the cap.
  * No escaping here: log_message neutralizes control bytes in every line. */
@@ -115,515 +357,49 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
 
   log_message(L_MSG, state, "[MSG] (%s): %s\n", user_host, message);
 
-  /* --- Block 1: Trusted Bot Logic (Encrypted Communication) --- */
+  /* --- Block 1: trusted-bot commands (~B2, bot_comms.c) --- */
+  if (bot_comms_handle_privmsg(state, nick, user_host, message))
+    return;
 
-  char sender_bot_uuid[64];
-  if (auth_is_trusted_bot(state, user_host, sender_bot_uuid,
-                          sizeof(sender_bot_uuid))) {
-    char message_copy_bot[MAX_BUFFER];
-    snprintf(message_copy_bot, sizeof(message_copy_bot), "%s", message);
-
-    char *saveptr_enc;
-    char *encoded_ciphertext = strtok_r(message_copy_bot, ":", &saveptr_enc);
-    char *encoded_tag = strtok_r(NULL, "", &saveptr_enc);
-
-    if (encoded_ciphertext && encoded_tag) {
-      unsigned char *decoded_data = NULL;
-      unsigned char *tag = NULL;
-      int decoded_len = 0;
-      int tag_len = 0;
-
-      decoded_data = base64_decode(encoded_ciphertext, &decoded_len);
-      tag = base64_decode(encoded_tag, &tag_len);
-
-      if (decoded_data && tag && decoded_len > (SALT_SIZE + GCM_IV_LEN) &&
-          tag_len == GCM_TAG_LEN) {
-        unsigned char salt[SALT_SIZE];
-        memcpy(salt, decoded_data, SALT_SIZE);
-
-        unsigned char key[32];
-        if (!crypto_derive_config_key(state->bot_comm_pass, salt, key)) {
-          if (decoded_data) free(decoded_data);
-          if (tag) free(tag);
-          return;
-        }
-
-        unsigned char *ciphertext_ptr = decoded_data + SALT_SIZE;
-        int ciphertext_len = decoded_len - SALT_SIZE;
-
-        unsigned char *decrypted_data = malloc(ciphertext_len + 1);
-        if (decrypted_data) {
-          /* Sender always binds its own UUID as GCM AAD (bot_comms.c
-           * bot_comms_send_command); mirror that here with the UUID we
-           * just resolved from trusted_bots[], or the tag never verifies. */
-          int decrypted_len = crypto_aes_gcm_decrypt_aad(
-              ciphertext_ptr, ciphertext_len,
-              (const unsigned char *)sender_bot_uuid,
-              (int)strlen(sender_bot_uuid),
-              key, decrypted_data, tag);
-
-          if (decrypted_len >= 0 &&
-              has_control_bytes(decrypted_data, (size_t)decrypted_len)) {
-            log_message(L_CMD, state,
-                        "[BOT-COMMS] Control character in command from %s; "
-                        "dropped\n", user_host);
-          } else if (decrypted_len >= 0) {
-            decrypted_data[decrypted_len] = '\0';
-
-            char *saveptr_bot;
-            char *received_timestamp_str =
-                strtok_r((char *)decrypted_data, ":", &saveptr_bot);
-            char *received_nonce_str = strtok_r(NULL, ":", &saveptr_bot);
-            char *command_part = strtok_r(NULL, "", &saveptr_bot);
-
-            if (received_timestamp_str && received_nonce_str && command_part) {
-              time_t received_time = atoll(received_timestamp_str);
-              uint64_t received_nonce = strtoull(received_nonce_str, NULL, 10);
-
-              if (fabs(difftime(time(NULL), received_time)) <= 60) {
-                bool nonce_is_reused = false;
-                { time_t _now = time(NULL);
-                  for (int i = 0; i < NONCE_CACHE_SIZE; i++) {
-                    if (state->recent_nonces[i].nonce == received_nonce &&
-                        _now - state->recent_nonces[i].ts <= NONCE_TTL_SECONDS)
-                      { nonce_is_reused = true; break; }
-                  }
-                }
-                if (!nonce_is_reused) {
-                  state->recent_nonces[state->nonce_idx] = (nonce_entry_t){ received_nonce, time(NULL) };
-                  state->nonce_idx = (state->nonce_idx + 1) % NONCE_CACHE_SIZE;
-
-                  char *saveptr_cmd;
-                  char *bot_command = strtok_r(command_part, " ", &saveptr_cmd);
-                  char *bot_arg1 = strtok_r(NULL, " ", &saveptr_cmd);
-                  if (bot_command && strcasecmp(bot_command, "OPME") == 0 &&
-                      bot_arg1) {
-                    irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, nick);
-                  } else if (bot_command &&
-                             strcasecmp(bot_command, "SETNICK") == 0 &&
-                             bot_arg1) {
-                    if (is_valid_bot_nick(bot_arg1)) {
-                      snprintf(state->target_nick, MAX_NICK, "%s", bot_arg1);
-                      state->current_nick_ts = time(NULL);
-                      hub_client_push_delta(state, "n", bot_arg1,
-                                            state->current_nick_ts);
-                      config_write_with_state_pass(state);
-                    }
-                  } else if (bot_command &&
-                             strcasecmp(bot_command, "INVITE") == 0 &&
-                             bot_arg1) {
-                    char *bot_arg2 = strtok_r(NULL, " ", &saveptr_cmd);
-                    if (bot_arg2) {
-                      chan_t *ic = channel_find(state, bot_arg1);
-                      if (ic && ic->status == C_IN && ic->i_am_opped) {
-                        log_message(L_INFO, state,
-                                    "[BOT-COMMS] Inviting %s to %s (bot req)\n",
-                                    bot_arg2, bot_arg1);
-                        irc_printf(state, "INVITE %s %s\r\n",
-                                   bot_arg2, bot_arg1);
-                      }
-                    }
-                  }
-                }
-              }
-            }
-          }
-          secure_wipe(decrypted_data, (size_t)ciphertext_len + 1);
-          free(decrypted_data);
-        }
-        secure_wipe(key, sizeof(key));
-      }
-
-      if (decoded_data)
-        free(decoded_data);
-      if (tag)
-        free(tag);
-    }
+  /* --- Block 2: admin/oper (irchub/docs/passwordless.md §4) ---
+   * ~A2A is the auth request, answered with a ~A2K lockbox and nothing else;
+   * ~A2 carries a sealed command.  Anything else — including the retired
+   * password formats ~A1 / ~A1c — is unauthenticated and dropped below. */
+  if (strncmp(message, "~A2A ", 5) == 0) {
+    a2_handle_auth(state, nick, user_host, dest, message + 5);
+    return;
   }
-  /* --- Block 2: Admin/Op Logic --- */
-  /* Two accepted formats:
-   *   v1   (default):      "~A1 <base64-blob>"
-   *     blob = salt(16) || iv(12) || ciphertext(N) || tag(16)
-   *     key  = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 32)
-   *     cipher = AES-256-GCM
-   *
-   *   v1c  (openssl-CLI friendly): "~A1c <base64-blob>"
-   *     blob = salt(16) || iv(16) || ciphertext(N) || hmac(32)
-   *     keys = PBKDF2-HMAC-SHA256(admin_password, salt, PBKDF2_ITERATIONS, 64)
-   *     enc_key = keys[0..31], mac_key = keys[32..63]
-   *     cipher = AES-256-CBC (PKCS#7 padded)
-   *     hmac   = HMAC-SHA256(mac_key, salt || iv || ciphertext)
-   *     Verification is encrypt-then-MAC: HMAC verified BEFORE decrypt.
-   *     Exists so clients with no AES-GCM support (mIRC's $encode,
-   *     OpenSSL's `enc` CLI, pure-Perl with Digest::SHA + openssl CLI)
-   *     can still produce a valid frame.
-   *
-   * The pre-PBKDF2 "<nonce>:<hash> <command>" scheme was removed in
-   * 0292ddb; anything without a ~A1/~A1c prefix is now unauthenticated and
-   * falls straight through to the "Auth failed" path below.  Clients still
-   * shipping it (the irssi script before v3.0.0, now utils/ircbot_irssi_auth.pl)
-   * must be upgraded, not re-supported.
-   *
-   * Plaintext under both v1 and v1c is "<timestamp>:<nonce>:<command> [args]".
-   * Both formats populate the same dispatch variables and fall through to
-   * the existing command tree below. */
 
-  char v1_plaintext[MAX_BUFFER];     /* v1 decrypted-payload working buffer */
-  bool used_v1 = false;
+  char cmd_plaintext[SEAL_MAX_PLAINTEXT + 1];  /* decrypted command */
   bool is_admin = false;
   bool is_op = false;
   user_record_t *auth_user = NULL;
   char *command = NULL, *arg1 = NULL, *arg2 = NULL, *arg3 = NULL;
-  uint64_t nonce_val = 0;
+  cmd_plaintext[0] = '\0';
 
-  if (strncmp(message, "~A1c ", 5) == 0) {
-    /* ---- v1c: AES-256-CBC + HMAC-SHA256 encrypt-then-MAC admin command ----
-     * Exists for clients that can't produce AES-GCM (mIRC, openssl(1) CLI).
-     * Security is equivalent to v1 — both achieve AEAD over the same key
-     * derivation and the same nonce / timestamp envelope. */
-    used_v1 = true;
-    const char *b64 = message + 5;
-    int blob_len = 0;
-    unsigned char *blob = base64_decode(b64, &blob_len);
-    const int min_len = SALT_SIZE + 16 + 16 + 32;  /* salt + iv + 1 AES block + hmac */
-    if (!blob || blob_len < min_len) {
-      if (blob) { secure_wipe(blob, (size_t)(blob_len > 0 ? blob_len : 0)); free(blob); }
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: malformed blob from %s\n", user_host);
-      return;
-    }
-    int ct_len = blob_len - SALT_SIZE - 16 - 32;
-    if (ct_len <= 0 || (ct_len % 16) != 0) {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: ct_len %d not a multiple of 16\n", ct_len);
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    unsigned char salt_v1c[SALT_SIZE], iv_v1c[16], hmac_v1c[32];
-    memcpy(salt_v1c, blob,                                       SALT_SIZE);
-    memcpy(iv_v1c,   blob + SALT_SIZE,                           16);
-    memcpy(hmac_v1c, blob + blob_len - 32,                       32);
-
-    time_t now_auth = time(NULL);
-    user_record_t *candidate = auth_find_user(state, user_host, now_auth);
-    if (!candidate || !candidate->is_active || candidate->password[0] == '\0') {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: no matching active user for %s\n", user_host);
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    /* Derive 64 bytes: enc_key(32) || mac_key(32) */
-    unsigned char keys[64];
-    if (PKCS5_PBKDF2_HMAC(candidate->password, (int)strlen(candidate->password),
-                          salt_v1c, SALT_SIZE, PBKDF2_ITERATIONS,
-                          EVP_sha256(), 64, keys) != 1) {
-      log_message(L_CMD, state, "[CMD] v1c auth: PBKDF2 failed\n");
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    /* Verify HMAC over salt || iv || ciphertext BEFORE decrypting. */
-    unsigned int hmac_calc_len = 0;
-    unsigned char hmac_calc[32];
-    /* The first (blob_len - 32) bytes of `blob` are exactly salt||iv||ct. */
-    if (!HMAC(EVP_sha256(), keys + 32, 32,
-              blob, (size_t)(blob_len - 32),
-              hmac_calc, &hmac_calc_len) ||
-        hmac_calc_len != 32 ||
-        CRYPTO_memcmp(hmac_calc, hmac_v1c, 32) != 0) {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: HMAC FAILED for %s (wrong password?)\n",
-                  user_host);
-      secure_wipe(keys, sizeof(keys));
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    /* HMAC ok — AES-CBC decrypt the ciphertext. */
-    unsigned char *plain = malloc((size_t)ct_len + 1);
-    if (!plain) {
-      secure_wipe(keys, sizeof(keys));
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-    EVP_CIPHER_CTX *cctx = EVP_CIPHER_CTX_new();
-    int plain_len = 0, final_len = 0;
-    if (!cctx ||
-        EVP_DecryptInit_ex(cctx, EVP_aes_256_cbc(), NULL, keys, iv_v1c) != 1 ||
-        EVP_DecryptUpdate(cctx, plain, &plain_len,
-                          blob + SALT_SIZE + 16, ct_len) != 1 ||
-        EVP_DecryptFinal_ex(cctx, plain + plain_len, &final_len) != 1) {
-      log_message(L_CMD, state, "[CMD] v1c auth: AES-CBC decrypt failed\n");
-      if (cctx) EVP_CIPHER_CTX_free(cctx);
-      secure_wipe(keys, sizeof(keys));
-      secure_wipe(plain, (size_t)ct_len + 1);
-      free(plain);
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-    EVP_CIPHER_CTX_free(cctx);
-    plain_len += final_len;
-    plain[plain_len] = '\0';
-    secure_wipe(keys, sizeof(keys));
-    secure_wipe(blob, (size_t)blob_len);
-    free(blob);
-
-    if ((size_t)plain_len >= sizeof(v1_plaintext)) {
-      secure_wipe(plain, (size_t)plain_len);
-      free(plain);
-      return;
-    }
-    memcpy(v1_plaintext, plain, (size_t)plain_len);
-    v1_plaintext[plain_len] = '\0';
-    secure_wipe(plain, (size_t)plain_len);
-    free(plain);
-
-    /* Reject, don't repair: a CR/LF in an argument would reach irc_printf
-     * and split into a second IRC command. */
-    if (has_control_bytes(v1_plaintext, (size_t)plain_len)) {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: control character in command from %s; "
-                  "dropped\n", user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-
-    /* Parse: <timestamp>:<nonce>:<command> [args] — same envelope as v1. */
-    char *sp_v1c;
-    char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1c);
-    char *nonce_str = strtok_r(NULL,         ":", &sp_v1c);
-    char *cmd_line  = strtok_r(NULL,         "",  &sp_v1c);
-    if (!ts_str || !nonce_str || !cmd_line) {
-      log_message(L_CMD, state, "[CMD] v1c auth: malformed plaintext\n");
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-    time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
-    if (llabs((long long)(now_auth - client_ts)) > 30) {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: timestamp skew %lds (max 30) from %s\n",
-                  (long)(now_auth - client_ts), user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-    nonce_val = strtoull(nonce_str, NULL, 10);
-    bool replay_v1c = false;
-    { time_t _now = time(NULL);
-      for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-        if (state->admin_nonces[_ri].nonce == nonce_val &&
-            _now - state->admin_nonces[_ri].ts <= NONCE_TTL_SECONDS)
-          { replay_v1c = true; break; }
+  if (strncmp(message, "~A2 ", 4) == 0) {
+    char *cmd_line = NULL;
+    auth_user = a2_open_command(state, nick, user_host, dest, message + 4,
+                                cmd_plaintext, &cmd_line);
+    if (auth_user && cmd_line) {
+      char *sp_cmd;
+      command = strtok_r(cmd_line, " ", &sp_cmd);
+      arg1    = strtok_r(NULL,     " ", &sp_cmd);
+      arg2    = strtok_r(NULL,     " ", &sp_cmd);
+      arg3    = strtok_r(NULL,     " ", &sp_cmd);
+      if (command) {
+        is_admin = (auth_user->type == 'a');
+        is_op    = (auth_user->type == 'o');
       }
     }
-    if (replay_v1c) {
-      log_message(L_CMD, state,
-                  "[CMD] v1c auth: replay (nonce=%llu) from %s\n",
-                  (unsigned long long)nonce_val, user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce_val, time(NULL) };
-    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-
-    char *sp_cmd;
-    command = strtok_r(cmd_line, " ", &sp_cmd);
-    arg1    = strtok_r(NULL,     " ", &sp_cmd);
-    arg2    = strtok_r(NULL,     " ", &sp_cmd);
-    arg3    = strtok_r(NULL,     " ", &sp_cmd);
-    if (!command) {
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-    auth_user = candidate;
-    if (candidate->type == 'a') is_admin = true;
-    if (candidate->type == 'o') is_op    = true;
-
-    /* No command text here: log_user_command records it, redacted. */
-    log_message(L_DEBUG, state,
-                "[CMD_DEBUG] v1c frame verified: User='%s' Type=%c\n",
-                candidate->name, candidate->type);
-  } else if (strncmp(message, "~A1 ", 4) == 0) {
-    /* ---- v1: AES-256-GCM-protected admin command ---- */
-    used_v1 = true;
-    const char *b64 = message + 4;
-    int blob_len = 0;
-    unsigned char *blob = base64_decode(b64, &blob_len);
-    if (!blob || blob_len < (int)(SALT_SIZE + GCM_IV_LEN + GCM_TAG_LEN)) {
-      if (blob) { secure_wipe(blob, (size_t)(blob_len > 0 ? blob_len : 0)); free(blob); }
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: malformed blob from %s\n", user_host);
-      return;
-    }
-    int ct_len = blob_len - (int)SALT_SIZE - GCM_IV_LEN - GCM_TAG_LEN;
-    if (ct_len <= 0) {
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN], tag[GCM_TAG_LEN];
-    memcpy(salt, blob, SALT_SIZE);
-    memcpy(iv,   blob + SALT_SIZE, GCM_IV_LEN);
-    memcpy(tag,  blob + blob_len - GCM_TAG_LEN, GCM_TAG_LEN);
-
-    /* Identify the sender by hostmask BEFORE trusting any payload content.
-     * auth_find_user updates last_seen/last_used and sets config_dirty even
-     * on the v1 path, so both formats record activity identically.  The flush
-     * is debounced and LOCAL (main.c, CONFIG_WRITE_DEBOUNCE_S) -- these
-     * timestamps are this bot's own view and are deliberately not pushed to
-     * the hub; that would mean mesh traffic per admin command. */
-    time_t now_auth = time(NULL);
-    user_record_t *candidate = auth_find_user(state, user_host, now_auth);
-    if (!candidate || !candidate->is_active || candidate->password[0] == '\0') {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: no matching active user for %s\n", user_host);
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    unsigned char key[32];
-    if (!crypto_derive_config_key(candidate->password, salt, key)) {
-      log_message(L_CMD, state, "[CMD] v1 auth: PBKDF2 failed\n");
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-
-    /* crypto_aes_gcm_decrypt expects input = iv || ciphertext, plus tag. */
-    int gcm_in_len = GCM_IV_LEN + ct_len;
-    unsigned char *gcm_in = malloc((size_t)gcm_in_len);
-    if (!gcm_in) {
-      secure_wipe(key, sizeof(key));
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-    memcpy(gcm_in,              iv,                 GCM_IV_LEN);
-    memcpy(gcm_in + GCM_IV_LEN, blob + SALT_SIZE + GCM_IV_LEN, (size_t)ct_len);
-
-    unsigned char *plain = malloc((size_t)ct_len + 1);
-    if (!plain) {
-      secure_wipe(key, sizeof(key));
-      secure_wipe(gcm_in, (size_t)gcm_in_len);
-      free(gcm_in);
-      secure_wipe(blob, (size_t)blob_len);
-      free(blob);
-      return;
-    }
-    int plain_len = crypto_aes_gcm_decrypt(gcm_in, gcm_in_len, key, plain, tag);
-    secure_wipe(key, sizeof(key));
-    secure_wipe(gcm_in, (size_t)gcm_in_len);
-    free(gcm_in);
-    secure_wipe(blob, (size_t)blob_len);
-    free(blob);
-
-    if (plain_len < 0) {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: GCM tag failed for %s (wrong password?)\n",
-                  user_host);
-      secure_wipe(plain, (size_t)ct_len + 1);
-      free(plain);
-      return;
-    }
-    plain[plain_len] = '\0';
-
-    /* Copy decrypted plaintext to v1_plaintext so strtok_r pointers we save
-     * remain valid for the dispatch below. */
-    if ((size_t)plain_len >= sizeof(v1_plaintext)) {
-      secure_wipe(plain, (size_t)plain_len);
-      free(plain);
-      return;
-    }
-    memcpy(v1_plaintext, plain, (size_t)plain_len);
-    v1_plaintext[plain_len] = '\0';
-    secure_wipe(plain, (size_t)plain_len);
-    free(plain);
-
-    /* Same framing rule as v1c: control bytes drop the whole command. */
-    if (has_control_bytes(v1_plaintext, (size_t)plain_len)) {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: control character in command from %s; "
-                  "dropped\n", user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-
-    /* Parse: timestamp:nonce:command args */
-    char *sp_v1;
-    char *ts_str    = strtok_r(v1_plaintext, ":", &sp_v1);
-    char *nonce_str = strtok_r(NULL,         ":", &sp_v1);
-    char *cmd_line  = strtok_r(NULL,         "",  &sp_v1);
-    if (!ts_str || !nonce_str || !cmd_line) {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: malformed plaintext (missing fields)\n");
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-
-    /* Freshness window — narrower than legacy because the script doesn't
-     * need clock-skew tolerance beyond a few seconds. */
-    time_t client_ts = (time_t)strtoll(ts_str, NULL, 10);
-    if (llabs((long long)(now_auth - client_ts)) > 30) {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: timestamp skew %lds (max 30) from %s\n",
-                  (long)(now_auth - client_ts), user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-
-    /* Replay check against the shared admin_nonces ring. */
-    nonce_val = strtoull(nonce_str, NULL, 10);
-    bool replay_v1 = false;
-    { time_t _now = time(NULL);
-      for (int _ri = 0; _ri < MAX_SEEN_HASHES; _ri++) {
-        if (state->admin_nonces[_ri].nonce == nonce_val &&
-            _now - state->admin_nonces[_ri].ts <= NONCE_TTL_SECONDS)
-          { replay_v1 = true; break; }
-      }
-    }
-    if (replay_v1) {
-      log_message(L_CMD, state,
-                  "[CMD] v1 auth: replay detected (nonce=%llu) from %s\n",
-                  (unsigned long long)nonce_val, user_host);
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-    state->admin_nonces[state->admin_nonce_idx] = (nonce_entry_t){ nonce_val, time(NULL) };
-    state->admin_nonce_idx = (state->admin_nonce_idx + 1) % MAX_SEEN_HASHES;
-
-    /* Tokenize the command line, in place, the same way the legacy path does. */
-    char *sp_cmd;
-    command = strtok_r(cmd_line, " ", &sp_cmd);
-    arg1    = strtok_r(NULL,     " ", &sp_cmd);
-    arg2    = strtok_r(NULL,     " ", &sp_cmd);
-    arg3    = strtok_r(NULL,     " ", &sp_cmd);
-    if (!command) {
-      secure_wipe(v1_plaintext, sizeof(v1_plaintext));
-      return;
-    }
-
-    auth_user = candidate;
-    if (candidate->type == 'a') is_admin = true;
-    if (candidate->type == 'o') is_op    = true;
-
-    /* No command text here: log_user_command records it, redacted. */
-    log_message(L_DEBUG, state,
-                "[CMD_DEBUG] v1 frame verified: User='%s' Type=%c\n",
-                candidate->name, candidate->type);
+  } else if (strncmp(message, "~A1", 3) == 0) {
+    log_message(L_CMD, state,
+                "[CMD] Retired password frame (~A1/~A1c) from %s; the client "
+                "script needs updating to the key-based ~A2\n", user_host);
   }
-
   if (!is_admin && !is_op) {
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
-    if (used_v1) secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+    secure_wipe(cmd_plaintext, sizeof(cmd_plaintext));
     /* Nothing below this point may run for an unauthenticated sender: bail
      * rather than relying on every downstream branch staying guarded.
      * `command` is still NULL here on the no-prefix path. */
@@ -631,9 +407,9 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   }
 
   /* Every value a command stores lands in a '|'-delimited config line and
-   * hub record (o|uuid|name|password|add|last_seen|ts), where a '|' shifts
-   * the fields after it: `chpass me pw|add|0|<far future>` would plant a
-   * timestamp that outranks any later -oper. */
+   * hub record (o|uuid|name|pubkey|add|last_seen|ts|), where a '|' shifts
+   * the fields after it: `+usermask me x|add|0|<far future>` would plant a
+   * timestamp that outranks any later -usermask. */
   const char *const toks[] = {command, arg1, arg2, arg3};
   bool has_delim = false;
   for (size_t i = 0; i < sizeof(toks) / sizeof(toks[0]); i++)
@@ -651,14 +427,108 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     dispatch_user_command(state, nick, auth_user, is_admin, is_op, command,
                           arg1, arg2, arg3);
   }
-  /* The decrypted command can carry a new password (chpass, +admin, +oper,
-   * botpass) and nothing points into it once dispatch has returned. */
-  secure_wipe(v1_plaintext, sizeof(v1_plaintext));
+  /* The decrypted command (channel keys, masks, hub addresses) never outlives
+   * its processing; nothing points into it once dispatch has returned. */
+  secure_wipe(cmd_plaintext, sizeof(cmd_plaintext));
+}
+
+/* Fingerprint of a user's key for listings, or "(no key)". */
+static void user_key_fp(const user_record_t *u, char out[KEY_FP_LEN + 1]) {
+  unsigned char pub[HUB_KEY_RAW_LEN];
+  if (u->has_pubkey && crypto_pubkey_b64_decode(u->pubkey_b64, pub))
+    crypto_key_fingerprint(pub, out);
+  else
+    snprintf(out, KEY_FP_LEN + 1, "(no key)");
+}
+
+/* Validate a user public-key argument: the canonical 88-char key, not held
+ * by any other active user (keys identify users on the hub).  `self` is the
+ * record being re-keyed (NULL when adding).  Replies with the reason. */
+static bool user_key_arg_ok(bot_state_t *state, const char *nick,
+                            const char *key, const user_record_t *self,
+                            const char *cmdname) {
+  unsigned char raw[HUB_KEY_RAW_LEN];
+  if (!key || !crypto_pubkey_b64_decode(key, raw)) {
+    irc_printf(state,
+               "PRIVMSG %s :Error: %s needs the user's public key — the "
+               "88-char contents of their <ts>_<name>.public.b64. Ask them "
+               "for it; 'help %s' shows how they make one.\r\n",
+               nick, cmdname, cmdname);
+    return false;
+  }
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *o = &state->user_records[i];
+    if (o == self || !o->is_active || !o->has_pubkey) continue;
+    if (strcmp(o->pubkey_b64, key) == 0) {
+      irc_printf(state,
+                 "PRIVMSG %s :Error: that key already belongs to '%s'. Each "
+                 "user needs their own keypair.\r\n", nick, o->name);
+      return false;
+    }
+  }
+  return true;
+}
+
+static void set_user_key(bot_state_t *state, user_record_t *u,
+                         const char *key) {
+  snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", key);
+  u->has_pubkey = true;
+  u->timestamp = lww_next_ts(u->timestamp);
+  u->last_auth_reply = 0;
+  config_write_with_state_pass(state);
+  hub_client_push_admin_delta(state);
+}
+
+/* Shared by help +admin / +oper / chkey: how a user makes a keypair.
+ * Each line stays well under the IRC line limit. */
+static void help_keypair(bot_state_t *state, const char *nick) {
+  static const char *const lines[] = {
+    "<pubkey> is the user's 88-char public key. The user makes a keypair on "
+    "their own machine, keeps the .private.b64 (chmod 600) for their IRC "
+    "script, and sends you only the .public.b64 contents:",
+    "  keygen <name>     (ircbot/utils/keygen or irchub/bin/keygen; writes "
+    "<YYYYMMDDHHMMSS>_<name>.private.b64 and .public.b64)",
+    "  or with openssl 1.1.1+:  umask 077; openssl genpkey -algorithm ED25519 "
+    "-out ed.pem; openssl genpkey -algorithm X25519 -out x.pem",
+    "  (openssl pkey -in ed.pem -outform DER | tail -c 32; openssl pkey -in "
+    "x.pem -outform DER | tail -c 32) | openssl base64 -A > NAME.private.b64",
+    "  (openssl pkey -in ed.pem -pubout -outform DER | tail -c 32; openssl "
+    "pkey -in x.pem -pubout -outform DER | tail -c 32) | openssl base64 -A > "
+    "NAME.public.b64",
+    "  shred -u ed.pem x.pem    (or rm -f; the .pem files hold the private key)",
+    NULL
+  };
+  struct timespec d = {0, 100000000};
+  for (int i = 0; lines[i]; i++) {
+    irc_printf(state, "PRIVMSG %s :%s\r\n", nick, lines[i]);
+    nanosleep(&d, NULL);
+  }
+}
+
+static void help_auth(bot_state_t *state, const char *nick) {
+  static const char *const lines[] = {
+    "Admins and opers sign in with their Curve25519 key; there are no "
+    "passwords. Use a client script from ircbot/utils (irssi, hexchat, "
+    "weechat, mIRC via bot-auth.exe, or the bot-auth CLI) pointed at your "
+    ".private.b64.",
+    "On the first command to a bot the script sends a signed ~A2A request; "
+    "the bot answers with a ~A2K notice carrying its public key (the script "
+    "shows its fingerprint). Commands then travel sealed as ~A2 frames.",
+    "Compare that fingerprint once with this bot's 'status' or hub_admin's "
+    "bot list. After a bot 'rekey', run /botforget <bot> so the script "
+    "fetches the new key.",
+    NULL
+  };
+  struct timespec d = {0, 100000000};
+  for (int i = 0; lines[i]; i++) {
+    irc_printf(state, "PRIVMSG %s :%s\r\n", nick, lines[i]);
+    nanosleep(&d, NULL);
+  }
 }
 
 /* The admin/oper command tree, split out of commands_handle_private_message
  * so the caller wipes the decrypted command after every return path here.
- * command/arg1..arg3 point into the caller's v1_plaintext. */
+ * command/arg1..arg3 point into the caller's cmd_plaintext. */
 static void dispatch_user_command(bot_state_t *state, const char *nick,
                                   user_record_t *auth_user, bool is_admin,
                                   bool is_op, char *command, char *arg1,
@@ -673,7 +543,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         "+usermask", "-usermask",
         "+bot", "-bot",
         "join", "part",
-        "botpass", "chpass",
+        "chkey",
         /* +hub / -hub are intentionally NOT here: hub membership is a
          * bot-local connection concern (the hub-only-mutation boundary
          * covers mesh-replicated records, not which hubs this bot dials),
@@ -812,27 +682,16 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           return;
         }
       }
-      /* Escalate: hub or encrypted PRIVMSG to trusted bots */
+      /* Escalate: hub, else a sealed ~B2 PRIVMSG to each trusted bot */
       if (!hub_client_send_invite_request(state, nick, inv_channel)) {
         for (int i = 0; i < state->trusted_bot_count; i++) {
           char tb_nick[MAX_NICK];
-          if (sscanf(state->trusted_bots[i], "%9[^!]", tb_nick) == 1) {
+          auth_trusted_bot_nick(&state->trusted_bots[i], tb_nick);
+          if (tb_nick[0])
             bot_comms_send_command(state, tb_nick,
                                    "INVITE %s %s", inv_channel, nick);
-          }
         }
       }
-    } else if (strcasecmp(command, "botpass") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: botpass <password>\r\n", nick);
-        return;
-      }
-      snprintf(state->bot_comm_pass, MAX_PASS, "%s", arg1);
-      state->bot_comm_pass_ts = time(NULL);
-      config_write_with_state_pass(state);
-      irc_printf(state,
-                 "PRIVMSG %s :Bot communication password set and saved.\r\n",
-                 nick);
     } else if (strcasecmp(command, "+bot") == 0) {
       if (state->hub_count > 0) {
         irc_printf(state,
@@ -841,29 +700,65 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                    nick);
         return;
       }
-      if (!arg1) {
+      /* +bot <nick!user@host> <uuid> <pubkey> — all three come from the
+       * other bot's 'status' output.  The key is what ~B2 is sealed with. */
+      if (!arg1 || !arg2 || !arg3) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: +bot <nick*!*user@hostmask.com>\r\n",
-                   nick);
+                   "PRIVMSG %s :Syntax: +bot <nick!user@host> <uuid> <pubkey> "
+                   "- copy the UUID and Pubkey lines from that bot's "
+                   "'status'.\r\n", nick);
+        return;
+      }
+      trusted_bot_t nb;
+      memset(&nb, 0, sizeof(nb));
+      if (strlen(arg1) >= sizeof(nb.mask) || !strchr(arg1, '!') ||
+          !strchr(arg1, '@')) {
+        irc_printf(state, "PRIVMSG %s :Error: mask must be nick!user@host "
+                          "(max %d chars).\r\n", nick, MAX_MASK_LEN - 1);
+        return;
+      }
+      if (strlen(arg2) != 36 || arg2[8] != '-' || arg2[13] != '-' ||
+          arg2[18] != '-' || arg2[23] != '-') {
+        irc_printf(state, "PRIVMSG %s :Error: '%s' is not a bot UUID.\r\n",
+                   nick, arg2);
+        return;
+      }
+      if (!crypto_pubkey_b64_decode(arg3, nb.pub)) {
+        irc_printf(state, "PRIVMSG %s :Error: pubkey must be the bot's "
+                          "88-char public key (Pubkey line of its "
+                          "'status').\r\n", nick);
+        return;
+      }
+      if (strcmp(arg2, state->bot_uuid) == 0) {
+        irc_printf(state, "PRIVMSG %s :Error: that is this bot.\r\n", nick);
         return;
       }
       for (int i = 0; i < state->trusted_bot_count; i++) {
-        if (strcasecmp(state->trusted_bots[i], arg1) == 0) {
+        if (strcasecmp(state->trusted_bots[i].mask, arg1) == 0 ||
+            strcmp(state->trusted_bots[i].uuid, arg2) == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Error: Trusted bot mask '%s' already exists.\r\n",
+              "PRIVMSG %s :Error: Trusted bot '%s' already exists (same mask "
+              "or UUID). Remove it with -bot first.\r\n",
               nick, arg1);
           return;
         }
       }
-      if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-        char *dup = strdup(arg1);
-        if (!dup) return;
-        state->trusted_bots[state->trusted_bot_count++] = dup;
-        state->trusted_bots[state->trusted_bot_count] = NULL;
-        config_write_with_state_pass(state);
-        irc_printf(state, "PRIVMSG %s :Added trusted bot: %s\r\n", nick, arg1);
+      if (state->trusted_bot_count >= MAX_TRUSTED_BOTS) {
+        irc_printf(state, "PRIVMSG %s :Error: trusted bot list is full.\r\n",
+                   nick);
+        return;
       }
+      snprintf(nb.mask, sizeof(nb.mask), "%s", arg1);
+      snprintf(nb.uuid, sizeof(nb.uuid), "%s", arg2);
+      nb.has_pub = true;
+      nb.ts = time(NULL);
+      state->trusted_bots[state->trusted_bot_count++] = nb;
+      config_write_with_state_pass(state);
+      char fp[KEY_FP_LEN + 1];
+      crypto_key_fingerprint(nb.pub, fp);
+      irc_printf(state, "PRIVMSG %s :Added trusted bot: %s (key %s)\r\n", nick,
+                 arg1, fp);
     } else if (strcasecmp(command, "-bot") == 0) {
       if (state->hub_count > 0) {
         irc_printf(state,
@@ -880,21 +775,25 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       int found_index = -1;
       for (int i = 0; i < state->trusted_bot_count; i++) {
-        if (strcasecmp(state->trusted_bots[i], arg1) == 0) {
+        if (strcasecmp(state->trusted_bots[i].mask, arg1) == 0) {
           found_index = i;
           break;
         }
       }
       if (found_index != -1) {
-        free(state->trusted_bots[found_index]);
-        for (int i = found_index; i < state->trusted_bot_count - 1; i++) {
-          state->trusted_bots[i] = state->trusted_bots[i + 1];
-        }
+        memmove(&state->trusted_bots[found_index],
+                &state->trusted_bots[found_index + 1],
+                (size_t)(state->trusted_bot_count - found_index - 1) *
+                    sizeof(trusted_bot_t));
         state->trusted_bot_count--;
-        state->trusted_bots[state->trusted_bot_count] = NULL;
+        memset(&state->trusted_bots[state->trusted_bot_count], 0,
+               sizeof(trusted_bot_t));
         config_write_with_state_pass(state);
         irc_printf(state, "PRIVMSG %s :Removed trusted bot: %s\r\n", nick,
                    arg1);
+      } else {
+        irc_printf(state, "PRIVMSG %s :Error: no trusted bot with mask '%s' "
+                          "(see 'status').\r\n", nick, arg1);
       }
     } else if (strcasecmp(command, "status") == 0) {
 #define ST_SEP  "+----------------------------------------------------------------------------"
@@ -956,6 +855,17 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :| Identity : %s (Target: %s) | UUID: %s\r\n",
                  nick, state->current_nick, state->target_nick,
                  state->bot_uuid[0] ? state->bot_uuid : "none");
+      if (state->self_pub_set) {
+        char *spb = base64_encode(state->self_pub, HUB_KEY_RAW_LEN);
+        char sfp[KEY_FP_LEN + 1];
+        crypto_key_fingerprint(state->self_pub, sfp);
+        irc_printf(state, "PRIVMSG %s :| Pubkey   : %s (fp %s)\r\n", nick,
+                   spb ? spb : "?", sfp);
+        free(spb);
+      } else {
+        irc_printf(state, "PRIVMSG %s :| Pubkey   : NONE (re-run -setup)\r\n",
+                   nick);
+      }
       irc_printf(state, "PRIVMSG %s :| Uptime   : %s\r\n", nick, uptime_str);
       irc_printf(state, "PRIVMSG %s :| Network  : %s (%s, TLS: %s)\r\n",
                  nick, srv, conn_str, state->is_ssl ? "YES" : "NO");
@@ -1092,8 +1002,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           char trust_line[512] = ""; int toff = 0;
           int first = 1, shown = 0;
           for (int i = 0; i < state->trusted_bot_count && shown < HUB_TRUST_MAX; i++, shown++) {
-            char tname[64] = "";
-            sscanf(state->trusted_bots[i], "%63[^!]", tname);
+            char tname[MAX_NICK];
+            auth_trusted_bot_nick(&state->trusted_bots[i], tname);
             int tlen = (int)strlen(tname);
             int need = toff ? tlen + 2 : tlen;
             if (toff && toff + need > BOTS_CW) {
@@ -1119,8 +1029,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         char trust_line[512] = ""; int toff = 0;
         int first = 1, shown = 0;
         for (int i = 0; i < state->trusted_bot_count && shown < HUB_TRUST_MAX; i++, shown++) {
-          char tname[64] = "";
-          sscanf(state->trusted_bots[i], "%63[^!]", tname);
+          char tname[MAX_NICK];
+          auth_trusted_bot_nick(&state->trusted_bots[i], tname);
           int tlen = (int)strlen(tname);
           int need = toff ? tlen + 2 : tlen;
           if (toff && toff + need > BOTS_CW) {
@@ -1184,8 +1094,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         return;
       }
       for (int i = 0; i < state->trusted_bot_count; i++) {
-        char bnick[MAX_NICK] = "";
-        sscanf(state->trusted_bots[i], "%9[^!]", bnick);
+        char bnick[MAX_NICK];
+        auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
         if (strcasecmp(bnick, arg2) == 0) {
           irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use by a bot.\r\n",
                      nick, arg2);
@@ -1209,7 +1119,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           user_record_t *u = &state->user_records[i];
           if (u->is_active && strcasecmp(u->name, arg1) == 0) {
             snprintf(u->name, sizeof(u->name), "%s", arg2);
-            u->timestamp = time(NULL);
+            u->timestamp = lww_next_ts(u->timestamp);
             config_write_with_state_pass(state);
             hub_client_push_admin_delta(state);
             irc_printf(state, "PRIVMSG %s :User '%s' renamed to '%s'.\r\n",
@@ -1222,34 +1132,26 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       /* Case 3: trusted bot */
       if (!cn_found) {
         for (int i = 0; i < state->trusted_bot_count; i++) {
-          char bnick[MAX_NICK] = "", bmask[MAX_MASK_LEN] = "";
-          char buuid[64] = "";
-          long long bts = 0;
-          sscanf(state->trusted_bots[i], "%9[^!]", bnick);
+          trusted_bot_t *tb = &state->trusted_bots[i];
+          char bnick[MAX_NICK];
+          auth_trusted_bot_nick(tb, bnick);
           if (strcasecmp(bnick, arg1) != 0) continue;
-          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%lld",
-                 bmask, buuid, &bts);
           /* Replace the nick part of the mask (up to '!') */
           char newmask[MAX_MASK_LEN] = "";
-          char *bang = strchr(bmask, '!');
-          if (bang)
-            snprintf(newmask, sizeof(newmask), "%s%s", arg2, bang);
-          else
-            snprintf(newmask, sizeof(newmask), "%s", arg2);
-          long new_ts = time(NULL);
-          char new_entry[512];
-          snprintf(new_entry, sizeof(new_entry), "%s|%s|%ld",
-                   newmask, buuid, new_ts);
-          char *dup_entry = strdup(new_entry);
-          if (!dup_entry) {
-            irc_printf(state, "PRIVMSG %s :Error: Memory allocation failed.\r\n", nick);
+          const char *bang = strchr(tb->mask, '!');
+          int nm = bang ? snprintf(newmask, sizeof(newmask), "%s%s", arg2, bang)
+                        : snprintf(newmask, sizeof(newmask), "%s", arg2);
+          if (nm < 0 || nm >= (int)sizeof(newmask)) {
+            irc_printf(state, "PRIVMSG %s :Error: resulting mask too long.\r\n",
+                       nick);
             return;
           }
-          free(state->trusted_bots[i]);
-          state->trusted_bots[i] = dup_entry;
-          config_write_with_state_pass(state);
-          /* Send SETNICK to the bot via encrypted bot comms (old nick) */
+          /* Notify first: the sealed SETNICK is addressed by the bot's
+           * current (old) nick, which the lookup reads from this entry. */
           bot_comms_send_command(state, arg1, "SETNICK %s", arg2);
+          snprintf(tb->mask, sizeof(tb->mask), "%s", newmask);
+          tb->ts = time(NULL);
+          config_write_with_state_pass(state);
           irc_printf(state, "PRIVMSG %s :Bot '%s' renamed to '%s' and notified.\r\n",
                      nick, arg1, arg2);
           cn_found = true;
@@ -1379,8 +1281,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         }
         char del_tag[16] = "";
         if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
-        irc_printf(state, "PRIVMSG %s :| %-*s  (last seen: %s)%s\r\n",
-                   nick, name_w, u->name, ts_buf, del_tag);
+        char kfp[KEY_FP_LEN + 1];
+        user_key_fp(u, kfp);
+        irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
+                   nick, name_w, u->name, kfp, ts_buf, del_tag);
         shown++;
         nanosleep(&delay, NULL);
       }
@@ -1412,8 +1316,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         }
         char del_tag[16] = "";
         if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
-        irc_printf(state, "PRIVMSG %s :| %-*s  (last seen: %s)%s\r\n",
-                   nick, name_w, u->name, ts_buf, del_tag);
+        char kfp[KEY_FP_LEN + 1];
+        user_key_fp(u, kfp);
+        irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
+                   nick, name_w, u->name, kfp, ts_buf, del_tag);
         shown++;
         nanosleep(&delay, NULL);
       }
@@ -1445,8 +1351,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
           else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
         }
-        irc_printf(state, "PRIVMSG %s :| [%c] %-20s  (last seen: %s)\r\n",
-                   nick, u->type, u->name, ts_buf);
+        char kfp[KEY_FP_LEN + 1];
+        user_key_fp(u, kfp);
+        irc_printf(state, "PRIVMSG %s :| [%c] %-20s  key %s  (last seen: %s)\r\n",
+                   nick, u->type, u->name, kfp, ts_buf);
         nanosleep(&delay, NULL);
         for (int j = 0; j < state->mask_record_count; j++) {
           mask_record_t *m = &state->mask_records[j];
@@ -1469,12 +1377,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       /* If no user record found and not wildcard, check trusted bots */
       if (shown == 0 && !match_all) {
         for (int i = 0; i < state->trusted_bot_count; i++) {
-          char bot_mask[256] = "", bot_uuid[64] = "";
-          long long bot_ts = 0;
-          sscanf(state->trusted_bots[i], "%255[^|]|%63[^|]|%lld",
-                 bot_mask, bot_uuid, &bot_ts);
-          char bot_nick[MAX_NICK] = "";
-          sscanf(bot_mask, "%9[^!]", bot_nick);
+          const trusted_bot_t *tb = &state->trusted_bots[i];
+          const char *bot_mask = tb->mask, *bot_uuid = tb->uuid;
+          long long bot_ts = (long long)tb->ts;
+          char bot_nick[MAX_NICK];
+          auth_trusted_bot_nick(tb, bot_nick);
           if (strcasecmp(bot_nick, arg1) != 0) continue;
           /* Found a matching bot */
           char ts_buf[48];
@@ -1493,6 +1400,13 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
             irc_printf(state, "PRIVMSG %s :|   mask: %s\r\n", nick, bot_mask);
           if (bot_uuid[0])
             irc_printf(state, "PRIVMSG %s :|   uuid: %s\r\n", nick, bot_uuid);
+          if (tb->has_pub) {
+            char bfp[KEY_FP_LEN + 1];
+            crypto_key_fingerprint(tb->pub, bfp);
+            irc_printf(state, "PRIVMSG %s :|   key : %s\r\n", nick, bfp);
+          } else {
+            irc_printf(state, "PRIVMSG %s :|   key : (none on file)\r\n", nick);
+          }
           const char *hub_str = (state->hub_connected && state->current_hub[0])
                                 ? state->current_hub : "none";
           irc_printf(state, "PRIVMSG %s :|   hub : %s\r\n", nick, hub_str);
@@ -1506,31 +1420,54 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       match_done:
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
-    } else if (strcasecmp(command, "+admin") == 0) {
-      /* +admin <name> <password> <usermask> */
+    } else if (strcasecmp(command, "+admin") == 0 ||
+               strcasecmp(command, "+oper") == 0) {
+      /* +admin|+oper <name> <pubkey> <nick!user@host>.  The user makes their
+       * own keypair and hands over only the public half, so nothing secret
+       * travels and the bot never mints or delivers a key. */
+      const bool add_admin = (strcasecmp(command, "+admin") == 0);
+      const char *what = add_admin ? "+admin" : "+oper";
       if (!arg1 || !arg2 || !arg3) {
-        irc_printf(state, "PRIVMSG %s :Syntax: +admin <name> <password> <nick!user@host>\r\n", nick);
+        irc_printf(state,
+                   "PRIVMSG %s :Syntax: %s <name> <pubkey> <nick!user@host> - "
+                   "<pubkey> is the user's 88-char public key. Ask them for "
+                   "it; 'help %s' shows how they make one.\r\n",
+                   nick, what, what);
         return;
       }
-      if (!strchr(arg3,'!') || !strchr(arg3,'@')) {
-        irc_printf(state, "PRIVMSG %s :Error: mask must contain ! and @\r\n", nick);
+      if (strlen(arg1) > 63) {
+        irc_printf(state, "PRIVMSG %s :Error: name too long (max 63).\r\n", nick);
+        return;
+      }
+      if (!strchr(arg3, '!') || !strchr(arg3, '@') ||
+          strlen(arg3) >= MAX_MASK_LEN) {
+        irc_printf(state, "PRIVMSG %s :Error: mask must be nick!user@host "
+                          "(max %d chars)\r\n", nick, MAX_MASK_LEN - 1);
         return;
       }
       for (int i = 0; i < state->user_record_count; i++) {
         if (state->user_records[i].is_active &&
             strcasecmp(state->user_records[i].name, arg1) == 0) {
-          irc_printf(state, "PRIVMSG %s :Error: name '%s' already exists.\r\n", nick, arg1);
+          irc_printf(state, "PRIVMSG %s :Error: name '%s' already exists.\r\n",
+                     nick, arg1);
           return;
         }
       }
+      if (!user_key_arg_ok(state, nick, arg2, NULL, what)) return;
       if (state->user_record_count >= MAX_USER_RECORDS) {
-        irc_printf(state, "PRIVMSG %s :Error: user record table full.\r\n", nick); return;
+        irc_printf(state, "PRIVMSG %s :Error: user record table full.\r\n", nick);
+        return;
       }
       if (state->mask_record_count >= MAX_USER_MASKS) {
-        irc_printf(state, "PRIVMSG %s :Error: mask table full.\r\n", nick); return;
+        irc_printf(state, "PRIVMSG %s :Error: mask table full.\r\n", nick);
+        return;
       }
       /* Generate UUID using random bytes */
-      unsigned char rnd[16]; RAND_bytes(rnd, sizeof(rnd));
+      unsigned char rnd[16];
+      if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
+        irc_printf(state, "PRIVMSG %s :Error: RNG failure.\r\n", nick);
+        return;
+      }
       rnd[6]=(rnd[6]&0x0f)|0x40; rnd[8]=(rnd[8]&0x3f)|0x80;
       char new_uuid[37];
       snprintf(new_uuid, sizeof(new_uuid),
@@ -1542,8 +1479,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       memset(u, 0, sizeof(*u));
       snprintf(u->uuid, sizeof(u->uuid), "%s", new_uuid);
       snprintf(u->name, sizeof(u->name), "%s", arg1);
-      snprintf(u->password, sizeof(u->password), "%s", arg2);
-      u->type = 'a'; u->is_active = true; u->timestamp = now;
+      snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", arg2);
+      u->has_pubkey = true;
+      u->type = add_admin ? 'a' : 'o';
+      u->is_active = true; u->timestamp = now;
       mask_record_t *m = &state->mask_records[state->mask_record_count++];
       memset(m, 0, sizeof(*m));
       snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
@@ -1551,7 +1490,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       m->is_active = true; m->timestamp = now;
       config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
-      irc_printf(state, "PRIVMSG %s :Admin '%s' added with mask %s\r\n", nick, arg1, arg3);
+      char kfp[KEY_FP_LEN + 1];
+      user_key_fp(u, kfp);
+      irc_printf(state, "PRIVMSG %s :%s '%s' added with mask %s (key %s)\r\n",
+                 nick, add_admin ? "Admin" : "Oper", arg1, arg3, kfp);
 
     } else if (strcasecmp(command, "-admin") == 0) {
       if (!arg1) {
@@ -1566,56 +1508,16 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (!target) { irc_printf(state, "PRIVMSG %s :Error: admin '%s' not found.\r\n", nick, arg1); return; }
       target->is_active = false;
-      target->timestamp = time(NULL);
+      target->timestamp = lww_next_ts(target->timestamp);
       for (int i = 0; i < state->mask_record_count; i++)
         if (strcmp(state->mask_records[i].uuid, target->uuid) == 0) {
           state->mask_records[i].is_active = false;
-          state->mask_records[i].timestamp = time(NULL);
+          state->mask_records[i].timestamp =
+              lww_next_ts(state->mask_records[i].timestamp);
         }
       config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Admin '%s' and all their masks removed.\r\n", nick, arg1);
-
-    } else if (strcasecmp(command, "+oper") == 0) {
-      /* +oper <name> <password> <usermask> */
-      if (!arg1 || !arg2 || !arg3) {
-        irc_printf(state, "PRIVMSG %s :Syntax: +oper <name> <password> <nick!user@host>\r\n", nick);
-        return;
-      }
-      if (!strchr(arg3,'!') || !strchr(arg3,'@')) {
-        irc_printf(state, "PRIVMSG %s :Error: mask must contain ! and @\r\n", nick); return;
-      }
-      for (int i = 0; i < state->user_record_count; i++) {
-        if (state->user_records[i].is_active &&
-            strcasecmp(state->user_records[i].name, arg1) == 0) {
-          irc_printf(state, "PRIVMSG %s :Error: name '%s' already exists.\r\n", nick, arg1); return;
-        }
-      }
-      if (state->user_record_count >= MAX_USER_RECORDS || state->mask_record_count >= MAX_USER_MASKS) {
-        irc_printf(state, "PRIVMSG %s :Error: table full.\r\n", nick); return;
-      }
-      unsigned char rnd2[16]; RAND_bytes(rnd2, sizeof(rnd2));
-      rnd2[6]=(rnd2[6]&0x0f)|0x40; rnd2[8]=(rnd2[8]&0x3f)|0x80;
-      char new_uuid2[37];
-      snprintf(new_uuid2, sizeof(new_uuid2),
-               "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
-               rnd2[0],rnd2[1],rnd2[2],rnd2[3],rnd2[4],rnd2[5],rnd2[6],rnd2[7],
-               rnd2[8],rnd2[9],rnd2[10],rnd2[11],rnd2[12],rnd2[13],rnd2[14],rnd2[15]);
-      time_t now2 = time(NULL);
-      user_record_t *u2 = &state->user_records[state->user_record_count++];
-      memset(u2, 0, sizeof(*u2));
-      snprintf(u2->uuid, sizeof(u2->uuid), "%s", new_uuid2);
-      snprintf(u2->name, sizeof(u2->name), "%s", arg1);
-      snprintf(u2->password, sizeof(u2->password), "%s", arg2);
-      u2->type = 'o'; u2->is_active = true; u2->timestamp = now2;
-      mask_record_t *m2 = &state->mask_records[state->mask_record_count++];
-      memset(m2, 0, sizeof(*m2));
-      snprintf(m2->uuid, sizeof(m2->uuid), "%s", new_uuid2);
-      snprintf(m2->mask, sizeof(m2->mask), "%s", arg3);
-      m2->is_active = true; m2->timestamp = now2;
-      config_write_with_state_pass(state);
-      hub_client_push_admin_delta(state);
-      irc_printf(state, "PRIVMSG %s :Oper '%s' added with mask %s\r\n", nick, arg1, arg3);
 
     } else if (strcasecmp(command, "-oper") == 0) {
       if (!arg1) {
@@ -1630,11 +1532,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (!target_o) { irc_printf(state, "PRIVMSG %s :Error: oper '%s' not found.\r\n", nick, arg1); return; }
       target_o->is_active = false;
-      target_o->timestamp = time(NULL);
+      target_o->timestamp = lww_next_ts(target_o->timestamp);
       for (int i = 0; i < state->mask_record_count; i++)
         if (strcmp(state->mask_records[i].uuid, target_o->uuid) == 0) {
           state->mask_records[i].is_active = false;
-          state->mask_records[i].timestamp = time(NULL);
+          state->mask_records[i].timestamp =
+              lww_next_ts(state->mask_records[i].timestamp);
         }
       config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
@@ -1656,12 +1559,25 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         }
       }
       if (!tum) { irc_printf(state, "PRIVMSG %s :Error: user '%s' not found.\r\n", nick, arg1); return; }
+      mask_record_t *old_m = NULL;   /* a tombstone for this exact mask */
       for (int i = 0; i < state->mask_record_count; i++) {
-        if (state->mask_records[i].is_active &&
-            strcmp(state->mask_records[i].uuid, tum->uuid) == 0 &&
-            strcasecmp(state->mask_records[i].mask, arg2) == 0) {
+        if (strcmp(state->mask_records[i].uuid, tum->uuid) != 0 ||
+            strcasecmp(state->mask_records[i].mask, arg2) != 0)
+          continue;
+        if (state->mask_records[i].is_active) {
           irc_printf(state, "PRIVMSG %s :Error: mask already exists.\r\n", nick); return;
         }
+        old_m = &state->mask_records[i];
+      }
+      if (old_m) {
+        /* Revive the tombstone past its stamp: a second record for the same
+         * uuid+mask could tie with the remove and lose on the hub. */
+        old_m->is_active = true;
+        old_m->timestamp = lww_next_ts(old_m->timestamp);
+        config_write_with_state_pass(state);
+        hub_client_push_admin_delta(state);
+        irc_printf(state, "PRIVMSG %s :Mask %s added to %s\r\n", nick, arg2, arg1);
+        return;
       }
       if (state->mask_record_count >= MAX_USER_MASKS) {
         irc_printf(state, "PRIVMSG %s :Error: mask table full.\r\n", nick); return;
@@ -1699,7 +1615,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (!fdm) { irc_printf(state, "PRIVMSG %s :Error: mask '%s' not found for %s.\r\n", nick, arg2, arg1); return; }
       fdm->is_active = false;
-      fdm->timestamp = time(NULL);
+      fdm->timestamp = lww_next_ts(fdm->timestamp);
       config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Mask %s removed from %s\r\n", nick, arg2, arg1);
@@ -1923,11 +1839,15 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       memcpy(state->hub_key_raw, new_priv, HUB_KEY_RAW_LEN);
       secure_wipe(state->hub_key, sizeof(state->hub_key));
       snprintf(state->hub_key, sizeof(state->hub_key), "%s", new_priv_b64);
+      bot_self_pub_refresh(state);
       config_write_with_state_pass(state);
 
+      char rfp[KEY_FP_LEN + 1];
+      crypto_key_fingerprint(new_pub, rfp);
       irc_printf(state,
-                 "PRIVMSG %s :✓ Rekeyed. New pubkey pushed to hub; "
-                 "reconnecting with new key.\r\n", nick);
+                 "PRIVMSG %s :✓ Rekeyed (new key %s). New pubkey pushed to "
+                 "hub; reconnecting with new key. Clients must re-auth "
+                 "(/botforget %s).\r\n", nick, rfp, state->current_nick);
       log_message(L_INFO, state,
                   "[HUB] Rekey: generated new identity, pushed new pub to hub, "
                   "reconnecting.\n");
@@ -1942,24 +1862,28 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       hub_client_disconnect(state);
       state->last_hub_connect_attempt = 0;
       hub_client_connect(state);
-    } else if (strcasecmp(command, "chpass") == 0) {
-      /* chpass <name> <newpassword> — admin changes anyone; oper changes own only */
+    } else if (strcasecmp(command, "chkey") == 0) {
+      /* chkey <name> <pubkey> — admins change anyone's key (opers: own only,
+       * handled in the oper branch).  UUID, masks and history are kept. */
       if (!arg1 || !arg2) {
-        irc_printf(state, "PRIVMSG %s :Syntax: chpass <name> <newpassword>\r\n", nick); return;
+        irc_printf(state, "PRIVMSG %s :Syntax: chkey <name> <pubkey>\r\n", nick);
+        return;
       }
-      user_record_t *cp_target = NULL;
+      user_record_t *ck = NULL;
       for (int i = 0; i < state->user_record_count; i++) {
         if (state->user_records[i].is_active &&
             strcasecmp(state->user_records[i].name, arg1) == 0) {
-          cp_target = &state->user_records[i]; break;
+          ck = &state->user_records[i]; break;
         }
       }
-      if (!cp_target) { irc_printf(state, "PRIVMSG %s :Error: user '%s' not found.\r\n", nick, arg1); return; }
-      snprintf(cp_target->password, sizeof(cp_target->password), "%s", arg2);
-      cp_target->timestamp = time(NULL);
-      config_write_with_state_pass(state);
-      hub_client_push_admin_delta(state);
-      irc_printf(state, "PRIVMSG %s :Password changed for %s\r\n", nick, arg1);
+      if (!ck) { irc_printf(state, "PRIVMSG %s :Error: user '%s' not found.\r\n", nick, arg1); return; }
+      if (!user_key_arg_ok(state, nick, arg2, ck, "chkey")) return;
+      set_user_key(state, ck, arg2);
+      char kfp[KEY_FP_LEN + 1];
+      user_key_fp(ck, kfp);
+      irc_printf(state, "PRIVMSG %s :Key for %s changed (key %s). They must "
+                        "use the new private key from now on.\r\n",
+                 nick, ck->name, kfp);
 
     } else if (strcasecmp(command, "help") == 0) {
       if (!arg1) {
@@ -1970,13 +1894,15 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers, match\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)\r\n", nick);
         } else {
-          irc_printf(state, "PRIVMSG %s : |   die, jump, op, join, part, status, givenick, chnick\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chpass, match\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   botpass, +bot, -bot, +hub, -hub, rekey\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, join, part, status, givenick, chnick\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers, match\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +bot, -bot, +hub, -hub, rekey\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   saveconf, setlog, getlog, update, help\r\n", nick);
         }
+        irc_printf(state, "PRIVMSG %s : |   'help auth' explains how clients sign in with their key\r\n", nick);
         irc_printf(state, "PRIVMSG %s : |\r\n", nick);
         irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
       } else {
@@ -2031,15 +1957,17 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s :Syntax: opers - List all opers.\r\n", nick);
         } else if (strcasecmp(arg1, "+admin") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: +admin <name> <password> <mask> - "
-                     "Add a named admin with first usermask. Name must be unique across admins and opers.\r\n", nick);
+                     "PRIVMSG %s :Syntax: +admin <name> <pubkey> <nick!user@host> - "
+                     "Add a named admin with a first usermask. Name must be unique across admins and opers.\r\n", nick);
+          help_keypair(state, nick);
         } else if (strcasecmp(arg1, "-admin") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: -admin <name> - Remove admin and all their masks.\r\n", nick);
         } else if (strcasecmp(arg1, "+oper") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: +oper <name> <password> <mask> - "
-                     "Add a named oper with first usermask.\r\n", nick);
+                     "PRIVMSG %s :Syntax: +oper <name> <pubkey> <nick!user@host> - "
+                     "Add a named oper with a first usermask. Opers may use op, chkey (own key) and help.\r\n", nick);
+          help_keypair(state, nick);
         } else if (strcasecmp(arg1, "-oper") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: -oper <name> - Remove oper and all their masks.\r\n", nick);
@@ -2049,26 +1977,28 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         } else if (strcasecmp(arg1, "-usermask") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: -usermask <name> <mask> - Remove a specific usermask from admin or oper.\r\n", nick);
-        } else if (strcasecmp(arg1, "chpass") == 0) {
+        } else if (strcasecmp(arg1, "chkey") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: chpass <name> <newpassword> - Change password for named admin or oper. "
-                     "Opers may only change their own password.\r\n", nick);
+                     "PRIVMSG %s :Syntax: chkey <name> <pubkey> - Replace the public key of a named admin or oper "
+                     "(UUID and usermasks are kept). Opers may only change their own key.\r\n", nick);
+          help_keypair(state, nick);
+        } else if (strcasecmp(arg1, "invite") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a "
+                     "trusted bot if this bot is not opped there).\r\n", nick);
+        } else if (strcasecmp(arg1, "auth") == 0) {
+          help_auth(state, nick);
         } else if (strcasecmp(arg1, "match") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: match <name|*> - Show all records for a user, or * for all users.\r\n", nick);
-        } else if (strcasecmp(arg1, "botpass") == 0) {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: botpass <password> - Creates a bot "
-                     "password that bots use to communicate with each other. "
-                     "This password is used in all bot communication with "
-                     "known bots matching a stored usermask.\r\n",
-                     nick);
         } else if (strcasecmp(arg1, "+bot") == 0) {
           irc_printf(
               state,
-              "PRIVMSG %s :Syntax: +bot <nick*!*user@hostmask.com> - Adds a "
-              "bot mask for secure bot communication. The usermask should be "
-              "reflective of potential nick changes.\r\n",
+              "PRIVMSG %s :Syntax: +bot <nick!user@host> <uuid> <pubkey> - "
+              "Standalone bots only (hub-managed bots get peers from the hub): "
+              "trust another bot for encrypted bot-to-bot commands. Copy the "
+              "UUID and Pubkey from that bot's 'status' (or its -setup "
+              "output). The mask should be the one the network shows for it.\r\n",
               nick);
         } else if (strcasecmp(arg1, "-bot") == 0) {
           irc_printf(state,
@@ -2128,7 +2058,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               state,
               "PRIVMSG %s :Syntax: rekey - Generate a new Curve25519 identity "
               "keypair locally, push the new public key to the hub, and "
-              "reconnect. UUID is unchanged. Requires an active hub session.\r\n",
+              "reconnect. UUID is unchanged. Requires an active hub session. "
+              "Clients holding the old key must re-auth (/botforget <bot>).\r\n",
               nick);
         } else {
           irc_printf(state,
@@ -2144,32 +2075,44 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       char *op_arg1 = strtok_r(arg1, " ", &saveptr_op);
       if (op_arg1)
         irc_printf(state, "MODE %s +o %s\r\n", op_arg1, nick);
-    } else if (strcasecmp(command, "chpass") == 0) {
-      /* Opers can only change their own password */
+    } else if (strcasecmp(command, "chkey") == 0) {
+      /* Opers can only change their own key (refused under opt 'h', like
+       * every other local mutation of a hub-authoritative record). */
+      if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
+        irc_printf(state,
+                   "PRIVMSG %s :Error: 'chkey' is disabled — network is in "
+                   "hub-only-mutation mode (opt 'h'). Ask a hub admin.\r\n",
+                   nick);
+        return;
+      }
       if (!arg1 || !arg2) {
-        irc_printf(state, "PRIVMSG %s :Syntax: chpass <yourname> <newpassword>\r\n", nick); return;
+        irc_printf(state, "PRIVMSG %s :Syntax: chkey <yourname> <pubkey>\r\n", nick); return;
       }
       if (!auth_user || strcasecmp(auth_user->name, arg1) != 0) {
-        irc_printf(state, "PRIVMSG %s :Error: opers may only change their own password.\r\n", nick); return;
+        irc_printf(state, "PRIVMSG %s :Error: opers may only change their own key.\r\n", nick); return;
       }
-      snprintf(auth_user->password, sizeof(auth_user->password), "%s", arg2);
-      auth_user->timestamp = time(NULL);
-      config_write_with_state_pass(state);
-      hub_client_push_admin_delta(state);
-      irc_printf(state, "PRIVMSG %s :Your password has been changed.\r\n", nick);
+      if (!user_key_arg_ok(state, nick, arg2, auth_user, "chkey")) return;
+      set_user_key(state, auth_user, arg2);
+      char kfp[KEY_FP_LEN + 1];
+      user_key_fp(auth_user, kfp);
+      irc_printf(state, "PRIVMSG %s :Your key has been changed (key %s). Use "
+                        "the new private key from now on.\r\n", nick, kfp);
     } else if (strcasecmp(command, "help") == 0) {
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s : | " BOT_NAME " " BOT_VERSION " help\r\n", nick);
         irc_printf(state, "PRIVMSG %s : +----------------------------------------------------------------------------\r\n", nick);
         irc_printf(state, "PRIVMSG %s : | \r\n", nick);
-        irc_printf(state, "PRIVMSG %s : |   op, chpass, help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : |   op, chkey, help\r\n", nick);
         irc_printf(state, "PRIVMSG %s : |\r\n", nick);
         irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
       } else {
         if (strcasecmp(arg1, "op") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: op <#channel> - Get operator status on a channel.\r\n", nick);
-        } else if (strcasecmp(arg1, "chpass") == 0) {
-          irc_printf(state, "PRIVMSG %s :Syntax: chpass <yourname> <newpassword> - Change your own password.\r\n", nick);
+        } else if (strcasecmp(arg1, "chkey") == 0) {
+          irc_printf(state, "PRIVMSG %s :Syntax: chkey <yourname> <pubkey> - Replace your own public key.\r\n", nick);
+          help_keypair(state, nick);
+        } else if (strcasecmp(arg1, "auth") == 0) {
+          help_auth(state, nick);
         } else if (strcasecmp(arg1, "help") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: help [command] - Show available commands.\r\n", nick);
         } else {

@@ -21,4 +21,5 @@ utils/decrypt_config
 utils/encrypt_config
 docs/*
 utils/bot-auth
+utils/keygen
 releases/

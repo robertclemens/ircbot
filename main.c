@@ -28,7 +28,7 @@ void ssl_init_openssl(void) {
 /* Process hardening: keep secrets out of anything that lands on disk.
  *
  * PR_SET_DUMPABLE(0) suppresses the core dump on a crash.  Without it a
- * crash hands every admin/oper plaintext password in user_records[] to
+ * crash hands the bot's identity private key and the config password to
  * /proc/sys/kernel/core_pattern -- on this host that pipes to
  * systemd-coredump, i.e. straight to disk.  It also blocks same-uid ptrace
  * attach, complementing kernel.yama.ptrace_scope.
@@ -52,9 +52,9 @@ static void state_init(bot_state_t *state) {
   /* Lock the whole state into RAM so no part of it can reach swap or a
    * hibernation image.  bot_state_t is ~301 KB against a 4 MB RLIMIT_MEMLOCK,
    * so locking wholesale is cheaper than tracking individual fields and it
-   * covers user_records[] (every admin/oper plaintext password), hub_key[]
-   * (base64 of the combined private key), hub_session_key[], and anything
-   * secret added later.  Best-effort: a failure here is not fatal. */
+   * covers hub_key[] (base64 of the combined private key), hub_session_key[],
+   * startup_password, and anything secret added later.  Best-effort: a failure
+   * here is not fatal. */
   if (mlock(state, sizeof(bot_state_t)) != 0)
     fprintf(stderr, "Warning: mlock(state) failed (%s) - "
                     "secrets may reach swap.\n", strerror(errno));
@@ -83,6 +83,10 @@ static void state_destroy(bot_state_t *state) {
   for (int i = 0; i < state->hub_count; i++)
     OPENSSL_cleanse(state->hubs[i].ed_pub, sizeof(state->hubs[i].ed_pub));
   channel_list_destroy(state);
+  /* The base64 copy of the identity key and the live session key die with
+   * the raw key (the whole state is mlock'd in state_init; this is the wipe). */
+  OPENSSL_cleanse(state->hub_key,         sizeof(state->hub_key));
+  OPENSSL_cleanse(state->hub_session_key, sizeof(state->hub_session_key));
   OPENSSL_cleanse(state->hub_key_raw,     sizeof(state->hub_key_raw));
   munlock(state->hub_key_raw,             sizeof(state->hub_key_raw));
   OPENSSL_cleanse(state->startup_password, MAX_PASS);
@@ -305,6 +309,55 @@ done:
   return ok;
 }
 
+/* Read a user's public key for the wizard: the pasted 88-char key, or a
+ * path to their .public.b64.  Shows the fingerprint and asks to confirm. */
+static void wizard_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) {
+  for (;;) {
+    char in[PATH_MAX];
+    unsigned char raw[HUB_KEY_RAW_LEN];
+    out[0] = '\0';
+    get_input("Public key (paste the 88 chars, or a path to the .public.b64)",
+              in, sizeof(in));
+    if (in[0] == '\0') {
+      printf("ERROR: a public key is required. Make one with "
+             "'utils/keygen %s' and give its .public.b64.\n", who);
+      continue;
+    }
+    /* Private and public key files have the same shape; refuse a keygen
+     * private file by name before it gets published in the a| record. */
+    if (strstr(in, ".private.")) {
+      printf("ERROR: that is a PRIVATE key file — it stays with the admin. "
+             "Use the matching .public.b64.\n");
+      continue;
+    }
+    if (crypto_pubkey_b64_decode(in, raw)) {
+      /* decode succeeded => exactly COMBINED_KEY_B64 chars */
+      memcpy(out, in, COMBINED_KEY_B64);
+      out[COMBINED_KEY_B64] = '\0';
+    } else {
+      FILE *f = fopen(in, "r");
+      char line[256] = {0};
+      if (f) {
+        if (!fgets(line, sizeof(line), f)) line[0] = '\0';
+        fclose(f);
+        line[strcspn(line, " \t\r\n")] = '\0';
+      }
+      if (!line[0] || !crypto_pubkey_b64_decode(line, raw)) {
+        printf("ERROR: not an 88-char public key%s. Use the .public.b64 "
+               "(never the .private.b64).\n", f ? " in that file" : "");
+        continue;
+      }
+      memcpy(out, line, COMBINED_KEY_B64);
+      out[COMBINED_KEY_B64] = '\0';
+    }
+    char fp[KEY_FP_LEN + 1], yn[16];
+    crypto_key_fingerprint(raw, fp);
+    printf("  Key fingerprint for %s: %s\n", who, fp);
+    get_input("Use this key? (Y/n)", yn, sizeof(yn));
+    if (yn[0] != 'n' && yn[0] != 'N') return;
+  }
+}
+
 static void run_config_wizard(void) {
   bot_state_t state;
   char config_pass[MAX_PASS];
@@ -312,13 +365,13 @@ static void run_config_wizard(void) {
   char chan_buf[MAX_CHAN];
   char confirm_char[16];
   char admin_name[64];
-  char admin_pass[MAX_PASS];
+  char admin_pub[COMBINED_KEY_B64 + 1];
 #define WIZARD_MAX_MASKS 20
   char admin_masks[WIZARD_MAX_MASKS][MAX_MASK_LEN];
   int  admin_mask_count = 0;
   bool hub_managed = false;
   memset(admin_name,  0, sizeof(admin_name));
-  memset(admin_pass,  0, sizeof(admin_pass));
+  memset(admin_pub,   0, sizeof(admin_pub));
   memset(admin_masks, 0, sizeof(admin_masks));
 
   printf("--- IRC Bot Initial Setup ---\n");
@@ -333,12 +386,12 @@ static void run_config_wizard(void) {
     /* Reset every mode-dependent field here rather than at its prompt: the
      * prompts now live in mutually exclusive branches, so a wizard restart that
      * switches from standalone to hub-managed would otherwise carry the first
-     * pass's admin name/password/masks into the committed config. */
+     * pass's admin name/key/masks into the committed config. */
     hub_managed = false;
     admin_mask_count = 0;
     memset(admin_name,  0, sizeof(admin_name));
+    memset(admin_pub,   0, sizeof(admin_pub));
     memset(admin_masks, 0, sizeof(admin_masks));
-    secure_wipe(admin_pass, sizeof(admin_pass));
 
     printf("==========================================\n");
     printf("         Starting Configuration Wizard      \n");
@@ -391,10 +444,15 @@ static void run_config_wizard(void) {
       secure_wipe(priv_b64, strlen(priv_b64));
       free(priv_b64);
 
+      char fp[KEY_FP_LEN + 1];
+      crypto_key_fingerprint(pub64, fp);
       printf("\n  Bot UUID:        %s\n", state.bot_uuid);
       printf("  Bot public key:  %s\n", pub_b64);
+      printf("  Key fingerprint: %s\n", fp);
       printf("\n  Save these — when registering this bot in hub_admin's\n");
       printf("  'Add Bot' menu the hub will ask for the UUID and pubkey above.\n");
+      printf("  (Standalone bots: other bots trust this one with\n");
+      printf("  '+bot <nick!user@host> <UUID> <public key>'.)\n");
       printf("\n  Press Enter to continue...");
       fflush(stdout);
       { int c; while ((c = getchar()) != '\n' && c != EOF); }
@@ -549,8 +607,11 @@ static void run_config_wizard(void) {
           break;
         printf("ERROR: Name cannot contain spaces or '|'.\n");
       }
-      while (!get_confirmed_password("Enter admin password", admin_pass, MAX_PASS))
-        ;
+      printf("\nThe admin signs in with a Curve25519 key, not a password.\n");
+      printf("On the admin's own machine run 'utils/keygen %s' (or see\n", admin_name);
+      printf("'help +admin' for an openssl recipe) and give its .public.b64 here.\n");
+      printf("The .private.b64 stays with the admin (chmod 600) for their IRC script.\n");
+      wizard_read_pubkey(admin_name, admin_pub);
       printf("\n--- Setup Admin Usermasks ---\n");
       printf("Enter usermasks for this admin (e.g. nick!*@*.example.com).\n");
       printf("Press Enter with no mask when done (at least one required).\n\n");
@@ -599,6 +660,14 @@ static void run_config_wizard(void) {
       printf("Mode: STANDALONE\n");
       printf("Admin: %s (%d usermask%s)\n", admin_name, admin_mask_count,
              admin_mask_count == 1 ? "" : "s");
+    {
+      unsigned char raw[HUB_KEY_RAW_LEN];
+      char fp[KEY_FP_LEN + 1];
+      if (crypto_pubkey_b64_decode(admin_pub, raw)) {
+        crypto_key_fingerprint(raw, fp);
+        printf("Admin key: %s\n", fp);
+      }
+    }
       printf("Channel: %s\n", chan_buf[0] ? chan_buf : "(none)");
     }
 
@@ -618,9 +687,9 @@ static void run_config_wizard(void) {
    * entirely for a hub-managed bot: the hub is authoritative for a|/m| records
    * and replaces the bot's set wholesale on the first sync
    * (hub_client_process_config_data), so anything written here is dead on
-   * arrival.  The guard is load-bearing, not cosmetic — admin_name/admin_pass
+   * arrival.  The guard is load-bearing, not cosmetic — admin_name/admin_pub
    * are never populated in hub-managed mode, so running this unguarded would
-   * persist an admin record with an empty name and an empty password. */
+   * persist an admin record with an empty name and no key. */
   if (!hub_managed) {
     unsigned char rnd[16];
     RAND_bytes(rnd, sizeof(rnd));
@@ -634,8 +703,9 @@ static void run_config_wizard(void) {
     user_record_t *u = &state.user_records[state.user_record_count++];
     memset(u, 0, sizeof(*u));
     snprintf(u->uuid,     sizeof(u->uuid),     "%s", new_uuid);
-    snprintf(u->name,     sizeof(u->name),     "%s", admin_name);
-    snprintf(u->password, sizeof(u->password), "%s", admin_pass);
+    snprintf(u->name,       sizeof(u->name),       "%s", admin_name);
+    snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", admin_pub);
+    u->has_pubkey = (admin_pub[0] != '\0');
     u->type = 'a'; u->is_active = true; u->timestamp = now;
     for (int mi = 0; mi < admin_mask_count && state.mask_record_count < MAX_USER_MASKS; mi++) {
       mask_record_t *m = &state.mask_records[state.mask_record_count++];
@@ -647,7 +717,6 @@ static void run_config_wizard(void) {
   }
   /* Wipe unconditionally — the buffers exist in both modes even though only the
    * standalone branch fills them. */
-  secure_wipe(admin_pass,  sizeof(admin_pass));
   secure_wipe(admin_masks, sizeof(admin_masks));
 #undef WIZARD_MAX_MASKS
   state.server_list[state.server_count++] = strdup(server_buf);
@@ -802,7 +871,7 @@ int main(int argc, char *argv[]) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
 
-    /* Debounced config flush.  auth_find_user() sets config_dirty whenever it
+    /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin
      * auth; writing on each one would cost a full config rewrite (PBKDF2
      * included) per command.  Flush at most once every

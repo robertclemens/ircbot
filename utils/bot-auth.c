@@ -1,257 +1,424 @@
-/* bot-auth.c — standalone helper that builds a v1 (~A1) AES-256-GCM admin
- * command payload for ircbot. The only external dependency is libcrypto
- * (already linked into the bot). No CPAN modules, no Python, no perl/CryptX.
+/* bot-auth.c — command-line client for ircbot's key-based admin/oper protocol
+ * (~A2A auth request, ~A2K lockbox, ~A2 sealed command).  Also the backend
+ * that bot-auth.mrc drives for mIRC (as bot-auth.exe).  Only dependency is
+ * libcrypto.  Protocol: irchub/docs/passwordless.md §4; the bot side is
+ * ircbot/commands.c (a2_handle_auth / a2_open_command).
  *
  * Build:   gcc -O2 -Wall -Wextra -o bot-auth bot-auth.c -lcrypto
- * Usage:   BOT_AUTH_PASSWORD='hunter2' ./bot-auth "die"
- *          ./bot-auth "+admin alice s3cret alice!*@trusted.example"   (prompts)
- *          echo 'hunter2' | ./bot-auth -                              (pipe)
- * Output:  "~A1 <base64-blob>\n" to stdout. The blob is
- *          salt(16) || iv(12) || ciphertext(N) || tag(16). Send via:
- *          /quote PRIVMSG <bot_nick> :~A1 <blob>
+ *          (Windows, MSYS2 MinGW 64-bit:
+ *           gcc -O2 -Wall -o bot-auth.exe bot-auth.c -lcrypto -static)
  *
- * Plaintext under the GCM tag:
- *          <unix_ts>:<nonce>:<command line>
- * Key:     PBKDF2-HMAC-SHA256(password, salt, 100000, 32)
+ * Usage (keyfile = your <ts>_<name>.private.b64, chmod 600):
+ *   bot-auth auth <keyfile> <botnick> <yournick>
+ *       -> prints "~A2A <sig> <ts>:<nonce>"; send it:  /msg <botnick> <line>
+ *   bot-auth open <keyfile> <botnick> <yournick> <ts:nonce> <~A2K reply>
+ *                 [--pin <pinfile>]
+ *       -> the bot answers the auth with a NOTICE "~A2K <b64>"; pass it here
+ *          with the <ts>:<nonce> of the ~A2A you sent.  Prints
+ *          "<bot pubkey> <fingerprint>".  With --pin, the bot key is checked
+ *          against / recorded in pinfile ("<lc botnick> <pubkey>" lines).
+ *   bot-auth cmd <keyfile> <botnick> <yournick> <botpubkey|@file>
+ *       -> reads ONE command line from stdin (never argv: ps(1) would show
+ *          it) and prints "~A2 <b64>"; send it:  /quote PRIVMSG <bot> :<line>
+ *   bot-auth fp <pubkey|file>
+ *       -> prints the key fingerprint (compare with the bot's 'status').
+ *
+ * Exit status: 0 ok, 1 usage/IO error, 2 crypto/verification failure,
+ *              3 pinned key mismatch (possible MITM or a rekeyed bot).
  */
 
+#if !defined(_WIN32) && !defined(_POSIX_C_SOURCE)
 #define _POSIX_C_SOURCE 200809L
+#endif
+#include <stdbool.h>
+#include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
-#include <stdint.h>
+#include <sys/stat.h>
 #include <time.h>
-#include <fcntl.h>
-#include <unistd.h>
 #ifndef _WIN32
-#include <termios.h>
+#include <sys/resource.h>
+#include <unistd.h>
 #endif
 
+#include <openssl/crypto.h>
 #include <openssl/evp.h>
+#include <openssl/kdf.h>
 #include <openssl/rand.h>
-#include <openssl/bio.h>
-#include <openssl/buffer.h>
 
-#define SALT_SIZE         16
-#define GCM_IV_LEN        12
-#define GCM_TAG_LEN       16
-#define KEY_LEN           32
-#define PBKDF2_ITERATIONS 100000
-#define MAX_PASS_LEN      128
-#define MAX_CMD_LEN       512
+#define A2A_LABEL "ircbot-A2A-v1"
+#define A2K_LABEL "ircbot-A2K-v1"
+#define A2_LABEL  "ircbot-A2-v1"
+#define KEY_LEN 64               /* ed25519(32) || x25519(32) */
+#define KEY_B64 88
+#define LOCKBOX_LEN (32 + 12 + KEY_LEN + 16)
+#define MAX_LINE 400             /* IRC line budget for the ~A2 text */
+#define MAX_CMD 300
 
-static void secure_wipe(void *ptr, size_t len) {
-    volatile unsigned char *p = ptr;
-    while (len--) *p++ = 0;
+static void die(int rc, const char *msg) {
+  fprintf(stderr, "bot-auth: %s\n", msg);
+  exit(rc);
 }
 
-#ifdef _WIN32
-#include <windows.h>
-static int read_password_tty(const char *prompt, char *buf, size_t len) {
-    HANDLE h = GetStdHandle(STD_INPUT_HANDLE);
-    DWORD oldmode = 0, newmode = 0;
-    int have_mode = GetConsoleMode(h, &oldmode) ? 1 : 0;
-    if (have_mode) {
-        newmode = oldmode & ~ENABLE_ECHO_INPUT;
-        SetConsoleMode(h, newmode);
-    }
-    fprintf(stderr, "%s", prompt);
-    fflush(stderr);
-    int rc = 0;
-    if (fgets(buf, (int)len, stdin) == NULL) rc = -1;
-    if (have_mode) SetConsoleMode(h, oldmode);
-    fprintf(stderr, "\n");
-    if (rc == 0) buf[strcspn(buf, "\r\n")] = '\0';
-    return rc;
+/* ---- small helpers ---------------------------------------------------- */
+
+static int b64enc(const unsigned char *in, int n, char *out, size_t cap) {
+  if (cap < (size_t)(4 * ((n + 2) / 3) + 1)) return -1;
+  return EVP_EncodeBlock((unsigned char *)out, in, n);
 }
-#else
-static int read_password_tty(const char *prompt, char *buf, size_t len) {
-    int fd = isatty(STDIN_FILENO) ? STDIN_FILENO : open("/dev/tty", 0);
-    if (fd < 0) {
-        if (fgets(buf, (int)len, stdin) == NULL) return -1;
-        buf[strcspn(buf, "\r\n")] = '\0';
-        return 0;
-    }
-    struct termios oldt, newt;
-    if (tcgetattr(fd, &oldt) == 0) {
-        newt = oldt;
-        newt.c_lflag &= ~(tcflag_t)ECHO;
-        tcsetattr(fd, TCSANOW, &newt);
-    }
-    fprintf(stderr, "%s", prompt);
-    fflush(stderr);
-    int rc = 0;
-    if (fgets(buf, (int)len, stdin) == NULL) rc = -1;
-    if (tcgetattr(fd, &oldt) == 0) tcsetattr(fd, TCSANOW, &oldt);
-    fprintf(stderr, "\n");
-    if (rc == 0) buf[strcspn(buf, "\r\n")] = '\0';
-    return rc;
+
+/* Strict-ish base64 decode: returns decoded length or -1. */
+static int b64dec(const char *in, unsigned char *out, int cap) {
+  size_t n = strlen(in);
+  if (n == 0 || n % 4 != 0 || (int)(n / 4 * 3) > cap + 2) return -1;
+  unsigned char *tmp = malloc(n / 4 * 3 + 1);
+  if (!tmp) return -1;
+  int len = EVP_DecodeBlock(tmp, (const unsigned char *)in, (int)n);
+  if (len < 0) { free(tmp); return -1; }
+  if (n >= 1 && in[n - 1] == '=') len--;
+  if (n >= 2 && in[n - 2] == '=') len--;
+  if (len > cap) { OPENSSL_cleanse(tmp, n / 4 * 3); free(tmp); return -1; }
+  memcpy(out, tmp, (size_t)len);
+  OPENSSL_cleanse(tmp, n / 4 * 3);
+  free(tmp);
+  return len;
 }
+
+static void lc_copy(char *out, size_t cap, const char *in) {
+  size_t i = 0;
+  for (; in[i] && i + 1 < cap; i++)
+    out[i] = (in[i] >= 'A' && in[i] <= 'Z') ? (char)(in[i] + 32) : in[i];
+  out[i] = '\0';
+}
+
+static void fingerprint(const unsigned char pub[KEY_LEN], char out[20]) {
+  unsigned char h[32];
+  unsigned int hl = 0;
+  if (EVP_Digest(pub, KEY_LEN, h, &hl, EVP_sha256(), NULL) != 1) {
+    snprintf(out, 20, "????:????:????:????");
+    return;
+  }
+  snprintf(out, 20, "%02x%02x:%02x%02x:%02x%02x:%02x%02x", h[0], h[1], h[2],
+           h[3], h[4], h[5], h[6], h[7]);
+}
+
+/* First line of a file, whitespace-trimmed. */
+static bool read_first_line(const char *path, char *out, size_t cap) {
+  FILE *f = fopen(path, "r");
+  if (!f) return false;
+  bool ok = fgets(out, (int)cap, f) != NULL;
+  fclose(f);
+  if (ok) out[strcspn(out, " \t\r\n")] = '\0';
+  return ok && out[0];
+}
+
+/* X25519 with all-zero-result rejection. */
+static bool x25519(const unsigned char priv[32], const unsigned char pub[32],
+                   unsigned char out[32]) {
+  EVP_PKEY *k = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv, 32);
+  EVP_PKEY *p = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, pub, 32);
+  EVP_PKEY_CTX *c = k ? EVP_PKEY_CTX_new(k, NULL) : NULL;
+  size_t l = 32;
+  bool ok = p && c && EVP_PKEY_derive_init(c) == 1 &&
+            EVP_PKEY_derive_set_peer(c, p) == 1 &&
+            EVP_PKEY_derive(c, out, &l) == 1 && l == 32;
+  EVP_PKEY_CTX_free(c);
+  EVP_PKEY_free(k);
+  EVP_PKEY_free(p);
+  unsigned char acc = 0;
+  for (int i = 0; ok && i < 32; i++) acc |= out[i];
+  if (!ok || !acc) { OPENSSL_cleanse(out, 32); return false; }
+  return true;
+}
+
+static bool hkdf(const unsigned char *ikm, size_t il, const unsigned char *salt,
+                 size_t sl, const unsigned char *info, size_t nl,
+                 unsigned char out[32]) {
+  EVP_PKEY_CTX *c = EVP_PKEY_CTX_new_id(EVP_PKEY_HKDF, NULL);
+  size_t ol = 32;
+  bool ok = c && EVP_PKEY_derive_init(c) == 1 &&
+            EVP_PKEY_CTX_set_hkdf_md(c, EVP_sha256()) == 1 &&
+            EVP_PKEY_CTX_set1_hkdf_salt(c, salt, (int)sl) == 1 &&
+            EVP_PKEY_CTX_set1_hkdf_key(c, ikm, (int)il) == 1 &&
+            EVP_PKEY_CTX_add1_hkdf_info(c, info, (int)nl) == 1 &&
+            EVP_PKEY_derive(c, out, &ol) == 1 && ol == 32;
+  EVP_PKEY_CTX_free(c);
+  return ok;
+}
+
+static bool gcm(bool enc, const unsigned char key[32], const unsigned char iv[12],
+                const unsigned char *aad, size_t al, const unsigned char *in,
+                int n, unsigned char *out, unsigned char tag[16]) {
+  EVP_CIPHER_CTX *c = EVP_CIPHER_CTX_new();
+  int l = 0, f = 0;
+  bool ok = c && EVP_CipherInit_ex(c, EVP_aes_256_gcm(), NULL, NULL, NULL, enc) == 1 &&
+            EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_IVLEN, 12, NULL) == 1 &&
+            EVP_CipherInit_ex(c, NULL, NULL, key, iv, enc) == 1 &&
+            EVP_CipherUpdate(c, NULL, &l, aad, (int)al) == 1 &&
+            EVP_CipherUpdate(c, out, &l, in, n) == 1;
+  if (ok && !enc) ok = EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_SET_TAG, 16, tag) == 1;
+  if (ok) ok = EVP_CipherFinal_ex(c, out + l, &f) == 1;
+  if (ok && enc) ok = EVP_CIPHER_CTX_ctrl(c, EVP_CTRL_GCM_GET_TAG, 16, tag) == 1;
+  EVP_CIPHER_CTX_free(c);
+  if (!ok) OPENSSL_cleanse(out, (size_t)n);
+  return ok;
+}
+
+/* label "\0" lc(bot) "\0" lc(me) [ "\0" extra ] */
+static size_t context(unsigned char *buf, size_t cap, const char *label,
+                      const char *bot, const char *me, const char *extra) {
+  char b[64], m[64];
+  lc_copy(b, sizeof(b), bot);
+  lc_copy(m, sizeof(m), me);
+  int n = extra ? snprintf((char *)buf, cap, "%s%c%s%c%s%c%s", label, 0, b, 0, m, 0, extra)
+                : snprintf((char *)buf, cap, "%s%c%s%c%s", label, 0, b, 0, m);
+  return (n > 0 && (size_t)n < cap) ? (size_t)n : 0;
+}
+
+/* ---- key material ----------------------------------------------------- */
+
+typedef struct {
+  unsigned char priv[KEY_LEN];  /* ed || x */
+  unsigned char pub[KEY_LEN];
+} userkey_t;
+
+static void load_key(const char *path, userkey_t *k) {
+  struct stat st;
+  if (stat(path, &st) != 0) die(1, "cannot read the key file");
+#ifndef _WIN32
+  if (st.st_mode & 0077)
+    fprintf(stderr, "bot-auth: warning: %s is readable by others — chmod 600 it\n",
+            path);
 #endif
+  char line[256];
+  if (!read_first_line(path, line, sizeof(line))) die(1, "cannot read the key file");
+  int n = b64dec(line, k->priv, KEY_LEN);
+  OPENSSL_cleanse(line, sizeof(line));
+  if (n != KEY_LEN)
+    die(1, "key file is not an 88-char private key (use the .private.b64)");
+  EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, k->priv, 32);
+  EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, k->priv + 32, 32);
+  size_t l1 = 32, l2 = 32;
+  bool ok = ep && xp && EVP_PKEY_get_raw_public_key(ep, k->pub, &l1) == 1 &&
+            EVP_PKEY_get_raw_public_key(xp, k->pub + 32, &l2) == 1;
+  EVP_PKEY_free(ep);
+  EVP_PKEY_free(xp);
+  if (!ok) die(2, "cannot derive the public key");
+}
 
-static char *base64_encode(const unsigned char *input, int length) {
-    BIO *b64 = BIO_new(BIO_f_base64());
-    BIO *mem = BIO_new(BIO_s_mem());
-    BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    b64 = BIO_push(b64, mem);
-    BIO_write(b64, input, length);
-    BIO_flush(b64);
-    BUF_MEM *bptr;
-    BIO_get_mem_ptr(b64, &bptr);
-    char *out = malloc((size_t)bptr->length + 1);
-    if (out) {
-        memcpy(out, bptr->data, bptr->length);
-        out[bptr->length] = '\0';
+/* A bot public key given inline (88 chars) or as @file. */
+static void load_pub(const char *arg, unsigned char pub[KEY_LEN]) {
+  char line[256];
+  if (arg[0] == '@') {
+    if (!read_first_line(arg + 1, line, sizeof(line))) die(1, "cannot read the pubkey file");
+  } else if (!read_first_line(arg, line, sizeof(line))) {
+    snprintf(line, sizeof(line), "%s", arg);
+  }
+  if (strlen(line) != KEY_B64 || b64dec(line, pub, KEY_LEN) != KEY_LEN)
+    die(1, "not an 88-char public key");
+}
+
+static void make_nonce(char out[17]) {
+  unsigned char r[8];
+  if (RAND_bytes(r, sizeof(r)) != 1) die(2, "RNG failure");
+  for (int i = 0; i < 8; i++) snprintf(out + 2 * i, 3, "%02x", r[i]);
+}
+
+/* ---- subcommands ------------------------------------------------------ */
+
+static int cmd_auth(const char *keyfile, const char *bot, const char *me) {
+  userkey_t k;
+  load_key(keyfile, &k);
+  char nonce[17], tsn[40];
+  make_nonce(nonce);
+  snprintf(tsn, sizeof(tsn), "%lld:%s", (long long)time(NULL), nonce);
+  unsigned char msg[256];
+  size_t ml = context(msg, sizeof(msg), A2A_LABEL, bot, me, tsn);
+  unsigned char sig[64];
+  size_t sl = sizeof(sig);
+  EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, k.priv, 32);
+  EVP_MD_CTX *md = EVP_MD_CTX_new();
+  bool ok = ml && ep && md && EVP_DigestSignInit(md, NULL, NULL, NULL, ep) == 1 &&
+            EVP_DigestSign(md, sig, &sl, msg, ml) == 1 && sl == 64;
+  EVP_MD_CTX_free(md);
+  EVP_PKEY_free(ep);
+  OPENSSL_cleanse(&k, sizeof(k));
+  if (!ok) die(2, "signing failed");
+  char sb[100];
+  b64enc(sig, 64, sb, sizeof(sb));
+  printf("~A2A %s %s\n", sb, tsn);
+  return 0;
+}
+
+/* Pin file: "<lc botnick> <pubkey b64>" per line.  0 ok/recorded, 3 mismatch. */
+static int pin_check(const char *pinfile, const char *bot,
+                     const unsigned char pub[KEY_LEN]) {
+  char want[100], lbot[64];
+  b64enc(pub, KEY_LEN, want, sizeof(want));
+  lc_copy(lbot, sizeof(lbot), bot);
+  FILE *f = fopen(pinfile, "r");
+  if (f) {
+    char line[256];
+    while (fgets(line, sizeof(line), f)) {
+      char n[64] = {0}, k[128] = {0};
+      if (sscanf(line, "%63s %127s", n, k) != 2 || strcmp(n, lbot) != 0) continue;
+      fclose(f);
+      if (strcmp(k, want) == 0) return 0;
+      unsigned char old[KEY_LEN];
+      char ofp[20] = "(unreadable)", nfp[20];
+      if (b64dec(k, old, KEY_LEN) == KEY_LEN) fingerprint(old, ofp);
+      fingerprint(pub, nfp);
+      fprintf(stderr,
+              "bot-auth: *** KEY CHANGED for %s: pinned %s, offered %s ***\n"
+              "bot-auth: possible man-in-the-middle, or the bot was rekeyed.\n"
+              "bot-auth: check the bot's 'status' / hub_admin, then remove its "
+              "line from %s to accept.\n", bot, ofp, nfp, pinfile);
+      return 3;
     }
-    BIO_free_all(b64);
-    return out;
+    fclose(f);
+  }
+#ifndef _WIN32
+  mode_t old = umask(077);
+#endif
+  f = fopen(pinfile, "a");
+#ifndef _WIN32
+  umask(old);
+#endif
+  if (!f) die(1, "cannot write the pin file");
+  fprintf(f, "%s %s\n", lbot, want);
+  fclose(f);
+  return 0;
 }
 
-static int gcm_encrypt(const unsigned char *key, const unsigned char *iv,
-                       const unsigned char *pt, int pt_len,
-                       unsigned char *ct_out, unsigned char *tag_out) {
-    EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-    int len = 0, ct_len = 0;
-    if (!ctx) return -1;
-    if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, NULL, NULL) != 1) goto err;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_IVLEN, GCM_IV_LEN, NULL) != 1) goto err;
-    if (EVP_EncryptInit_ex(ctx, NULL, NULL, key, iv) != 1) goto err;
-    if (EVP_EncryptUpdate(ctx, ct_out, &len, pt, pt_len) != 1) goto err;
-    ct_len = len;
-    if (EVP_EncryptFinal_ex(ctx, ct_out + len, &len) != 1) goto err;
-    ct_len += len;
-    if (EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag_out) != 1) goto err;
-    EVP_CIPHER_CTX_free(ctx);
-    return ct_len;
-err:
-    EVP_CIPHER_CTX_free(ctx);
-    return -1;
+static int cmd_open(const char *keyfile, const char *bot, const char *me,
+                    const char *tsn, const char *reply, const char *pinfile) {
+  const char *b = strncmp(reply, "~A2K ", 5) == 0 ? reply + 5 : reply;
+  unsigned char frame[LOCKBOX_LEN + 4];
+  if (b64dec(b, frame, sizeof(frame)) != LOCKBOX_LEN) die(2, "not a ~A2K lockbox");
+  userkey_t k;
+  load_key(keyfile, &k);
+  unsigned char ss[32], key[32], info[64], aad[256], pub[KEY_LEN];
+  size_t il = strlen(A2K_LABEL);
+  memcpy(info, A2K_LABEL, il);
+  memcpy(info + il, k.pub + 32, 32);
+  size_t al = context(aad, sizeof(aad), A2K_LABEL, bot, me, tsn);
+  bool ok = al && x25519(k.priv + 32, frame, ss) &&
+            hkdf(ss, 32, frame, 32, info, il + 32, key) &&
+            gcm(false, key, frame + 32, aad, al, frame + 44, KEY_LEN, pub,
+                frame + 44 + KEY_LEN);
+  OPENSSL_cleanse(&k, sizeof(k));
+  OPENSSL_cleanse(ss, sizeof(ss));
+  OPENSSL_cleanse(key, sizeof(key));
+  if (!ok) die(2, "lockbox did not verify (wrong key, bot nick, your nick, or ts:nonce)");
+  if (pinfile) {
+    int rc = pin_check(pinfile, bot, pub);
+    if (rc) return rc;
+  }
+  char pb[100], fp[20];
+  b64enc(pub, KEY_LEN, pb, sizeof(pb));
+  fingerprint(pub, fp);
+  printf("%s %s\n", pb, fp);
+  return 0;
 }
 
-static void usage(const char *argv0) {
-    fprintf(stderr,
-        "Usage: %s \"<command line, with args>\"\n"
-        "\n"
-        "Reads the admin/oper password from $BOT_AUTH_PASSWORD or, if unset,\n"
-        "prompts on the controlling tty with echo disabled.  Use '-' as the\n"
-        "argument to read both the password and command from stdin (one per\n"
-        "line) — useful for non-interactive callers like irssi /exec.\n"
-        "\n"
-        "Output (one line to stdout):  ~A1 <base64-blob>\n"
-        "\n"
-        "Send to the bot via:  /quote PRIVMSG <bot_nick> :~A1 <blob>\n",
-        argv0);
-    exit(1);
+static int cmd_cmd(const char *keyfile, const char *bot, const char *me,
+                   const char *botpub) {
+  unsigned char bpub[KEY_LEN];
+  load_pub(botpub, bpub);
+  char line_in[MAX_CMD + 2];
+  if (!fgets(line_in, sizeof(line_in), stdin)) die(1, "no command on stdin");
+  size_t cl = strcspn(line_in, "\r\n");
+  if (cl == strlen(line_in) && !feof(stdin)) die(1, "command too long");
+  line_in[cl] = '\0';
+  if (!cl) die(1, "empty command");
+  for (size_t i = 0; i < cl; i++)
+    if ((unsigned char)line_in[i] < 0x20 || line_in[i] == 0x7f)
+      die(1, "control characters are not allowed in commands");
+
+  userkey_t k;
+  load_key(keyfile, &k);
+  char nonce[17];
+  make_nonce(nonce);
+  char pt[MAX_CMD + 64];
+  int pl = snprintf(pt, sizeof(pt), "%lld:%s:%s", (long long)time(NULL), nonce,
+                    line_in);
+  OPENSSL_cleanse(line_in, sizeof(line_in));
+
+  unsigned char eph_priv[32], eph_pub[32], ikm[64], key[32], info[96];
+  unsigned char aad[160], frame[sizeof(pt) + 60], tag[16];
+  EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+  EVP_PKEY *ek = NULL;
+  size_t l1 = 32, l2 = 32;
+  bool ok = kc && EVP_PKEY_keygen_init(kc) == 1 && EVP_PKEY_keygen(kc, &ek) == 1 &&
+            EVP_PKEY_get_raw_private_key(ek, eph_priv, &l1) == 1 &&
+            EVP_PKEY_get_raw_public_key(ek, eph_pub, &l2) == 1;
+  EVP_PKEY_free(ek);
+  EVP_PKEY_CTX_free(kc);
+  size_t il = strlen(A2_LABEL);
+  memcpy(info, A2_LABEL, il);
+  memcpy(info + il, k.pub + 32, 32);
+  memcpy(info + il + 32, bpub + 32, 32);
+  size_t al = context(aad, sizeof(aad), A2_LABEL, bot, me, NULL);
+  ok = ok && al && pl > 0 && pl < (int)sizeof(pt) &&
+       x25519(eph_priv, bpub + 32, ikm) && x25519(k.priv + 32, bpub + 32, ikm + 32) &&
+       hkdf(ikm, 64, eph_pub, 32, info, il + 64, key) &&
+       RAND_bytes(frame + 32, 12) == 1 &&
+       gcm(true, key, frame + 32, aad, al, (unsigned char *)pt, pl, frame + 44, tag);
+  OPENSSL_cleanse(&k, sizeof(k));
+  OPENSSL_cleanse(eph_priv, sizeof(eph_priv));
+  OPENSSL_cleanse(ikm, sizeof(ikm));
+  OPENSSL_cleanse(key, sizeof(key));
+  OPENSSL_cleanse(pt, sizeof(pt));
+  if (!ok) die(2, "sealing failed");
+  memcpy(frame, eph_pub, 32);
+  memcpy(frame + 44 + pl, tag, 16);
+  int fl = 44 + pl + 16;
+  char out[1024];
+  if (b64enc(frame, fl, out, sizeof(out)) < 0) die(2, "encoding failed");
+  if (strlen(out) + 4 > MAX_LINE)
+    die(1, "command too long for one IRC line (keep it under ~200 chars)");
+  printf("~A2 %s\n", out);
+  return 0;
+}
+
+static int cmd_fp(const char *arg) {
+  unsigned char pub[KEY_LEN];
+  load_pub(arg, pub);
+  char fp[20];
+  fingerprint(pub, fp);
+  printf("%s\n", fp);
+  return 0;
+}
+
+static void usage(void) {
+  fprintf(stderr,
+          "usage: bot-auth auth <keyfile> <botnick> <yournick>\n"
+          "       bot-auth open <keyfile> <botnick> <yournick> <ts:nonce> <~A2K reply> [--pin <pinfile>]\n"
+          "       bot-auth cmd  <keyfile> <botnick> <yournick> <botpubkey|@file>   (command on stdin)\n"
+          "       bot-auth fp   <pubkey|file>\n"
+          "keyfile is your <ts>_<name>.private.b64 (chmod 600). See utils/README.txt.\n");
+  exit(1);
 }
 
 int main(int argc, char **argv) {
-    if (argc != 2) usage(argv[0]);
-
-    char password[MAX_PASS_LEN] = {0};
-    char command[MAX_CMD_LEN]   = {0};
-    int rc = 1;
-
-    if (strcmp(argv[1], "-") == 0) {
-        /* stdin mode: line 1 = password, line 2 = command. Used by scripts
-         * that want to keep the password out of argv and the environment. */
-        if (fgets(password, sizeof(password), stdin) == NULL) {
-            fprintf(stderr, "Error: failed to read password from stdin\n");
-            return 2;
-        }
-        password[strcspn(password, "\r\n")] = '\0';
-        if (fgets(command, sizeof(command), stdin) == NULL) {
-            fprintf(stderr, "Error: failed to read command from stdin\n");
-            secure_wipe(password, sizeof(password));
-            return 2;
-        }
-        command[strcspn(command, "\r\n")] = '\0';
-    } else {
-        snprintf(command, sizeof(command), "%s", argv[1]);
-        const char *env_pass = getenv("BOT_AUTH_PASSWORD");
-        if (env_pass && env_pass[0]) {
-            snprintf(password, sizeof(password), "%s", env_pass);
-        } else {
-            if (read_password_tty("Bot admin password: ",
-                                  password, sizeof(password)) != 0) {
-                fprintf(stderr, "Error: failed to read password\n");
-                return 2;
-            }
-        }
+#ifndef _WIN32
+  struct rlimit rl = {0, 0};
+  (void)setrlimit(RLIMIT_CORE, &rl);
+#endif
+  if (argc < 2) usage();
+  const char *sub = argv[1];
+  if (strcmp(sub, "auth") == 0 && argc == 5) return cmd_auth(argv[2], argv[3], argv[4]);
+  if (strcmp(sub, "open") == 0 && (argc == 7 || argc == 9)) {
+    const char *pin = NULL;
+    if (argc == 9) {
+      if (strcmp(argv[7], "--pin") != 0) usage();
+      pin = argv[8];
     }
-
-    if (password[0] == '\0' || command[0] == '\0') {
-        fprintf(stderr, "Error: empty password or command\n");
-        secure_wipe(password, sizeof(password));
-        return 2;
-    }
-
-    /* Build random material */
-    unsigned char salt[SALT_SIZE], iv[GCM_IV_LEN];
-    uint64_t nonce;
-    if (RAND_bytes(salt, SALT_SIZE) != 1 ||
-        RAND_bytes(iv,   GCM_IV_LEN)  != 1 ||
-        RAND_bytes((unsigned char *)&nonce, sizeof(nonce)) != 1) {
-        fprintf(stderr, "Error: RAND_bytes failed\n");
-        secure_wipe(password, sizeof(password));
-        return 3;
-    }
-    /* Keep positive in 64-bit signed math used by bot's strtoull -> ring. */
-    nonce &= 0x7FFFFFFFFFFFFFFFULL;
-
-    /* Derive key via PBKDF2-HMAC-SHA256 */
-    unsigned char key[KEY_LEN];
-    if (PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
-                          salt, SALT_SIZE, PBKDF2_ITERATIONS,
-                          EVP_sha256(), KEY_LEN, key) != 1) {
-        fprintf(stderr, "Error: PBKDF2 failed\n");
-        secure_wipe(password, sizeof(password));
-        return 4;
-    }
-    secure_wipe(password, sizeof(password));
-
-    /* Plaintext: "<unix_ts>:<nonce>:<command>" */
-    char plaintext[MAX_CMD_LEN + 64];
-    int pt_len = snprintf(plaintext, sizeof(plaintext), "%lld:%llu:%s",
-                          (long long)time(NULL),
-                          (unsigned long long)nonce, command);
-    if (pt_len <= 0 || pt_len >= (int)sizeof(plaintext)) {
-        fprintf(stderr, "Error: plaintext too long\n");
-        secure_wipe(key, sizeof(key));
-        return 5;
-    }
-
-    /* GCM encrypt */
-    unsigned char ciphertext[MAX_CMD_LEN + 128];
-    unsigned char tag[GCM_TAG_LEN];
-    int ct_len = gcm_encrypt(key, iv,
-                             (unsigned char *)plaintext, pt_len,
-                             ciphertext, tag);
-    secure_wipe(key, sizeof(key));
-    secure_wipe(plaintext, sizeof(plaintext));
-    if (ct_len < 0) {
-        fprintf(stderr, "Error: GCM encrypt failed\n");
-        return 6;
-    }
-
-    /* Assemble blob = salt || iv || ciphertext || tag */
-    int blob_len = SALT_SIZE + GCM_IV_LEN + ct_len + GCM_TAG_LEN;
-    unsigned char *blob = malloc((size_t)blob_len);
-    if (!blob) return 7;
-    memcpy(blob,                                       salt,       SALT_SIZE);
-    memcpy(blob + SALT_SIZE,                           iv,         GCM_IV_LEN);
-    memcpy(blob + SALT_SIZE + GCM_IV_LEN,              ciphertext, ct_len);
-    memcpy(blob + SALT_SIZE + GCM_IV_LEN + ct_len,     tag,        GCM_TAG_LEN);
-
-    char *b64 = base64_encode(blob, blob_len);
-    secure_wipe(blob, (size_t)blob_len);
-    free(blob);
-    if (!b64) {
-        fprintf(stderr, "Error: base64 encode failed\n");
-        return 8;
-    }
-
-    printf("~A1 %s\n", b64);
-    free(b64);
-    rc = 0;
-    return rc;
+    return cmd_open(argv[2], argv[3], argv[4], argv[5], argv[6], pin);
+  }
+  if (strcmp(sub, "cmd") == 0 && argc == 6) return cmd_cmd(argv[2], argv[3], argv[4], argv[5]);
+  if (strcmp(sub, "fp") == 0 && argc == 3) return cmd_fp(argv[2]);
+  usage();
+  return 1;
 }

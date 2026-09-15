@@ -3,6 +3,8 @@
 #include <openssl/bio.h>
 #include <openssl/buffer.h>
 #include <openssl/kdf.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <string.h>
 
 #include "bot.h"
@@ -295,6 +297,194 @@ bool crypto_ed25519_verify(const unsigned char pub[32],
     if (md) EVP_MD_CTX_free(md);
     EVP_PKEY_free(pk);
     return ok;
+}
+
+/* ==========================================================================
+ * Passwordless transport primitives (docs: irchub/docs/passwordless.md).
+ * ========================================================================== */
+
+/* X25519(priv, peer_pub) -> out[32].  Fails on an all-zero result, which is
+ * what a low-order peer point produces: such a secret is known to anyone and
+ * must never key a cipher. */
+bool crypto_x25519_derive(const unsigned char priv[32],
+                          const unsigned char peer_pub[32],
+                          unsigned char out[32]) {
+    EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv, 32);
+    EVP_PKEY *pp = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, peer_pub, 32);
+    EVP_PKEY_CTX *ctx = pk ? EVP_PKEY_CTX_new(pk, NULL) : NULL;
+    size_t len = 32;
+    bool ok = (pp && ctx
+            && EVP_PKEY_derive_init(ctx) == 1
+            && EVP_PKEY_derive_set_peer(ctx, pp) == 1
+            && EVP_PKEY_derive(ctx, out, &len) == 1
+            && len == 32);
+    if (ctx) EVP_PKEY_CTX_free(ctx);
+    if (pk) EVP_PKEY_free(pk);
+    if (pp) EVP_PKEY_free(pp);
+    if (ok) {
+        unsigned char acc = 0;
+        for (int i = 0; i < 32; i++) acc |= out[i];
+        ok = (acc != 0);
+    }
+    if (!ok) secure_wipe(out, 32);
+    return ok;
+}
+
+/* Combined public key (ed_pub || x_pub) from a combined private key
+ * (ed_priv || x_priv). */
+bool crypto_combined_pub_from_priv(const unsigned char priv[HUB_KEY_RAW_LEN],
+                                   unsigned char pub[HUB_KEY_RAW_LEN]) {
+    EVP_PKEY *ep = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, priv, 32);
+    EVP_PKEY *xp = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, priv + 32, 32);
+    size_t l1 = 32, l2 = 32;
+    bool ok = (ep && xp
+            && EVP_PKEY_get_raw_public_key(ep, pub, &l1) == 1 && l1 == 32
+            && EVP_PKEY_get_raw_public_key(xp, pub + 32, &l2) == 1 && l2 == 32);
+    if (ep) EVP_PKEY_free(ep);
+    if (xp) EVP_PKEY_free(xp);
+    if (!ok) memset(pub, 0, HUB_KEY_RAW_LEN);
+    return ok;
+}
+
+/* Strict decode of an 88-char combined public key.  Accepts only the
+ * canonical base64 of exactly 64 bytes (so one key has one spelling, which
+ * is what uniqueness checks and pin files compare) and rejects a half that is
+ * all zero.  Returns false and zeroes out on any deviation. */
+bool crypto_pubkey_b64_decode(const char *b64, unsigned char out[HUB_KEY_RAW_LEN]) {
+    memset(out, 0, HUB_KEY_RAW_LEN);
+    if (!b64 || strlen(b64) != COMBINED_KEY_B64) return false;
+    for (int i = 0; i < COMBINED_KEY_B64; i++) {
+        char c = b64[i];
+        bool alpha = (c >= 'A' && c <= 'Z') || (c >= 'a' && c <= 'z') ||
+                     (c >= '0' && c <= '9') || c == '+' || c == '/';
+        if (i >= COMBINED_KEY_B64 - 2 ? c != '=' : !alpha) return false;
+    }
+    int n = 0;
+    unsigned char *dec = base64_decode(b64, &n);
+    if (!dec || n != HUB_KEY_RAW_LEN) { free(dec); return false; }
+    char *re = base64_encode(dec, n);
+    bool ok = re && strcmp(re, b64) == 0;
+    free(re);
+    if (ok) {
+        unsigned char a = 0, b = 0;
+        for (int i = 0; i < 32; i++) { a |= dec[i]; b |= dec[32 + i]; }
+        ok = (a != 0 && b != 0);
+    }
+    if (ok) memcpy(out, dec, HUB_KEY_RAW_LEN);
+    free(dec);
+    return ok;
+}
+
+/* "ab12:cd34:ef56:7890" — first 8 bytes of SHA-256(pub64).  Shown wherever a
+ * key is displayed so humans can compare keys across bot/hub/client. */
+void crypto_key_fingerprint(const unsigned char pub[HUB_KEY_RAW_LEN],
+                            char out[KEY_FP_LEN + 1]) {
+    unsigned char h[32];
+    unsigned int hl = 0;
+    if (EVP_Digest(pub, HUB_KEY_RAW_LEN, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) {
+        snprintf(out, KEY_FP_LEN + 1, "????:????:????:????");
+        return;
+    }
+    snprintf(out, KEY_FP_LEN + 1, "%02x%02x:%02x%02x:%02x%02x:%02x%02x",
+             h[0], h[1], h[2], h[3], h[4], h[5], h[6], h[7]);
+}
+
+/* key = HKDF-SHA256(ikm, salt = eph_pub, info = label || [s_x_pub] || r_x_pub) */
+static bool seal_kdf(const unsigned char *ikm, size_t ikm_len,
+                     const unsigned char eph_pub[32], const char *label,
+                     const unsigned char *s_x_pub, const unsigned char r_x_pub[32],
+                     unsigned char key[32]) {
+    unsigned char info[64 + 32 + 32];
+    size_t ll = strlen(label);
+    if (ll > 64) return false;
+    size_t il = 0;
+    memcpy(info, label, ll); il += ll;
+    if (s_x_pub) { memcpy(info + il, s_x_pub, 32); il += 32; }
+    memcpy(info + il, r_x_pub, 32); il += 32;
+    return crypto_hkdf_sha256(ikm, ikm_len, eph_pub, 32, info, il, key, 32) == 0;
+}
+
+/* Seal pt to a recipient X25519 key.  frame = eph_pub(32) || iv(12) || ct ||
+ * tag(16).  With a sender key the static term X(s_x_priv, r_x_pub) is mixed
+ * in, so only the holder of s_x_priv (or the recipient) can make a frame
+ * that opens: that is the sender authentication for ~A2 and ~B2.  With
+ * s_x_priv == NULL the frame is anonymous (the ~A2K lockbox).  Returns the
+ * frame length, or -1. */
+int crypto_seal(const unsigned char *s_x_priv, const unsigned char *s_x_pub,
+                const unsigned char r_x_pub[32], const char *label,
+                const unsigned char *aad, size_t aad_len,
+                const unsigned char *pt, size_t pt_len,
+                unsigned char *out, size_t out_cap) {
+    if ((s_x_priv == NULL) != (s_x_pub == NULL)) return -1;
+    if (pt_len > SEAL_MAX_PLAINTEXT || out_cap < pt_len + SEAL_OVERHEAD) return -1;
+
+    unsigned char eph_priv[32], eph_pub[32], ikm[64], key[32];
+    size_t ikm_len = 32;
+    int ret = -1;
+    EVP_PKEY *ek = NULL;
+    EVP_PKEY_CTX *kc = EVP_PKEY_CTX_new_id(EVP_PKEY_X25519, NULL);
+    size_t l1 = 32, l2 = 32;
+    if (!kc || EVP_PKEY_keygen_init(kc) != 1 || EVP_PKEY_keygen(kc, &ek) != 1 ||
+        EVP_PKEY_get_raw_private_key(ek, eph_priv, &l1) != 1 || l1 != 32 ||
+        EVP_PKEY_get_raw_public_key(ek, eph_pub, &l2) != 1 || l2 != 32)
+        goto out;
+    if (!crypto_x25519_derive(eph_priv, r_x_pub, ikm)) goto out;
+    if (s_x_priv) {
+        if (!crypto_x25519_derive(s_x_priv, r_x_pub, ikm + 32)) goto out;
+        ikm_len = 64;
+    }
+    if (!seal_kdf(ikm, ikm_len, eph_pub, label, s_x_pub, r_x_pub, key)) goto out;
+
+    memcpy(out, eph_pub, 32);
+    unsigned char tag[GCM_TAG_LEN];
+    int n = crypto_aes_gcm_encrypt_aad(pt, (int)pt_len, aad, (int)aad_len, key,
+                                       out + 32, tag);
+    if (n != (int)pt_len + GCM_IV_LEN) goto out;
+    memcpy(out + 32 + n, tag, GCM_TAG_LEN);
+    ret = 32 + n + GCM_TAG_LEN;
+out:
+    if (ek) EVP_PKEY_free(ek);
+    if (kc) EVP_PKEY_CTX_free(kc);
+    secure_wipe(eph_priv, sizeof(eph_priv));
+    secure_wipe(ikm, sizeof(ikm));
+    secure_wipe(key, sizeof(key));
+    return ret;
+}
+
+/* Inverse of crypto_seal.  s_x_pub selects the expected sender (NULL for an
+ * anonymous frame).  Returns the plaintext length, or -1 on any failure
+ * (malformed frame, bad point, wrong key, wrong AAD, tampering).  pt_out is
+ * wiped on failure. */
+int crypto_open(const unsigned char r_x_priv[32], const unsigned char r_x_pub[32],
+                const unsigned char *s_x_pub, const char *label,
+                const unsigned char *aad, size_t aad_len,
+                const unsigned char *frame, size_t frame_len,
+                unsigned char *pt_out, size_t pt_cap) {
+    if (frame_len < SEAL_OVERHEAD) return -1;
+    size_t ct_len = frame_len - SEAL_OVERHEAD;
+    if (ct_len > SEAL_MAX_PLAINTEXT || ct_len > pt_cap) return -1;
+
+    unsigned char ikm[64], key[32], tag[GCM_TAG_LEN];
+    size_t ikm_len = 32;
+    int ret = -1;
+    const unsigned char *eph_pub = frame;
+    if (!crypto_x25519_derive(r_x_priv, eph_pub, ikm)) goto out;
+    if (s_x_pub) {
+        if (!crypto_x25519_derive(r_x_priv, s_x_pub, ikm + 32)) goto out;
+        ikm_len = 64;
+    }
+    if (!seal_kdf(ikm, ikm_len, eph_pub, label, s_x_pub, r_x_pub, key)) goto out;
+    memcpy(tag, frame + frame_len - GCM_TAG_LEN, GCM_TAG_LEN);
+    ret = crypto_aes_gcm_decrypt_aad(frame + 32, (int)(GCM_IV_LEN + ct_len),
+                                     aad, (int)aad_len, key, pt_out, tag);
+    if (ret != (int)ct_len) {
+        if (ct_len) secure_wipe(pt_out, ct_len);
+        ret = -1;
+    }
+out:
+    secure_wipe(ikm, sizeof(ikm));
+    secure_wipe(key, sizeof(key));
+    return ret;
 }
 
 unsigned char *base64_decode(const char *input, int *out_len) {

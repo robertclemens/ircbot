@@ -12,8 +12,135 @@
 
 #include "bot.h"
 
+/* Split s on '|' into at most max fields (pointers + lengths into s, no
+ * copies).  Returns the field count; a trailing '|' yields an empty field. */
+static int split_fields(const char *s, const char **f, size_t *fl, int max) {
+  int n = 0;
+  while (n < max) {
+    const char *bar = strchr(s, '|');
+    f[n] = s;
+    fl[n] = bar ? (size_t)(bar - s) : strlen(s);
+    n++;
+    if (!bar) break;
+    s = bar + 1;
+  }
+  return n;
+}
+
+static bool is_uuid_field(const char *s, size_t len) {
+  if (len != 36) return false;
+  for (size_t i = 0; i < 36; i++) {
+    char c = s[i];
+    bool dash = (i == 8 || i == 13 || i == 18 || i == 23);
+    if (dash ? c != '-'
+             : !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f') ||
+                 (c >= 'A' && c <= 'F')))
+      return false;
+  }
+  return true;
+}
+
+/* Decode a key-shaped field; false unless it is exactly a valid key. */
+static bool field_pubkey(const char *f, size_t fl, char out_b64[COMBINED_KEY_B64 + 1]) {
+  unsigned char raw[HUB_KEY_RAW_LEN];
+  out_b64[0] = '\0';
+  if (fl != COMBINED_KEY_B64) return false;
+  memcpy(out_b64, f, COMBINED_KEY_B64);
+  out_b64[COMBINED_KEY_B64] = '\0';
+  bool ok = crypto_pubkey_b64_decode(out_b64, raw);
+  if (!ok) out_b64[0] = '\0';
+  return ok;
+}
+
+/* a|/o| body codec (irchub/docs/passwordless.md §3.1):
+ *   new     uuid|name|pubkey|add/del|last_seen|ts|<reserved, empty>
+ *   legacy  uuid|name|password|add/del|last_seen|ts[|pubkey]
+ * Field 3 decides.  A valid key there means the new format.  Anything else is
+ * a legacy password: it is never copied anywhere, and the key (if any) is
+ * field 7.  Also used by hub_client.c for hub-sent records. */
+bool config_parse_user_line(const char *data, user_line_t *out) {
+  const char *f[8];
+  size_t fl[8];
+  memset(out, 0, sizeof(*out));
+  int nf = split_fields(data, f, fl, 8);
+  if (nf < 6 || !is_uuid_field(f[0], fl[0])) return false;
+  if (fl[1] == 0 || fl[1] >= sizeof(out->name)) return false;
+  memcpy(out->uuid, f[0], 36);
+  memcpy(out->name, f[1], fl[1]);
+  if (field_pubkey(f[2], fl[2], out->pubkey_b64)) {
+    out->has_pubkey = true;
+  } else {
+    out->legacy = true;
+    if (nf >= 7 && field_pubkey(f[6], fl[6], out->pubkey_b64))
+      out->has_pubkey = true;
+  }
+  out->is_active = (fl[3] == 3 && strncmp(f[3], "add", 3) == 0);
+  out->last_seen = (time_t)strtoll(f[4], NULL, 10);
+  out->timestamp = (time_t)strtoll(f[5], NULL, 10);
+  return true;
+}
+
+/* Serialize one user record as a full "a|...\n" / "o|...\n" line. */
+int config_format_user_line(const user_record_t *u, char *buf, size_t len) {
+  return snprintf(buf, len, "%c|%s|%s|%s|%s|%lld|%lld|\n", u->type, u->uuid,
+                  u->name, u->has_pubkey ? u->pubkey_b64 : "",
+                  u->is_active ? "add" : "del", (long long)u->last_seen,
+                  (long long)u->timestamp);
+}
+
+/* b| body codec (passwordless.md §3.2):
+ *   new     mask|uuid|pubkey|ts       (pubkey may be empty)
+ *   legacy  mask|uuid|ts
+ *   bare    mask                       (hand-typed; no uuid, no key)
+ * Oversized fields are refused rather than truncated: a clipped mask or uuid
+ * would silently mis-key every later match. */
+bool config_parse_bot_line(const char *data, trusted_bot_t *out) {
+  const char *f[5];
+  size_t fl[5];
+  memset(out, 0, sizeof(*out));
+  int nf = split_fields(data, f, fl, 5);
+  if (fl[0] == 0 || fl[0] >= sizeof(out->mask)) return false;
+  memcpy(out->mask, f[0], fl[0]);
+  if (nf == 1) return true;
+  if (fl[1] >= sizeof(out->uuid)) return false;
+  memcpy(out->uuid, f[1], fl[1]);
+  if (nf == 2) return true;
+  if (nf == 3) {
+    out->ts = (time_t)strtoll(f[2], NULL, 10);
+    return true;
+  }
+  char b64[COMBINED_KEY_B64 + 1];
+  if (fl[2] > 0 && field_pubkey(f[2], fl[2], b64))
+    out->has_pub = crypto_pubkey_b64_decode(b64, out->pub);
+  out->ts = (time_t)strtoll(f[3], NULL, 10);
+  return true;
+}
+
+/* Serialize one trusted bot as a full "b|...\n" line (new format). */
+int config_format_bot_line(const trusted_bot_t *tb, char *buf, size_t len) {
+  char *pb = tb->has_pub ? base64_encode(tb->pub, HUB_KEY_RAW_LEN) : NULL;
+  int n = snprintf(buf, len, "b|%s|%s|%s|%lld\n", tb->mask, tb->uuid,
+                   pb ? pb : "", (long long)tb->ts);
+  free(pb);
+  return n;
+}
+
+static void gen_uuid_v4(char out[37]) {
+  unsigned char r[16];
+  if (RAND_bytes(r, sizeof(r)) != 1)
+    handle_fatal_error("RAND_bytes failed generating a UUID");
+  r[6] = (r[6] & 0x0f) | 0x40;
+  r[8] = (r[8] & 0x3f) | 0x80;
+  snprintf(out, 37,
+           "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
+           r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
+           r[11], r[12], r[13], r[14], r[15]);
+}
+
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {
+  int legacy_user_lines = 0;  // records that still carried a password
+  bool dropped_botpass = false;
   struct stat cfg_st;
   if (stat(filename, &cfg_st) == 0 && (cfg_st.st_mode & 0177) != 0)
     log_message(L_INFO, state,
@@ -257,132 +384,75 @@ bool config_load(bot_state_t *state, const char *password,
         }
       } break;
 
-      case 'o': // Oper record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64]; old: mask|pass|add/del|ts)
+      case 'o': // Oper record  } shapes: config_parse_user_line (UUID-keyed),
+      case 'a': // Admin record }         or the pre-UUID forms below
       {
-        char first[40] = {0};
-        char *p = strchr(data, '|');
-        if (p) {
-          size_t fl = (size_t)(p - data);
-          if (fl < sizeof(first)) { memcpy(first, data, fl); first[fl] = 0; }
-        }
-        bool is_new = (strlen(first) == 36 && first[8]=='-' &&
-                       first[13]=='-' && first[18]=='-' && first[23]=='-');
-
-        if (is_new && state->user_record_count < MAX_USER_RECORDS) {
-          user_record_t *u = &state->user_records[state->user_record_count];
-          memset(u, 0, sizeof(*u));
-          char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
-          char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-          char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
-          if (p1&&p2&&p3&&p4&&p5) {
-            snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
-            snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
-            snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
-            u->type      = 'o';
-            u->is_active = (strncmp(p3+1,"add",3)==0);
-            u->last_seen = (time_t)atoll(p4+1);
-            if (p6) {
-              char ts_buf[32];
-              snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-              u->timestamp = (time_t)atoll(ts_buf);
-              snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
-              u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
-            } else {
-              u->timestamp = (time_t)atoll(p5+1);
-            }
-            state->user_record_count++;
+        const char *f[5];
+        size_t fl[5];
+        int nf = split_fields(data, f, fl, 5);
+        if (state->user_record_count >= MAX_USER_RECORDS) break;
+        if (is_uuid_field(f[0], fl[0])) {
+          user_line_t ul;
+          if (!config_parse_user_line(data, &ul)) {
+            log_message(L_INFO, state, "[CFG] Malformed %c| record ignored.\n",
+                        type);
+            break;
           }
-        } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
-          /* Old format o|mask|password|add/del|timestamp — tag with MIGRATE sentinel */
+          user_record_t *u = &state->user_records[state->user_record_count++];
+          memset(u, 0, sizeof(*u));
+          memcpy(u->uuid, ul.uuid, sizeof(u->uuid));
+          memcpy(u->name, ul.name, sizeof(u->name));
+          memcpy(u->pubkey_b64, ul.pubkey_b64, sizeof(u->pubkey_b64));
+          u->has_pubkey = ul.has_pubkey;
+          u->type = type;
+          u->is_active = ul.is_active;
+          u->last_seen = ul.last_seen;
+          u->timestamp = ul.timestamp;
+          if (ul.legacy) legacy_user_lines++;
+        } else {
+          /* Pre-UUID shapes, tagged for the migration pass below.  The
+           * password they carry is never copied:
+           *   a|<password>|<ts>
+           *   o|<mask>|<password>|<add/del>|<ts>                            */
           user_record_t *u = &state->user_records[state->user_record_count];
           memset(u, 0, sizeof(*u));
-          snprintf(u->uuid, sizeof(u->uuid), "MIGRATE_O");
-          u->type = 'o';
-          char mask[MAX_MASK_LEN], pass[MAX_PASS], op[16]; long long ts_ll = 0; time_t ts = 0;
-          if (sscanf(data,"%255[^|]|%127[^|]|%15[^|]|%lld",mask,pass,op,&ts_ll)>=3) {
-            ts = (time_t)ts_ll;
-            /* Store mask in name temporarily; real name derived at migration */
-            snprintf(u->name,     sizeof(u->name),     "%.63s", mask);
-            snprintf(u->password, sizeof(u->password), "%s", pass);
-            u->is_active = (strcmp(op,"del")!=0);
-            u->timestamp = (ts > 0) ? ts : time(NULL);
-            state->user_record_count++;
-          }
-        }
-      } break;
-
-      case 'a': // Admin record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64]; old: pass|ts)
-      {
-        char first[40] = {0};
-        char *p = strchr(data, '|');
-        if (p) {
-          size_t fl = (size_t)(p - data);
-          if (fl < sizeof(first)) { memcpy(first, data, fl); first[fl] = 0; }
-        }
-        bool is_new = (strlen(first) == 36 && first[8]=='-' &&
-                       first[13]=='-' && first[18]=='-' && first[23]=='-');
-
-        if (is_new && state->user_record_count < MAX_USER_RECORDS) {
-          user_record_t *u = &state->user_records[state->user_record_count];
-          memset(u, 0, sizeof(*u));
-          char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
-          char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-          char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
-          if (p1&&p2&&p3&&p4&&p5) {
-            snprintf(u->uuid,     sizeof(u->uuid),     "%.*s",(int)(p1-data),data);
-            snprintf(u->name,     sizeof(u->name),     "%.*s",(int)(p2-p1-1),p1+1);
-            snprintf(u->password, sizeof(u->password), "%.*s",(int)(p3-p2-1),p2+1);
-            u->type      = 'a';
-            u->is_active = (strncmp(p3+1,"add",3)==0);
-            u->last_seen = (time_t)atoll(p4+1);
-            if (p6) {
-              char ts_buf[32];
-              snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-              u->timestamp = (time_t)atoll(ts_buf);
-              snprintf(u->pubkey_b64, sizeof(u->pubkey_b64), "%s", p6+1);
-              u->has_pubkey = (strlen(u->pubkey_b64) == COMBINED_KEY_B64);
-            } else {
-              u->timestamp = (time_t)atoll(p5+1);
-            }
-            state->user_record_count++;
-          }
-        } else if (!is_new && state->user_record_count < MAX_USER_RECORDS) {
-          /* Old format a|password|timestamp — MIGRATE sentinel */
-          user_record_t *u = &state->user_records[state->user_record_count];
-          memset(u, 0, sizeof(*u));
-          snprintf(u->uuid, sizeof(u->uuid), "MIGRATE");
-          u->type = 'a';
-          char pass[MAX_PASS]; long long ts_ll = 0; time_t ts = 0;
-          if (sscanf(data, "%127[^|]|%lld", pass, &ts_ll) >= 1) {
-            ts = (time_t)ts_ll;
-            snprintf(u->password, sizeof(u->password), "%s", pass);
+          u->type = type;
+          if (type == 'a') {
+            snprintf(u->uuid, sizeof(u->uuid), "MIGRATE");
+            time_t ts = (nf >= 2) ? (time_t)strtoll(f[1], NULL, 10) : 0;
+            u->is_active = true;
             u->timestamp = (ts > 0) ? ts : time(NULL);
           } else {
-            snprintf(u->password, sizeof(u->password), "%s", data);
-            u->timestamp = time(NULL);
+            if (nf < 3 || fl[0] == 0 || fl[0] >= MAX_MASK_LEN) break;
+            snprintf(u->uuid, sizeof(u->uuid), "MIGRATE_O");
+            /* Store the mask in name temporarily; the real name is derived at
+             * migration.  (name holds 63 chars; the mask record keeps all.) */
+            snprintf(u->name, sizeof(u->name), "%.*s",
+                     (int)(fl[0] < sizeof(u->name) ? fl[0] : sizeof(u->name) - 1),
+                     f[0]);
+            u->is_active = !(fl[2] == 3 && strncmp(f[2], "del", 3) == 0);
+            time_t ts = (nf >= 4) ? (time_t)strtoll(f[3], NULL, 10) : 0;
+            u->timestamp = (ts > 0) ? ts : time(NULL);
           }
           state->user_record_count++;
+          legacy_user_lines++;
         }
       } break;
 
-      case 'p': // Bot password (global, no operation field)
-      {
-        char pass[MAX_PASS];
-        long long ts_ll = 0;
-        time_t ts = 0;
-        if (sscanf(data, "%127[^|]|%lld", pass, &ts_ll) >= 1) {
-          ts = (time_t)ts_ll;
-          snprintf(state->bot_comm_pass, MAX_PASS, "%s", pass);
-          state->bot_comm_pass_ts = (ts > 0) ? ts : time(NULL);
-        } else {
-          snprintf(state->bot_comm_pass, MAX_PASS, "%s", data);
-          state->bot_comm_pass_ts = time(NULL);
-        }
-      } break;
+      case 'p': /* Retired: shared bot password (p|<pass>|<ts>).  Bot-to-bot
+                 * traffic now uses the b| public keys; the line is dropped and
+                 * the config rewritten without it. */
+        dropped_botpass = true;
+        break;
 
-      case 'b': // Bot line (hub-generated, no timestamp)
+      case 'b': // Trusted bot: b|mask|uuid|pubkey|ts (legacy mask|uuid|ts, bare mask)
         if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          state->trusted_bots[state->trusted_bot_count++] = strdup(data);
+          trusted_bot_t tb;
+          if (config_parse_bot_line(data, &tb))
+            state->trusted_bots[state->trusted_bot_count++] = tb;
+          else
+            log_message(L_INFO, state,
+                        "[CFG] Malformed or oversized b| line ignored.\n");
         }
         break;
 
@@ -484,7 +554,11 @@ bool config_load(bot_state_t *state, const char *password,
       {
         char flags[MAX_OPT_FLAGS + 1] = {0};
         long long ts = 0;
-        if (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1) {
+        /* "O||<ts>" is a persisted clear; %[^|] cannot match an empty field. */
+        bool ok = (data[0] == '|')
+                      ? (sscanf(data + 1, "%lld", &ts) == 1)
+                      : (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1);
+        if (ok) {
           /* Sanitize: keep only [a-zA-Z0-9] */
           int w = 0;
           for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
@@ -556,7 +630,6 @@ bool config_load(bot_state_t *state, const char *password,
         user_record_t *nu_rec = &new_users[nu++];
         snprintf(nu_rec->uuid,     sizeof(nu_rec->uuid),     "%s", admin_uuid);
         snprintf(nu_rec->name,     sizeof(nu_rec->name),     "admin");
-        snprintf(nu_rec->password, sizeof(nu_rec->password), "%s", u->password);
         nu_rec->type      = 'a';
         nu_rec->is_active = true;
         nu_rec->last_seen = 0;
@@ -623,7 +696,6 @@ bool config_load(bot_state_t *state, const char *password,
       user_record_t *nr = &new_users[nu++];
       snprintf(nr->uuid,     sizeof(nr->uuid),     "%s", ouuid);
       snprintf(nr->name,     sizeof(nr->name),     "%s", try_name);
-      snprintf(nr->password, sizeof(nr->password), "%s", u->password);
       nr->type      = 'o';
       nr->is_active = u->is_active;
       nr->last_seen = 0;
@@ -656,17 +728,70 @@ bool config_load(bot_state_t *state, const char *password,
     state->user_record_count = nu;
     memcpy(state->mask_records, new_masks, sizeof(new_masks));
     state->mask_record_count = nm;
-
-    if (migrated_from_legacy)
-      log_message(L_INFO, state,
-                  "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
-    /* Write migrated config immediately */
-    config_write(state, password);
-  } else if (migrated_from_legacy) {
+  }
+  if (migrated_from_legacy)
     log_message(L_INFO, state,
                 "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
-    config_write(state, password);
+
+  /* Identity key.  Standalone configs from before bots had keys carry no k|;
+   * the ~A2 / ~B2 transports need one, so mint it here.  A hub-managed bot
+   * without a key cannot reach its hub either and must re-run -setup (a new
+   * identity would need registering on the hub), so it is only reported. */
+  bool identity_minted = false;
+  if (state->hub_key[0] == '\0' && state->hub_count == 0) {
+    unsigned char priv[HUB_KEY_RAW_LEN], pub[HUB_KEY_RAW_LEN];
+    char *pb = NULL;
+    if (crypto_generate_combined_keypair(priv, pub) &&
+        (pb = base64_encode(priv, HUB_KEY_RAW_LEN)) != NULL &&
+        strlen(pb) < sizeof(state->hub_key)) {
+      snprintf(state->hub_key, sizeof(state->hub_key), "%s", pb);
+      memcpy(state->hub_key_raw, priv, HUB_KEY_RAW_LEN);
+      identity_minted = true;
+    }
+    if (pb) { secure_wipe(pb, strlen(pb)); free(pb); }
+    secure_wipe(priv, sizeof(priv));
+    if (!identity_minted)
+      log_message(L_INFO, state, "[CFG] Could not generate an identity key.\n");
   }
+  if (state->bot_uuid[0] == '\0' && state->hub_count == 0) {
+    gen_uuid_v4(state->bot_uuid);
+    identity_minted = true;
+  }
+  if (!bot_self_pub_refresh(state)) {
+    log_message(L_INFO, state,
+                "[CFG] No usable identity key (k|): admin commands and "
+                "bot-to-bot messages cannot be decrypted. Re-run -setup.\n");
+  } else if (identity_minted) {
+    char *pb = base64_encode(state->self_pub, HUB_KEY_RAW_LEN);
+    char fp[KEY_FP_LEN + 1];
+    crypto_key_fingerprint(state->self_pub, fp);
+    fprintf(stderr, "[CFG] Generated this bot's identity key. Public key: %s "
+                    "(fp %s)\n", pb ? pb : "?", fp);
+    log_message(L_INFO, state, "[CFG] Generated identity key, fp %s\n", fp);
+    free(pb);
+  }
+
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *u = &state->user_records[i];
+    if (u->is_active && !u->has_pubkey)
+      log_message(L_INFO, state,
+                  "[CFG] %s '%s' has no public key and cannot authenticate "
+                  "until given one (chkey, or hub_admin 'Change user public "
+                  "key').\n", u->type == 'a' ? "Admin" : "Oper", u->name);
+  }
+  if (legacy_user_lines > 0)
+    log_message(L_INFO, state,
+                "[CFG] Migrated %d password-era user record(s); passwords "
+                "dropped.\n", legacy_user_lines);
+  if (dropped_botpass)
+    log_message(L_INFO, state,
+                "[CFG] Dropped the retired bot password (p|); bots use public "
+                "keys now.\n");
+
+  /* Rewrite once if anything above changed the on-disk shape. */
+  if (needs_migration || migrated_from_legacy || legacy_user_lines > 0 ||
+      dropped_botpass || identity_minted)
+    config_write(state, password);
 
   // Validation changed
   if (state->target_nick[0] == '\0' || state->server_count == 0 ||
@@ -685,19 +810,29 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   if (strlen(password) >= MAX_PASS)
     return;
 
-  char plaintext_overrides[MAX_BUFFER * 4] = "";
+  /* Heap, sized to the load limit: the serialized config holds the k| private
+   * key, so it is wiped before free, and a config that does not fit is not
+   * written at all (a truncated write would silently drop records — keep the
+   * old file instead). */
+  const int cap = MAX_CONFIG_SIZE;
+  char *plaintext_overrides = calloc(1, (size_t)cap);
+  if (!plaintext_overrides) {
+    fprintf(stderr, "[CFG] Out of memory serializing config; not written.\n");
+    return;
+  }
   int offset = 0;
-  int remaining = sizeof(plaintext_overrides);
+  int remaining = cap;
   int written;
+  bool overflow = false;
 
 #define CFG_WRITE(...)                                          \
   do {                                                          \
-    if (remaining > 1) {                                        \
-      written = snprintf(plaintext_overrides + offset,          \
-                         remaining, __VA_ARGS__);               \
-      if (written > 0 && written < remaining) {                 \
-        offset += written; remaining -= written;                \
-      }                                                         \
+    written = snprintf(plaintext_overrides + offset,            \
+                       (size_t)remaining, __VA_ARGS__);         \
+    if (written > 0 && written < remaining) {                   \
+      offset += written; remaining -= written;                  \
+    } else if (written != 0) {                                  \
+      overflow = true;                                          \
     }                                                           \
   } while (0)
 
@@ -713,12 +848,11 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   }
 
   for (int i = 0; i < state->user_record_count; i++) {
-    const user_record_t *u = &state->user_records[i];
-    CFG_WRITE("%c|%s|%s|%s|%s|%lld|%lld|%s\n",
-              u->type, u->uuid, u->name, u->password,
-              u->is_active ? "add" : "del",
-              (long long)u->last_seen, (long long)u->timestamp,
-              u->has_pubkey ? u->pubkey_b64 : "");
+    char uline[CFG_USER_LINE_MAX];
+    int ul = config_format_user_line(&state->user_records[i], uline,
+                                     sizeof(uline));
+    if (ul <= 0 || ul >= (int)sizeof(uline)) { overflow = true; break; }
+    CFG_WRITE("%s", uline);
   }
 
   for (int i = 0; i < state->mask_record_count; i++) {
@@ -728,11 +862,13 @@ static void config_write_file(const bot_state_t *state, const char *password) {
               (long long)m->last_used, (long long)m->timestamp);
   }
 
-  if (state->bot_comm_pass[0] != '\0')
-    CFG_WRITE("p|%s|%lld\n", state->bot_comm_pass, (long long)state->bot_comm_pass_ts);
-
-  for (int i = 0; i < state->trusted_bot_count; i++)
-    CFG_WRITE("b|%s\n", state->trusted_bots[i]);
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    char bline[CFG_BLINE_MAX];
+    int bl = config_format_bot_line(&state->trusted_bots[i], bline,
+                                    sizeof(bline));
+    if (bl <= 0 || bl >= (int)sizeof(bline)) { overflow = true; break; }
+    CFG_WRITE("%s", bline);
+  }
 
   if (state->log_type != DEFAULT_LOG_LEVEL)
     CFG_WRITE("l|%d\n", state->log_type);
@@ -766,60 +902,65 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   if (state->bot_uuid[0] != '\0')
     CFG_WRITE("i|%s\n", state->bot_uuid);
 
-  if (state->opt_flags[0] != '\0')
+  /* Written with a timestamp even when empty, so a clear survives restart. */
+  if (state->opt_flags[0] != '\0' || state->opt_flags_ts > 0)
     CFG_WRITE("O|%s|%lld\n", state->opt_flags, (long long)state->opt_flags_ts);
 
 #undef CFG_WRITE
 
-  if (strlen(plaintext_overrides) == 0) {
+  if (overflow) {
+    fprintf(stderr, "[CFG] Config exceeds %d bytes; NOT written (old config "
+                    "kept).\n", cap);
+    secure_wipe(plaintext_overrides, (size_t)cap);
+    free(plaintext_overrides);
+    return;
+  }
+
+  if (offset == 0) {
+    free(plaintext_overrides);
     remove(CONFIG_FILE);
     return;
   }
 
   unsigned char salt[SALT_SIZE];
-  if (RAND_bytes(salt, sizeof(salt)) != 1) {
-    fprintf(stderr, "[CFG] RAND_bytes failed for salt; aborting write.\n");
-    return;
-  }
-
   unsigned char key[32];
-  if (!crypto_derive_config_key(password, salt, key)) {
-    fprintf(stderr, "[CFG] PBKDF2 key derivation failed; aborting write.\n");
-    return;
-  }
-
   unsigned char iv[GCM_IV_LEN];
-  if (RAND_bytes(iv, sizeof(iv)) != 1) {
-    fprintf(stderr, "[CFG] RAND_bytes failed for IV; aborting write.\n");
+  if (RAND_bytes(salt, sizeof(salt)) != 1 ||
+      !crypto_derive_config_key(password, salt, key) ||
+      RAND_bytes(iv, sizeof(iv)) != 1) {
+    fprintf(stderr, "[CFG] RNG/KDF failure; aborting config write.\n");
     secure_wipe(key, sizeof(key));
+    secure_wipe(plaintext_overrides, (size_t)cap);
+    free(plaintext_overrides);
     return;
   }
 
   unsigned char tag[GCM_TAG_LEN];
-  int plaintext_len = strlen(plaintext_overrides);
-  unsigned char *ciphertext = malloc(plaintext_len);
+  int plaintext_len = offset;
+  unsigned char *ciphertext = malloc((size_t)plaintext_len);
   if (!ciphertext) {
     secure_wipe(key, sizeof(key));
+    secure_wipe(plaintext_overrides, (size_t)cap);
     handle_fatal_error("malloc failed for ciphertext");
   }
   int len, ciphertext_len;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) { secure_wipe(key, sizeof(key)); free(ciphertext); return; }
-
-  if (EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
+  bool enc_ok = ctx &&
+      EVP_EncryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) == 1 &&
       EVP_EncryptUpdate(ctx, ciphertext, &ciphertext_len,
-                        (unsigned char *)plaintext_overrides, plaintext_len) != 1 ||
-      EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) != 1 ||
-      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
+                        (unsigned char *)plaintext_overrides, plaintext_len) == 1 &&
+      EVP_EncryptFinal_ex(ctx, ciphertext + ciphertext_len, &len) == 1 &&
+      EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_GET_TAG, GCM_TAG_LEN, tag) == 1;
+  if (ctx) EVP_CIPHER_CTX_free(ctx);
+  secure_wipe(key, sizeof(key));
+  secure_wipe(plaintext_overrides, (size_t)cap);
+  free(plaintext_overrides);
+  if (!enc_ok) {
     free(ciphertext);
     return;
   }
   ciphertext_len += len;
-  EVP_CIPHER_CTX_free(ctx);
-  secure_wipe(key, sizeof(key));
 
   char temp_file[256];
   snprintf(temp_file, sizeof(temp_file), "%s.tmp", CONFIG_FILE);

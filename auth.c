@@ -32,34 +32,48 @@ static bool wildcard_match(const char *pattern, const char *text) {
   return !*p;
 }
 
-/* auth_find_user: find the user_record_t whose usermask matches user_host.
- * Updates last_used on the matching mask and last_seen on the user record.
- * Sets state->config_dirty so the timestamps are persisted on next flush. */
-user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
-                              time_t now) {
-  for (int i = 0; i < state->mask_record_count; i++) {
+/* auth_user_candidates: every active user record that has a public key and
+ * owns an active mask matching user_host, each listed once (with the first
+ * mask that matched).  Several records can match one hostmask (overlapping
+ * wildcards); the caller tries each record's key and the one that verifies
+ * wins.  Deliberately free of side effects: last_seen/last_used move only in
+ * auth_mark_used(), after the sender has proven the key. */
+int auth_user_candidates(bot_state_t *state, const char *user_host,
+                         user_record_t **out, int *mask_idx, int max) {
+  int n = 0;
+  for (int i = 0; i < state->mask_record_count && n < max; i++) {
     mask_record_t *mr = &state->mask_records[i];
     if (!mr->is_active || mr->mask[0] == '\0') continue;
-
-    if (wildcard_match(mr->mask, user_host)) {
-      /* Find the owning user record */
-      for (int j = 0; j < state->user_record_count; j++) {
-        user_record_t *ur = &state->user_records[j];
-        if (!ur->is_active) continue;
-        if (strcmp(ur->uuid, mr->uuid) != 0) continue;
-        /* Match — update timestamps */
-        mr->last_used  = now;
-        ur->last_seen  = now;
-        state->config_dirty = true;
-        log_message(L_DEBUG, state,
-                    "[AUTH] mask %s matched user %s (%c)\n",
-                    mr->mask, ur->name, ur->type);
-        return ur;
+    if (!wildcard_match(mr->mask, user_host)) continue;
+    for (int j = 0; j < state->user_record_count; j++) {
+      user_record_t *ur = &state->user_records[j];
+      if (!ur->is_active || !ur->has_pubkey) continue;
+      if (strcmp(ur->uuid, mr->uuid) != 0) continue;
+      bool dup = false;
+      for (int k = 0; k < n; k++)
+        if (out[k] == ur) { dup = true; break; }
+      if (!dup) {
+        out[n] = ur;
+        mask_idx[n] = i;
+        n++;
       }
+      break;
     }
   }
-  log_message(L_DEBUG, state, "[AUTH] no mask matched %s\n", user_host);
-  return NULL;
+  if (n == 0)
+    log_message(L_DEBUG, state, "[AUTH] no keyed user mask matched %s\n",
+                user_host);
+  return n;
+}
+
+/* Record a successful authentication.  Sets config_dirty so the debounced
+ * flush in main.c persists last_seen/last_used locally. */
+void auth_mark_used(bot_state_t *state, user_record_t *u, int mask_idx,
+                    time_t now) {
+  if (u) u->last_seen = now;
+  if (mask_idx >= 0 && mask_idx < state->mask_record_count)
+    state->mask_records[mask_idx].last_used = now;
+  state->config_dirty = true;
 }
 
 // Strip leading '~' from the ident portion of nick!ident@host, writing the
@@ -78,36 +92,58 @@ static void strip_ident_tilde(const char *in, char *out, size_t out_size) {
   snprintf(out + prefix, out_size - prefix, "%s", bang + 2); // skip '~'
 }
 
-// auth_is_trusted_bot: wildcard-match user_host against trusted_bots[]
-// hostmasks. On a match, if uuid_out is non-NULL, also fills in the
-// matched entry's UUID (hostmask|uuid|timestamp format) so callers that
-// need to bind the sender's identity (e.g. GCM AAD) don't have to
-// re-implement this lookup.
+// auth_trusted_bot_by_host: wildcard-match user_host against the stored
+// trusted-bot hostmasks.  Strict on the full mask by design (see
+// ARCHITECTURE.md): the mask a peer publishes is the server-displayed one.
+trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
+                                        const char *user_host) {
+  if (state->trusted_bot_count == 0) return NULL;
+  char norm_user_host[MAX_MASK_LEN];
+  strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    char norm_hostmask[MAX_MASK_LEN];
+    strip_ident_tilde(state->trusted_bots[i].mask, norm_hostmask,
+                      sizeof(norm_hostmask));
+    if (wildcard_match(norm_hostmask, norm_user_host))
+      return &state->trusted_bots[i];
+  }
+  return NULL;
+}
+
+trusted_bot_t *auth_trusted_bot_by_uuid(bot_state_t *state, const char *uuid) {
+  if (!uuid || !uuid[0]) return NULL;
+  for (int i = 0; i < state->trusted_bot_count; i++)
+    if (strcmp(state->trusted_bots[i].uuid, uuid) == 0)
+      return &state->trusted_bots[i];
+  return NULL;
+}
+
+void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]) {
+  size_t n = strcspn(tb->mask, "!");
+  if (n >= MAX_NICK) n = MAX_NICK - 1;
+  memcpy(out, tb->mask, n);
+  out[n] = '\0';
+}
+
+trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick) {
+  if (!nick || !nick[0]) return NULL;
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    char bnick[MAX_NICK];
+    auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
+    if (strcasecmp(bnick, nick) == 0) return &state->trusted_bots[i];
+  }
+  return NULL;
+}
+
+// auth_is_trusted_bot: boolean wrapper over auth_trusted_bot_by_host.  On a
+// match, if uuid_out is non-NULL, also fills in the matched entry's UUID.
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
                          char *uuid_out, size_t uuid_out_size) {
   if (uuid_out && uuid_out_size > 0) uuid_out[0] = '\0';
-  if (state->trusted_bot_count == 0)
-    return false;
-
-  char norm_user_host[MAX_MASK_LEN];
-  strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
-
-  for (int i = 0; i < state->trusted_bot_count; i++) {
-    // Extract hostmask from format: hostmask|uuid|timestamp
-    // or just hostmask for legacy entries
-    char hostmask[MAX_MASK_LEN];
-    if (sscanf(state->trusted_bots[i], "%255[^|]", hostmask) == 1) {
-      char norm_hostmask[MAX_MASK_LEN];
-      strip_ident_tilde(hostmask, norm_hostmask, sizeof(norm_hostmask));
-      if (wildcard_match(norm_hostmask, norm_user_host)) {
-        if (uuid_out && uuid_out_size > 0) {
-          char uuid[64] = "";
-          sscanf(state->trusted_bots[i], "%*255[^|]|%63[^|]", uuid);
-          snprintf(uuid_out, uuid_out_size, "%s", uuid);
-        }
-        return true;
-      }
-    }
-  }
-  return false;
+  trusted_bot_t *tb =
+      auth_trusted_bot_by_host((bot_state_t *)state, user_host);
+  if (!tb) return false;
+  if (uuid_out && uuid_out_size > 0)
+    snprintf(uuid_out, uuid_out_size, "%s", tb->uuid);
+  return true;
 }

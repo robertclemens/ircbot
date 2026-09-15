@@ -97,9 +97,9 @@
  * ========================================================================== */
 #define CFG_GLOBAL_LINE_MAX 1088  /* key[32]+value[1024]+ts+seps */
 #define CFG_BOT_FIELD_LINE  320   /* per-bot line: capped value */
-#define CFG_USER_LINE_MAX   384   /* a|/o|: uuid+name+MAX_PASS+pubkey */
+#define CFG_USER_LINE_MAX   384   /* a|/o|: uuid+name+pubkey (legacy: +password) */
 #define CFG_MASK_LINE_MAX   352   /* m|: uuid+MAX_MASK_LEN */
-#define CFG_BLINE_MAX       352   /* b|<mask>|<uuid>|<ts> */
+#define CFG_BLINE_MAX       448   /* b|<mask>|<uuid>|<pubkey>|<ts> */
 #define CFG_MAX_GLOBALS     64    /* mirrors hub MAX_BOT_ENTRIES */
 #define CFG_BOT_SYNC_FIELDS 8
 #define CFG_PAYLOAD_SLACK   8192
@@ -120,12 +120,32 @@
   4096 // Nonce cache for secure communication. Prevents replay attacks
 #define NONCE_TTL_SECONDS 60 // Entries older than this are treated as empty
 typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
-/* Config-write debounce.  auth_find_user() bumps last_seen/last_used on every
+/* Config-write debounce.  auth_mark_used() bumps last_seen/last_used on every
  * successful admin auth, which would otherwise mean a full config rewrite --
  * including a PBKDF2 key derivation -- per admin command.  The main loop
  * flushes at most once every CONFIG_WRITE_DEBOUNCE_S seconds instead.
  * Mirrors irchub's hub.h:564 / hub_main.c:435. */
 #define CONFIG_WRITE_DEBOUNCE_S 5
+
+/* Passwordless admin/oper and bot-to-bot transport (irchub/docs/passwordless.md).
+ * The labels are domain separators baked into signatures, KDF info and GCM
+ * AAD.  They are shared with the client scripts in utils/ and irchub; change
+ * one only by bumping its -vN suffix everywhere. */
+#define A2A_LABEL "ircbot-A2A-v1"  /* ~A2A auth request (Ed25519 signature) */
+#define A2K_LABEL "ircbot-A2K-v1"  /* ~A2K lockbox: bot pubkey sealed to the user */
+#define A2_LABEL  "ircbot-A2-v1"   /* ~A2  sealed admin/oper command */
+#define B2_LABEL  "ircbot-B2-v1"   /* ~B2  sealed bot-to-bot command */
+#define A2_TS_SKEW 30              /* +/- seconds accepted on ~A2A / ~A2 */
+#define B2_TS_SKEW 60              /* +/- seconds accepted on ~B2 */
+#define A2_AUTH_REPLY_MIN_INTERVAL 3    /* per user: seconds between lockboxes */
+#define A2_AUTH_REPLY_GLOBAL_INTERVAL 1 /* all users: seconds between lockboxes */
+#define SEAL_OVERHEAD (32 + 12 + 16)    /* eph_pub || iv(GCM_IV_LEN) || .. || tag */
+#define SEAL_MAX_PLAINTEXT 1024         /* bound on any ~A2 / ~B2 plaintext */
+#define KEY_FP_LEN 19                   /* "ab12:cd34:ef56:7890" */
+/* Protocol version this bot advertises to the hub as "v|2|<ts>".  A hub sends
+ * the new a|/o|/b| record shapes only to bots at >= 2; older bots get records
+ * with an empty password slot so they refuse admin commands (fail closed). */
+#define BOT_PROTO_VERSION 2
 
 #define GCM_IV_LEN 12 // 12 bytes (96 bits) is industry standard. Do not change
 #define GCM_TAG_LEN                                                            \
@@ -191,7 +211,8 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_ADMIN_DEL_OPER_RECORD 0x49
 #define CMD_ADMIN_ADD_USERMASK   0x4A
 #define CMD_ADMIN_DEL_USERMASK   0x4B
-#define CMD_ADMIN_SET_USERPASS   0x4C
+/* 0x4C was CMD_ADMIN_SET_USERPASS — retired (passwordless), never reuse. */
+#define CMD_ADMIN_SET_USERKEY    0x55   /* payload: name|pubkey_b64 */
 #define CMD_ADMIN_MATCH          0x4D
 #define CMD_ADMIN_LIST_ADMINS    0x4E
 #define CMD_ADMIN_LIST_OPERS_V2  0x4F
@@ -206,8 +227,8 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_ADMIN_LIST_OPERS 0x2C     // List oper masks
 #define CMD_ADMIN_ADD_OPER 0x2D       // Add oper mask
 #define CMD_ADMIN_DEL_OPER 0x2E       // Remove oper mask
-#define CMD_ADMIN_SET_ADMIN_PASS 0x2F // Change admin password
-#define CMD_ADMIN_SET_BOT_PASS 0x30   // Change bot password
+/* 0x2F (SET_ADMIN_PASS) and 0x30 (SET_BOT_PASS) are retired — passwordless;
+ * never reuse them. */
 #define CMD_ADMIN_OP_USER 0x31        // Op a user in a channel
 
 // Bot-to-Bot Op Commands (via Hub)
@@ -258,16 +279,42 @@ typedef struct {
   char   uuid[37];
   char   name[64];
   /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
-   * (88 chars + NUL).  Empty when no key on file.  Bots never need to use
-   * the pubkey themselves but they replicate the field via mesh sync. */
+   * (88 chars + NUL) — the user's only credential: ~A2A signatures verify
+   * against the Ed25519 half, ~A2 commands open with the X25519 half.  Empty
+   * (has_pubkey false) for a legacy record that has not been given a key yet;
+   * such a user can authenticate nowhere. */
   char   pubkey_b64[COMBINED_KEY_B64 + 1];
   bool   has_pubkey;
-  char   password[MAX_PASS];
   char   type;         /* 'a' = admin, 'o' = oper */
   bool   is_active;    /* false when action == "del" */
   time_t last_seen;
   time_t timestamp;
+  time_t last_auth_reply; /* runtime only: ~A2K rate limit, never persisted */
 } user_record_t;
+
+/* Parsed a|/o| line body (config file, hub sync, bot push).  legacy is true
+ * when the line carried a password in field 3 — it has already been wiped. */
+typedef struct {
+  char   uuid[37];
+  char   name[64];
+  char   pubkey_b64[COMBINED_KEY_B64 + 1];
+  bool   has_pubkey;
+  bool   is_active;
+  bool   legacy;
+  time_t last_seen;
+  time_t timestamp;
+} user_line_t;
+
+/* One trusted peer bot (b| line).  pub is the peer's combined Curve25519 key
+ * (Ed25519 || X25519) used for ~B2; has_pub is false for entries that arrived
+ * without one (a pre-passwordless hub, or a bare hand-typed mask). */
+typedef struct {
+  char   mask[MAX_MASK_LEN];
+  char   uuid[37];
+  unsigned char pub[HUB_KEY_RAW_LEN];
+  bool   has_pub;
+  time_t ts;
+} trusted_bot_t;
 
 typedef struct {
   char   uuid[37];     /* matches user_record_t.uuid */
@@ -397,10 +444,14 @@ struct bot_state {
    * that is unavoidable without hardware-backed key storage.  Real defences
    * are OS-level (ptrace_scope, process isolation, 0600 file permissions). */
   char startup_password[MAX_PASS];
-  char bot_comm_pass[MAX_PASS];
-  time_t bot_comm_pass_ts;
-  char *trusted_bots[MAX_TRUSTED_BOTS + 1];
+  trusted_bot_t trusted_bots[MAX_TRUSTED_BOTS];
   int trusted_bot_count;
+  time_t last_auth_reply_any; // ~A2K global rate limit (runtime only)
+  /* Runtime only: a local user/mask change (+admin, -oper, chkey, ...) could
+   * not be pushed because the hub link was down.  Pushed right after the next
+   * hub authentication — otherwise that connect's config would rebuild the
+   * user table and silently undo it (a revoked key coming back). */
+  bool admin_delta_pending;
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
   char who_request_channel[MAX_CHAN];
   nonce_entry_t recent_nonces[NONCE_CACHE_SIZE];
@@ -425,6 +476,11 @@ struct bot_state {
   char bot_uuid[64];
   char hub_key[MAX_HUB_KEY_SIZE];    // 88-char base64 — used for config serialization only
   unsigned char hub_key_raw[HUB_KEY_RAW_LEN]; // decoded key; mlock'd and cleansed on exit
+  /* Public half of the identity key (ed_pub || x_pub), derived from hub_key_raw
+   * by bot_self_pub_refresh() on load/wizard/rekey.  ~A2 and ~B2 need x_pub for
+   * their KDF; status/-setup display it. */
+  unsigned char self_pub[HUB_KEY_RAW_LEN];
+  bool          self_pub_set;
   /* hub_remote_ed_pub holds the pinned pubkey of the hub currently being
    * connected to: it is copied from hubs[idx].ed_pub at connect time so the
    * handshake-verification code has a single place to read from. The
@@ -448,10 +504,26 @@ struct bot_state {
 
 // ... [Function Prototypes same as before] ...
 void ssl_init_openssl(void);
-user_record_t *auth_find_user(bot_state_t *state, const char *user_host,
-                              time_t now);
+/* Active user records that have a key and own an active mask matching
+ * user_host; mask_idx[i] is the matching mask.  No side effects — call
+ * auth_mark_used() once one of them has actually authenticated. */
+int auth_user_candidates(bot_state_t *state, const char *user_host,
+                         user_record_t **out, int *mask_idx, int max);
+void auth_mark_used(bot_state_t *state, user_record_t *u, int mask_idx,
+                    time_t now);
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
                          char *uuid_out, size_t uuid_out_size);
+trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
+                                        const char *user_host);
+trusted_bot_t *auth_trusted_bot_by_uuid(bot_state_t *state, const char *uuid);
+trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick);
+/* Nick part of a trusted bot's mask (up to '!'), bounded to MAX_NICK. */
+void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]);
+/* a|/o| and b| record codec shared by config.c and hub_client.c. */
+bool config_parse_user_line(const char *data, user_line_t *out);
+int config_format_user_line(const user_record_t *u, char *buf, size_t len);
+bool config_parse_bot_line(const char *data, trusted_bot_t *out);
+int config_format_bot_line(const trusted_bot_t *tb, char *buf, size_t len);
 void setup_signals(void);
 void daemonize(void);
 void change_proc_name(int argc, char *argv[]);
@@ -488,6 +560,8 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *dest, char *message);
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
                             const char *format, ...);
+void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
+                            const char *target_nick, const char *format, ...);
 _Noreturn void handle_fatal_error(const char *message);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
@@ -526,6 +600,28 @@ bool crypto_generate_combined_keypair(unsigned char priv_out[HUB_KEY_RAW_LEN],
 bool crypto_ed25519_verify(const unsigned char pub[32],
                            const unsigned char *msg, size_t msg_len,
                            const unsigned char sig[64]);
+/* X25519; false on failure or an all-zero (low-order point) result. */
+bool crypto_x25519_derive(const unsigned char priv[32],
+                          const unsigned char peer_pub[32],
+                          unsigned char out[32]);
+bool crypto_combined_pub_from_priv(const unsigned char priv[HUB_KEY_RAW_LEN],
+                                   unsigned char pub[HUB_KEY_RAW_LEN]);
+/* Strict: canonical base64 of exactly 64 bytes, neither half all zero. */
+bool crypto_pubkey_b64_decode(const char *b64, unsigned char out[HUB_KEY_RAW_LEN]);
+void crypto_key_fingerprint(const unsigned char pub[HUB_KEY_RAW_LEN],
+                            char out[KEY_FP_LEN + 1]);
+/* Sealed frame eph_pub(32) || iv(12) || ct || tag(16).  s_x_priv/s_x_pub add
+ * the static sender term (both NULL = anonymous).  Return length or -1. */
+int crypto_seal(const unsigned char *s_x_priv, const unsigned char *s_x_pub,
+                const unsigned char r_x_pub[32], const char *label,
+                const unsigned char *aad, size_t aad_len,
+                const unsigned char *pt, size_t pt_len,
+                unsigned char *out, size_t out_cap);
+int crypto_open(const unsigned char r_x_priv[32], const unsigned char r_x_pub[32],
+                const unsigned char *s_x_pub, const char *label,
+                const unsigned char *aad, size_t aad_len,
+                const unsigned char *frame, size_t frame_len,
+                unsigned char *pt_out, size_t pt_cap);
 /* Volatile-pointer secure zero. Compiler may NOT elide. */
 void secure_wipe(void *ptr, size_t len);
 char *base64_encode(const unsigned char *input, int length);
@@ -548,14 +644,34 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
                                     const char *channel);
 bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
-                                  const char *encoded_cipher,
-                                  const char *encoded_tag);
+                                  const char *frame_line);
+/* Split the mlock'd identity key into its halves (caller wipes). */
+bool bot_key_decode(bot_state_t *state, unsigned char ed_priv[32],
+                    unsigned char x_priv[32]);
+/* Recompute self_pub from the identity key; false if there is no usable key. */
+bool bot_self_pub_refresh(bot_state_t *state);
+/* Strict "<ts>:<nonce16hex>:<command>" parser shared by ~A2 and ~B2. */
+bool envelope_parse(char *pt, time_t *ts, uint64_t *nonce, char **cmd);
+/* Hub-relayed CMD_BOT_MSG: "<sender_uuid>|~B2 <b64>". */
 void bot_comms_process_payload(bot_state_t *state, const char *payload);
+/* Direct PRIVMSG from a trusted bot.  Returns true if message was a ~B2
+ * frame (handled or dropped) so the caller stops processing it. */
+bool bot_comms_handle_privmsg(bot_state_t *state, const char *nick,
+                              const char *user_host, const char *message);
 void bot_set_startup_pass(bot_state_t *s, const char *pass);
 void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]);
 bool bot_has_startup_pass(const bot_state_t *s);
 void config_write_with_state_pass(bot_state_t *s);
 void config_write_local_with_state_pass(bot_state_t *s);
+
+/* Timestamp for changing an EXISTING replicated record: now, but always past
+ * its previous stamp.  Hubs and bots accept only a strictly newer timestamp,
+ * so an add and a remove in the same second would tie and the remove would
+ * never replicate (a removed admin staying active elsewhere). */
+static inline time_t lww_next_ts(time_t prev) {
+  time_t now = time(NULL);
+  return now > prev ? now : prev + 1;
+}
 
 static inline bool is_valid_bot_nick(const char *nick) {
   return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&

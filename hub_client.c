@@ -40,9 +40,11 @@ void hub_client_on_connect(bot_state_t *state) {
 }
 
 /* Copy the raw key halves from the pre-decoded, mlock'd hub_key_raw buffer.
- * Avoids repeated base64 decoding and keeps the key out of new heap regions. */
-static bool hub_key_decode(bot_state_t *state, unsigned char ed_priv[32],
-                           unsigned char x_priv[32]) {
+ * Avoids repeated base64 decoding and keeps the key out of new heap regions.
+ * This is the bot's single identity key: hub handshake, ~A2/~A2K admin
+ * transport and ~B2 bot-to-bot all use it.  Callers wipe the outputs. */
+bool bot_key_decode(bot_state_t *state, unsigned char ed_priv[32],
+                    unsigned char x_priv[32]) {
   /* Zero check: if hub_key_raw was never populated, fall back to base64 decode
    * (handles the first handshake before a config reload sets hub_key_raw). */
   bool raw_set = false;
@@ -71,6 +73,50 @@ static bool hub_key_decode(bot_state_t *state, unsigned char ed_priv[32],
   return true;
 }
 
+bool bot_self_pub_refresh(bot_state_t *state) {
+  unsigned char priv[HUB_KEY_RAW_LEN];
+  state->self_pub_set = false;
+  memset(state->self_pub, 0, sizeof(state->self_pub));
+  if (state->hub_key[0] == '\0') {
+    bool raw_set = false;
+    for (int i = 0; i < HUB_KEY_RAW_LEN; i++)
+      if (state->hub_key_raw[i]) { raw_set = true; break; }
+    if (!raw_set) return false;
+  }
+  if (!bot_key_decode(state, priv, priv + 32)) return false;
+  state->self_pub_set = crypto_combined_pub_from_priv(priv, state->self_pub);
+  secure_wipe(priv, sizeof(priv));
+  return state->self_pub_set;
+}
+
+/* Encrypt one [cmd][len][payload] frame under the hub session key and send
+ * it.  Returns false (after disconnecting on a send error) if it could not. */
+static bool hub_send_frame(bot_state_t *state, int cmd, const char *payload,
+                           int pay_len) {
+  if (!state->hub_authenticated || state->hub_fd == -1) return false;
+  if (pay_len < 0 || pay_len > MAX_BUFFER - 64) return false;
+  unsigned char plain[MAX_BUFFER];
+  plain[0] = (unsigned char)cmd;
+  uint32_t inner_len = htonl((uint32_t)pay_len);
+  memcpy(&plain[1], &inner_len, 4);
+  if (pay_len) memcpy(&plain[5], payload, (size_t)pay_len);
+
+  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
+  int cipher_len = crypto_aes_gcm_encrypt(
+      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+  secure_wipe(plain, (size_t)(5 + pay_len));
+  if (cipher_len <= 0) return false;
+  memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
+  uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
+  memcpy(cipher, &net_len, 4);
+  int total = 4 + cipher_len + GCM_TAG_LEN;
+  if (send(state->hub_fd, cipher, total, 0) != total) {
+    hub_client_disconnect(state);
+    return false;
+  }
+  return true;
+}
+
 /* Sign a domain-separated challenge with the Ed25519 private key.
  * msg = "irchub-bot-challenge-v1|UUID|" + hub_eph_pub(32) + challenge(32)
  * sig_out is 64 bytes. */
@@ -79,7 +125,7 @@ static bool ed25519_sign_challenge(bot_state_t *state,
                                    const unsigned char *hub_eph_pub,
                                    unsigned char sig_out[64]) {
   unsigned char ed_priv[32], x_priv[32];
-  if (!hub_key_decode(state, ed_priv, x_priv)) return false;
+  if (!bot_key_decode(state, ed_priv, x_priv)) return false;
   secure_wipe(x_priv, 32);
 
   EVP_PKEY *pk = EVP_PKEY_new_raw_private_key(EVP_PKEY_ED25519, NULL, ed_priv, 32);
@@ -127,30 +173,14 @@ static bool x25519_derive_session_key(bot_state_t *state,
                                       const unsigned char challenge[32],
                                       unsigned char session_key_out[32]) {
   unsigned char ed_priv[32], x_priv[32];
-  if (!hub_key_decode(state, ed_priv, x_priv)) return false;
+  if (!bot_key_decode(state, ed_priv, x_priv)) return false;
   secure_wipe(ed_priv, 32);
 
-  // X25519 ECDH
-  EVP_PKEY *priv = EVP_PKEY_new_raw_private_key(EVP_PKEY_X25519, NULL, x_priv, 32);
-  EVP_PKEY *peer = EVP_PKEY_new_raw_public_key(EVP_PKEY_X25519, NULL, hub_eph_pub, 32);
-  secure_wipe(x_priv, 32);
-  bool ok = false;
+  // X25519 ECDH (rejects a low-order hub_eph_pub)
   unsigned char shared[32];
-
-  if (priv && peer) {
-    EVP_PKEY_CTX *ctx = EVP_PKEY_CTX_new(priv, NULL);
-    size_t len = 32;
-    if (ctx && EVP_PKEY_derive_init(ctx) == 1
-            && EVP_PKEY_derive_set_peer(ctx, peer) == 1
-            && EVP_PKEY_derive(ctx, shared, &len) == 1
-            && len == 32)
-      ok = true;
-    if (ctx) EVP_PKEY_CTX_free(ctx);
-  }
-  if (priv) EVP_PKEY_free(priv);
-  if (peer) EVP_PKEY_free(peer);
+  bool ok = crypto_x25519_derive(x_priv, hub_eph_pub, shared);
+  secure_wipe(x_priv, 32);
   if (!ok) {
-    secure_wipe(shared, 32);
     log_message(L_INFO, state, "[HUB] X25519 derive failed\n");
     return false;
   }
@@ -267,14 +297,14 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
 
 /**
  * Generate config payload for hub sync
- * Includes: c| (channels), p| (bot password), h| (hostmask), n| (nick)
- * Excludes: a|, o|, m| (hub-authoritative) and s|, u|, g|, v|, l|, i|, k|
- * (bot-specific)
- * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| and p| are omitted as well: the
- * bot refuses join/part/chpass/botpass locally, so those records can only be
- * the hub's own copy, and irchub's process_bot_config_push rejects them by
- * type before any timestamp compare — pushing them would just log one
- * REJECTED line per record on every connect.
+ * Includes: c| (channels), h| (hostmask), n| (nick), v| (protocol version)
+ * Excludes: a|, o|, m| (hub-authoritative; pushed separately by
+ * hub_client_push_admin_delta) and the local-only s|, u|, g|, l|, i|, k|
+ * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted as well: the bot
+ * refuses join/part locally, so those records can only be the hub's own copy,
+ * and irchub's process_bot_config_push rejects them by type before any
+ * timestamp compare — pushing them would just log one REJECTED line per
+ * record on every connect.  (The retired bot password p| is never sent.)
  */
 void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
                                         int max_len) {
@@ -311,13 +341,17 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
    * fields (channels, nick, hostmask) are included in the push payload.
    * The hub manages a|/o|/m| records via CMD_ADMIN_* commands only. */
 
-  // Bot communication password (p| line); hub-authoritative under opt 'h'
-  if (!hub_only && state->bot_comm_pass[0] != '\0') {
-    written = snprintf(buffer + offset, max_len - offset, "p|%s|%ld\n",
-                       state->bot_comm_pass, (long)state->bot_comm_pass_ts);
-    if (written > 0 && written < max_len - offset) {
-      offset += written;
-    }
+  /* Protocol capability (passwordless.md §3.4), sent on every push and under
+   * every opt.  The hub records it on this connection only (a downgraded
+   * binary on the next connect is never mistaken for v2), answers the first
+   * v >= 2 with a fresh config in the new a|/o|/b| shapes, and until then
+   * sends legacy shapes with an empty password slot, which this bot also
+   * parses.  (Bot->hub push namespace — unrelated to the v| vhost line in the
+   * local config file.)  The timestamp field is unused. */
+  written = snprintf(buffer + offset, max_len - offset, "v|%d|%d\n",
+                     BOT_PROTO_VERSION, 1);
+  if (written > 0 && written < max_len - offset) {
+    offset += written;
   }
 
   // Hostmask — use the timestamp captured when actual_hostname last changed;
@@ -391,44 +425,23 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
   return false;
 }
 
-/* Route an encrypted bot command to a specific bot by UUID via hub relay.
- * encoded_cipher and encoded_tag are the base64 strings from bot_comms.
+/* Route a sealed bot command ("~B2 <b64>") to a specific bot by UUID via hub
+ * relay.  The hub forwards it opaquely as "<sender_uuid>|~B2 <b64>".
  * Returns true if the frame was sent to the hub; false to fall back to PRIVMSG. */
 bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
-                                  const char *encoded_cipher,
-                                  const char *encoded_tag) {
+                                  const char *frame_line) {
   if (!state->hub_connected || !state->hub_authenticated ||
       state->hub_fd == -1)
     return false;
 
   char payload[MAX_BUFFER];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s:%s",
-                         target_uuid, encoded_cipher, encoded_tag);
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s",
+                         target_uuid, frame_line);
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return false;
-
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_BOT_RELAY;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
-      log_message(L_DEBUG, state,
-                  "[BOT-COMM] CMD_BOT_RELAY sent to hub for %s\n", target_uuid);
-      return true;
-    }
-    hub_client_disconnect(state);
-  }
-  return false;
+  if (!hub_send_frame(state, CMD_BOT_RELAY, payload, pay_len)) return false;
+  log_message(L_DEBUG, state,
+              "[BOT-COMM] CMD_BOT_RELAY sent to hub for %s\n", target_uuid);
+  return true;
 }
 
 /* Send CMD_INVITE_REQUEST to hub: hub will broadcast to all bots */
@@ -478,54 +491,59 @@ void hub_client_promote_local_config(bot_state_t *state) {
  * process_bot_config_push uses strict ts > stored_ts, so unchanged records
  * (same timestamp) are silently rejected — only new or modified ones land. */
 void hub_client_push_admin_delta(bot_state_t *state) {
-  if (!state->hub_authenticated || state->hub_fd == -1) return;
+  if (!state->hub_authenticated || state->hub_fd == -1) {
+    /* No hub link: send it after the next authentication (see
+     * admin_delta_pending).  A restart before that still loses it. */
+    if (state->hub_count > 0) state->admin_delta_pending = true;
+    return;
+  }
+  state->admin_delta_pending = true;   /* cleared once every frame went out */
 
+  /* Every record goes out: when the lines exceed one frame they are split
+   * across several CMD_CONFIG_PUSH frames at line boundaries (the hub applies
+   * each line independently, LWW by timestamp).  Users precede masks so a new
+   * user always lands before its first mask. */
+  const int chunk_cap = MAX_BUFFER - 64;
   char payload[MAX_BUFFER];
-  int offset = 0;
-  int remaining = (int)sizeof(payload);
+  int offset = 0, frames = 0;
+  int total_lines = state->user_record_count + state->mask_record_count;
 
-  for (int i = 0; i < state->user_record_count; i++) {
-    const user_record_t *u = &state->user_records[i];
-    int w = snprintf(payload + offset, (size_t)remaining,
-                     "%c|%s|%s|%s|%s|%ld|%ld\n",
-                     u->type, u->uuid, u->name, u->password,
-                     u->is_active ? "add" : "del",
-                     (long)u->last_seen, (long)u->timestamp);
-    if (w > 0 && w < remaining) { offset += w; remaining -= w; }
+  for (int i = 0; i < total_lines; i++) {
+    char line[CFG_MASK_LINE_MAX > CFG_USER_LINE_MAX ? CFG_MASK_LINE_MAX
+                                                    : CFG_USER_LINE_MAX];
+    int w;
+    if (i < state->user_record_count) {
+      w = config_format_user_line(&state->user_records[i], line, sizeof(line));
+    } else {
+      const mask_record_t *m =
+          &state->mask_records[i - state->user_record_count];
+      w = snprintf(line, sizeof(line), "m|%s|%s|%s|%ld|%ld\n", m->uuid,
+                   m->mask, m->is_active ? "add" : "del", (long)m->last_used,
+                   (long)m->timestamp);
+    }
+    if (w <= 0 || w >= (int)sizeof(line)) {
+      log_message(L_INFO, state, "[HUB] Admin delta: record %d too long; "
+                                 "skipped\n", i);
+      continue;
+    }
+    if (offset + w > chunk_cap) {
+      if (!hub_send_frame(state, CMD_CONFIG_PUSH, payload, offset)) return;
+      frames++;
+      offset = 0;
+    }
+    memcpy(payload + offset, line, (size_t)w);
+    offset += w;
   }
-  for (int i = 0; i < state->mask_record_count; i++) {
-    const mask_record_t *m = &state->mask_records[i];
-    int w = snprintf(payload + offset, (size_t)remaining,
-                     "m|%s|%s|%s|%ld|%ld\n",
-                     m->uuid, m->mask,
-                     m->is_active ? "add" : "del",
-                     (long)m->last_used, (long)m->timestamp);
-    if (w > 0 && w < remaining) { offset += w; remaining -= w; }
+  if (offset > 0) {
+    if (!hub_send_frame(state, CMD_CONFIG_PUSH, payload, offset)) return;
+    frames++;
   }
-
-  if (offset == 0) return;
-
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_CONFIG_PUSH;
-  uint32_t inner_len = htonl((uint32_t)offset);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)offset);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + offset, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total)
-      log_message(L_INFO, state, "[HUB] Admin delta pushed (%d user, %d mask records)\n",
-                  state->user_record_count, state->mask_record_count);
-    else
-      hub_client_disconnect(state);
-  }
+  state->admin_delta_pending = false;
+  if (frames > 0)
+    log_message(L_INFO, state,
+                "[HUB] Admin delta pushed (%d user, %d mask records, %d "
+                "frame%s)\n", state->user_record_count,
+                state->mask_record_count, frames, frames == 1 ? "" : "s");
 }
 
 /**
@@ -820,62 +838,40 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'o': // Oper user record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64])
-    case 'a': // Admin user record (new: uuid|name|pass|add/del|last_seen|ts[|pubkey_b64])
+    case 'o': // Oper user record  } config_parse_user_line: new, or legacy
+    case 'a': // Admin user record }  (password slot dropped, key from field 7)
     {
-      char first_ua[40] = {0};
-      char *pfua = strchr(data, '|');
-      if (pfua) { size_t fl=(size_t)(pfua-data); if(fl<sizeof(first_ua)){memcpy(first_ua,data,fl);first_ua[fl]=0;} }
-      bool is_new_ua = (strlen(first_ua)==36 && first_ua[8]=='-' && first_ua[13]=='-' && first_ua[18]=='-' && first_ua[23]=='-');
-      if (is_new_ua) {
-        char *p1=strchr(data,'|'), *p2=p1?strchr(p1+1,'|'):NULL;
-        char *p3=p2?strchr(p2+1,'|'):NULL, *p4=p3?strchr(p3+1,'|'):NULL;
-        char *p5=p4?strchr(p4+1,'|'):NULL, *p6=p5?strchr(p5+1,'|'):NULL;
-        if (p1&&p2&&p3&&p4&&p5) {
-          char uuid[37], uname[64], upass[MAX_PASS], act[8];
-          char incoming_pub[COMBINED_KEY_B64 + 1] = {0};
-          long long last_seen, ts;
-          snprintf(uuid,  sizeof(uuid),  "%.*s",(int)(p1-data),data);
-          snprintf(uname, sizeof(uname), "%.*s",(int)(p2-p1-1),p1+1);
-          snprintf(upass, sizeof(upass), "%.*s",(int)(p3-p2-1),p2+1);
-          snprintf(act,   sizeof(act),   "%.*s",(int)(p4-p3-1),p3+1);
-          last_seen = atoll(p4+1);
-          if (p6) {
-            char ts_buf[32];
-            snprintf(ts_buf, sizeof(ts_buf), "%.*s", (int)(p6-p5-1), p5+1);
-            ts = atoll(ts_buf);
-            snprintf(incoming_pub, sizeof(incoming_pub), "%s", p6+1);
-          } else {
-            ts = atoll(p5+1);
-          }
-          bool is_active = (strncmp(act,"add",3)==0);
-          user_record_t *found_u = NULL;
-          for (int ui=0; ui<state->user_record_count; ui++) {
-            if (strcmp(state->user_records[ui].uuid,uuid)==0) {
-              found_u = &state->user_records[ui]; break;
-            }
-          }
-          if (!found_u && state->user_record_count < MAX_USER_RECORDS) {
-            found_u = &state->user_records[state->user_record_count++];
-            memset(found_u,0,sizeof(*found_u));
-            snprintf(found_u->uuid,sizeof(found_u->uuid),"%s",uuid);
-          }
-          if (found_u && ts > found_u->timestamp) {
-            snprintf(found_u->name,     sizeof(found_u->name),     "%s",uname);
-            snprintf(found_u->password, sizeof(found_u->password), "%s",upass);
-            found_u->type      = type;
-            found_u->is_active = is_active;
-            if (last_seen > found_u->last_seen) found_u->last_seen = last_seen;
-            found_u->timestamp = ts;
-            if (incoming_pub[0] && strlen(incoming_pub) == COMBINED_KEY_B64) {
-              snprintf(found_u->pubkey_b64, sizeof(found_u->pubkey_b64),
-                       "%s", incoming_pub);
-              found_u->has_pubkey = true;
-            }
-            updates++;
-            log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s)\n", uname, type, act);
-          }
+      user_line_t ul;
+      if (!config_parse_user_line(data, &ul)) {
+        log_message(L_DEBUG, state, "[HUB-SYNC] Malformed %c| record ignored\n",
+                    type);
+        break;
+      }
+      user_record_t *found_u = NULL;
+      for (int ui = 0; ui < state->user_record_count; ui++) {
+        if (strcmp(state->user_records[ui].uuid, ul.uuid) == 0) {
+          found_u = &state->user_records[ui]; break;
         }
+      }
+      if (!found_u && state->user_record_count < MAX_USER_RECORDS) {
+        found_u = &state->user_records[state->user_record_count++];
+        memset(found_u, 0, sizeof(*found_u));
+        memcpy(found_u->uuid, ul.uuid, sizeof(found_u->uuid));
+      }
+      if (found_u && ul.timestamp > found_u->timestamp) {
+        memcpy(found_u->name, ul.name, sizeof(found_u->name));
+        /* The hub is authoritative for the key too: a record that arrives
+         * keyless leaves the user keyless (cannot authenticate). */
+        memcpy(found_u->pubkey_b64, ul.pubkey_b64, sizeof(found_u->pubkey_b64));
+        found_u->has_pubkey = ul.has_pubkey;
+        found_u->type      = type;
+        found_u->is_active = ul.is_active;
+        if (ul.last_seen > found_u->last_seen) found_u->last_seen = ul.last_seen;
+        found_u->timestamp = ul.timestamp;
+        updates++;
+        log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s%s)\n", ul.name,
+                    type, ul.is_active ? "add" : "del",
+                    ul.has_pubkey ? "" : ", no key");
       }
     } break;
 
@@ -907,126 +903,72 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'p': // Bot password: p|password|timestamp
+    case 'p': // Retired bot password (pre-passwordless hub): ignored
+      log_message(L_DEBUG, state, "[HUB-SYNC] Ignored retired p| line\n");
+      break;
+
+    case 'b': // Trusted bot: b|mask|uuid|pubkey|ts (legacy b|mask|uuid|ts)
     {
-      char pass[MAX_PASS];
-      long long ts = 0;
-      int parsed = sscanf(data, "%127[^|]|%lld", pass, &ts);
-      if (parsed < 1) {
-        snprintf(pass, sizeof(pass), "%s", data);
-        ts = 0;
-      }
-      log_message(L_DEBUG, state, "[HUB-SYNC] BotPass: hub_ts=%lld local_ts=%ld\n",
-                  ts, (long)state->bot_comm_pass_ts);
-      // Only update if hub has newer timestamp
-      if (ts > state->bot_comm_pass_ts || state->bot_comm_pass[0] == '\0') {
-        snprintf(state->bot_comm_pass, sizeof(state->bot_comm_pass), "%s", pass);
-        state->bot_comm_pass_ts = ts;
-        updates++;
-        log_message(L_INFO, state, "[HUB] Updated bot password (ts=%lld)\n", ts);
-      } else {
-        log_message(L_DEBUG, state, "[HUB-SYNC] Rejected bot password: hub_ts=%lld <= local_ts=%ld\n",
-                    ts, (long)state->bot_comm_pass_ts);
-      }
-    } break;
-
-    case 'b': // Bot line: b|hostmask|uuid|timestamp
-    {
-      // hub_generate_bot_payload sends: b|<hostmask>|<uuid>|<ts>
-      char hostmask[MAX_MASK_LEN];
-      char uuid[64];
-      long long ts = 0;
-      hostmask[0] = '\0';
-      uuid[0] = '\0';
-
-      log_message(L_DEBUG, state, "[HUB-SYNC] Processing bot line\n");
-
-      int parsed = sscanf(data, "%255[^|]|%63[^|]|%lld", hostmask, uuid, &ts);
-      log_message(L_DEBUG, state,
-                  "[HUB-SYNC] Parsed %d fields: hostmask='%s' uuid='%s' ts=%lld\n",
-                  parsed, hostmask, uuid, ts);
-      if (parsed < 1) {
-        snprintf(hostmask, sizeof(hostmask), "%s", data);
+      trusted_bot_t in;
+      if (!config_parse_bot_line(data, &in)) {
+        /* A trust record is never stored truncated — a clipped mask or uuid
+         * would silently mis-key every later match — so refuse instead. */
+        log_message(L_INFO, state,
+                    "[HUB] Rejected malformed/oversized trusted-bot line\n");
+        break;
       }
 
-      if (hostmask[0] != '\0') {
-        // Find existing entry: prefer UUID match (handles nick/host changes),
-        // fall back to hostmask match.  Also sweep out any duplicate entries
-        // for the same UUID so stale masks from previous sessions don't linger.
-        int existing_idx = -1;
-
-        if (uuid[0] != '\0') {
-          for (int i = 0; i < state->trusted_bot_count; i++) {
-            char ex_uuid[64];
-            if (sscanf(state->trusted_bots[i], "%*[^|]|%63[^|]", ex_uuid) >= 1 &&
-                strcmp(ex_uuid, uuid) == 0) {
-              if (existing_idx == -1) {
-                existing_idx = i; // keep first match
-              } else {
-                // Remove duplicate: shift array down and free
-                free(state->trusted_bots[i]);
-                memmove(&state->trusted_bots[i],
-                        &state->trusted_bots[i + 1],
-                        (state->trusted_bot_count - i - 1) * sizeof(char *));
-                state->trusted_bot_count--;
-                i--;
-              }
-            }
+      // Find existing entry: prefer UUID match (handles nick/host changes),
+      // fall back to hostmask match.  Also sweep out any duplicate entries
+      // for the same UUID so stale masks from previous sessions don't linger.
+      int existing_idx = -1;
+      if (in.uuid[0] != '\0') {
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          if (strcmp(state->trusted_bots[i].uuid, in.uuid) != 0) continue;
+          if (existing_idx == -1) {
+            existing_idx = i; // keep first match
+          } else {
+            memmove(&state->trusted_bots[i], &state->trusted_bots[i + 1],
+                    (size_t)(state->trusted_bot_count - i - 1) *
+                        sizeof(trusted_bot_t));
+            state->trusted_bot_count--;
+            i--;
           }
         }
-
-        // Fall back to hostmask match if no UUID match found
-        if (existing_idx == -1) {
-          for (int i = 0; i < state->trusted_bot_count; i++) {
-            char ex_mask[MAX_MASK_LEN];
-            if (sscanf(state->trusted_bots[i], "%255[^|]", ex_mask) >= 1 &&
-                strcmp(ex_mask, hostmask) == 0) {
-              existing_idx = i;
-              break;
-            }
-          }
-        }
-
-        if (existing_idx != -1) {
-          long long old_ts = 0;
-          sscanf(state->trusted_bots[existing_idx], "%*[^|]|%*[^|]|%lld", &old_ts);
-          if (ts > old_ts) {
-            /* Sized to the provable worst case: hostmask(255) + '|' +
-             * uuid(63) + '|' + ts(20 digits) + NUL.  A trust record must
-             * never be stored truncated — a clipped hostmask or UUID would
-             * silently mis-key every later match — so refuse instead. */
-            char full_entry[MAX_MASK_LEN + sizeof(uuid) + 32];
-            int elen = snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld",
-                                hostmask, uuid, ts);
-            if (elen < 0 || elen >= (int)sizeof(full_entry)) {
-              log_message(L_INFO, state,
-                          "[HUB] Rejected oversized trusted-bot entry for %s\n",
-                          hostmask);
-              break;
-            }
-            char *new_entry = strdup(full_entry);
-            if (!new_entry) break;
-            free(state->trusted_bots[existing_idx]);
-            state->trusted_bots[existing_idx] = new_entry;
-            updates++;
-            log_message(L_INFO, state, "[HUB] Updated trusted bot: %s\n", hostmask);
-          }
-        } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
-          char full_entry[MAX_MASK_LEN + sizeof(uuid) + 32];
-          int elen = snprintf(full_entry, sizeof(full_entry), "%s|%s|%lld",
-                              hostmask, uuid, ts);
-          if (elen < 0 || elen >= (int)sizeof(full_entry)) {
-            log_message(L_INFO, state,
-                        "[HUB] Rejected oversized trusted-bot entry for %s\n",
-                        hostmask);
+      }
+      if (existing_idx == -1) {
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          if (strcmp(state->trusted_bots[i].mask, in.mask) == 0) {
+            existing_idx = i;
             break;
           }
-          char *new_entry = strdup(full_entry);
-          if (!new_entry) break;
-          state->trusted_bots[state->trusted_bot_count++] = new_entry;
-          updates++;
-          log_message(L_INFO, state, "[HUB] Added trusted bot: %s\n", hostmask);
         }
+      }
+
+      if (existing_idx != -1) {
+        trusted_bot_t *ex = &state->trusted_bots[existing_idx];
+        bool key_is_new = in.has_pub &&
+            (!ex->has_pub || memcmp(ex->pub, in.pub, HUB_KEY_RAW_LEN) != 0);
+        /* ts = max(hostmask ts, key ts) on the hub, so a rekey alone bumps it;
+         * the equal-ts case covers a legacy-shaped line (no key) having been
+         * applied first under the same hostmask ts. */
+        if (in.ts > ex->ts || (in.ts == ex->ts && key_is_new)) {
+          if (!in.has_pub && ex->has_pub && strcmp(ex->uuid, in.uuid) == 0) {
+            /* Legacy-shaped line from a hub that has not seen our v|2 yet:
+             * it carries no key — keep the one we have. */
+            in.has_pub = true;
+            memcpy(in.pub, ex->pub, HUB_KEY_RAW_LEN);
+          }
+          *ex = in;
+          updates++;
+          log_message(L_INFO, state, "[HUB] Updated trusted bot: %s%s\n",
+                      in.mask, key_is_new ? " (new key)" : "");
+        }
+      } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
+        state->trusted_bots[state->trusted_bot_count++] = in;
+        updates++;
+        log_message(L_INFO, state, "[HUB] Added trusted bot: %s%s\n", in.mask,
+                    in.has_pub ? "" : " (no key yet)");
       }
     } break;
 
@@ -1587,6 +1529,14 @@ void hub_client_process(bot_state_t *state) {
           state->hub_connect_time = time(NULL);
           log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v2)!\n");
           hub_client_push_config(state);
+          if (state->admin_delta_pending) {
+            /* After the config push (so the hub already knows v|2).  LWW
+             * on the hub: only records changed here since carry a newer
+             * timestamp and win; the rest are no-ops. */
+            log_message(L_INFO, state, "[HUB] Pushing user/mask changes made "
+                                       "while the hub was unreachable\n");
+            hub_client_push_admin_delta(state);
+          }
         } else {
           log_message(L_INFO, state,
                       "[HUB] v2 ACK decrypt/parse failed (len=%d)\n", ack_pl);

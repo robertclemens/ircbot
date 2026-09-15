@@ -12,8 +12,9 @@ static bool find_uuid_for_helper(const bot_state_t *state,
                                   const roster_entry_t *helper,
                                   char *uuid_out, size_t uuid_len) {
   for (int tb = 0; tb < state->trusted_bot_count; tb++) {
-    char mask[MAX_MASK_LEN], uuid[64];
-    if (sscanf(state->trusted_bots[tb], "%255[^|]|%63[^|]", mask, uuid) < 2)
+    const char *mask = state->trusted_bots[tb].mask;
+    const char *uuid = state->trusted_bots[tb].uuid;
+    if (!uuid[0])
       continue;
 
     // 1. Exact hostmask match
@@ -355,13 +356,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
                                             chan_name)) {
           for (int tb = 0; tb < state->trusted_bot_count; tb++) {
             char tb_nick[MAX_NICK];
-            /* %9 not %63: tb_nick is MAX_NICK(10); a longer nick in a
-             * (mesh-synced) trusted_bots entry would overflow the stack. */
-            if (sscanf(state->trusted_bots[tb], "%9[^!]", tb_nick) == 1) {
+            auth_trusted_bot_nick(&state->trusted_bots[tb], tb_nick);
+            if (tb_nick[0])
               bot_comms_send_command(state, tb_nick,
                                      "INVITE %s %s",
                                      chan_name, state->current_nick);
-            }
           }
         }
       }
@@ -466,8 +465,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
     log_message(L_DEBUG, state, "[OP-REQ] trusted_bot_count=%d\n",
                 state->trusted_bot_count);
     for (int i = 0; i < state->trusted_bot_count; i++) {
-      log_message(L_DEBUG, state, "[OP-REQ] trusted_bots[%d]: %s\n", i,
-                  state->trusted_bots[i]);
+      log_message(L_DEBUG, state, "[OP-REQ] trusted_bots[%d]: %s|%s%s\n", i,
+                  state->trusted_bots[i].mask, state->trusted_bots[i].uuid,
+                  state->trusted_bots[i].has_pub ? "" : " (no key)");
     }
 
     time_t now = time(NULL);
@@ -540,7 +540,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
         if (!sent_via_hub) {
           log_message(L_DEBUG, state,
                       "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n");
-          bot_comms_send_command(state, chosen_helper->nick, "OPME %s", c->name);
+          bot_comms_send_to_host(state, chosen_helper->hostmask,
+                                 chosen_helper->nick, "OPME %s", c->name);
         }
         state->last_op_request_sent = now;
         c->op_request_retry_count++;

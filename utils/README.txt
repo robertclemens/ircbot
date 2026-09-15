@@ -1,152 +1,137 @@
-/* run_bot.sh */
+ircbot/utils — client tools and config utilities
+=================================================
 
-run_bot.sh is the preferred way to start your bot. Put this file in your bot directory and chmod 700 run_bot.sh and reference
-this file when installing a crontab.
-
-
-
-// Admin command transports
-
-The bot accepts TWO equivalent encrypted wire formats for admin commands:
-
-  ~A1   AES-256-GCM (single tag)
-  ~A1c  AES-256-CBC + HMAC-SHA256 (encrypt-then-MAC)
-
-Both derive their keys with PBKDF2-HMAC-SHA256(password, salt, 100000, ...).
-Both protect the same plaintext envelope "<unix_ts>:<nonce>:<command...>".
-Both are accepted equally — pick whichever your client can produce.
-
-Use ~A1c when you want NO compiled helpers and NO CPAN modules: openssl(1)
-alone can produce it.  Use ~A1 when you do have the compiled bot-auth helper
-(or Python/CryptX) and want the slightly cleaner AEAD wire format.
+Admins and opers command the bot with a Curve25519 keypair.  There are no
+admin, oper or bot passwords any more; the only password left is your bot's
+config-file password.  Design: irchub/docs/passwordless.md.
 
 
 
-/* bot-auth.sh  (~A1c, pure openssl CLI)  ***LEAKS YOUR PASSWORD*** */
+/* keygen.c :: make a keypair — build: make keygen   (or: gcc -O2 -Wall -o keygen keygen.c -lcrypto) */
 
-SECURITY WARNING: this script passes the admin password to openssl as
-`-kdfopt pass:"$password"` and the derived key as `enc -K <hex>`, both on the
-command line, where any local user can read them from ps(1) for the lifetime
-of the call.  Prefer a client script above.  See "WHY NOT openssl(1)".
+    ./keygen robert          # or just ./keygen and type the name when asked
 
-Builds a ~A1c payload using ONLY openssl(1) and standard coreutils.  No
-Python, no Perl modules, no compiled helpers.
+Writes, in the current directory (never overwriting an existing file):
 
-    BOT_AUTH_PASSWORD='hunter2' ./bot-auth.sh "die"
-    ./bot-auth.sh "+admin alice s3cret alice!*@trusted.example"   # prompts
+    YYYYMMDDHHMMSS_robert.private.b64   mode 0600 — yours alone: hub_admin and
+                                        your IRC script use it
+    YYYYMMDDHHMMSS_robert.public.b64    give this to an admin
 
-Requires: openssl 3.0+ (for `openssl kdf -binary PBKDF2`).
+and prints the public key and its fingerprint (e.g. 763e:58a6:2dfd:ae02).  The
+private key is never printed.  keygen.c is byte-identical to irchub/keygen.c.
 
+Without keygen (OpenSSL 1.1.1 or newer):
 
+    umask 077
+    openssl genpkey -algorithm ED25519 -out ed.pem
+    openssl genpkey -algorithm X25519  -out x.pem
+    ( openssl pkey -in ed.pem -outform DER | tail -c 32
+      openssl pkey -in x.pem  -outform DER | tail -c 32 ) | openssl base64 -A > NAME.private.b64
+    ( openssl pkey -in ed.pem -pubout -outform DER | tail -c 32
+      openssl pkey -in x.pem  -pubout -outform DER | tail -c 32 ) | openssl base64 -A > NAME.public.b64
+    shred -u ed.pem x.pem      # or rm -f — the .pem files hold the private key
 
-/* bot-auth.cmd  (~A1c, Windows batch + openssl + PowerShell)  ***LEAKS*** */
+An admin then adds you with your PUBLIC key: hub_admin "Add Admin/Oper", or on
+IRC (when the network is not in hub-only-mutation mode, opt 'h'):
 
-SECURITY WARNING: passes the password and derived key on the command line
-(readable via Win32_Process.CommandLine) and writes the derived keys and the
-plaintext to temp files.  Needs reworking before it should be relied on.
-
-Windows-native batch counterpart to bot-auth.sh.  Uses openssl.exe (ships
-with Git for Windows or any OpenSSL 3.x install) and PowerShell (built into
-Windows 10+).  No compiled helper, no Python, no Perl.
-
-    set BOT_AUTH_PASSWORD=hunter2
-    bot-auth.cmd "die"
-
-Sends the output to the bot:
-    /quote PRIVMSG <bot> :~A1c <base64>
+    +admin <name> <pubkey> <nick!user@host>
+    +oper  <name> <pubkey> <nick!user@host>
+    chkey  <name> <pubkey>          (replace a key; opers may change their own)
 
 
 
-/* ircbot_irssi_auth.pl  (~A1, Irssi, requires CryptX) */
+// How a client talks to the bot
 
-Irssi script.  All crypto runs in-process via CryptX — PBKDF2 through
-Crypt::KeyDerivation and AES-256-GCM through Crypt::AuthEnc::GCM.
+    you -> bot   PRIVMSG  ~A2A <signature> <ts>:<nonce>    auth request, signed with your key
+    bot -> you   NOTICE   ~A2K <lockbox>                   the bot's public key, sealed to you
+    you -> bot   PRIVMSG  ~A2 <sealed command>             every command after that
+
+The scripts below do this automatically: the first /botcmd to a bot
+authenticates (the lockbox notice is hidden and the bot key's fingerprint is
+printed), later commands go straight through.  The bot key is kept in memory
+for the session; restarting the IRC client means one fresh auth.  Compare the
+fingerprint once with the bot's 'status' (Pubkey line) or hub_admin's bot list.
+
+Optional pin file: once set, each bot's key is remembered and a DIFFERENT key
+for the same nick is refused with a loud warning (possible man-in-the-middle,
+or the bot was rekeyed — /botforget <bot> accepts the new key).
+
+Old password-based scripts (~A1 / ~A1c) no longer work: the bot ignores them.
+
+
+
+/* ircbot_irssi_auth.pl  (Irssi, requires CryptX) */
 
     cpan CryptX            (or: apt install libcryptx-perl)
-    /set bot_auth_passfile /home/you/.ircbot_admin_pass    # preferred, chmod 600
-    /set bot_auth_password your_admin_password             # or store in irssi config
+    cp ircbot_irssi_auth.pl ~/.irssi/scripts/ && /script load ircbot_irssi_auth.pl
+    /set bot_auth_keyfile /home/you/20260914120000_you.private.b64
+    /set bot_auth_pinfile /home/you/.ircbot_bot_pins        (optional)
     /botcmd <bot_nick> <command> [args]
-
-NOTE: Crypt::PBKDF2 is a separate distribution and is NOT part of CryptX.
-This script deliberately uses CryptX's own Crypt::KeyDerivation::pbkdf2 so
-CryptX is the only dependency.
-
-WHY NOT openssl(1): `openssl enc` accepts a raw key only as `-K <hex>` on the
-command line, and `openssl kdf` takes the password only as `-kdfopt pass:...`.
-argv is world-readable via ps(1), so the CLI cannot be used for this protocol
-without leaking either the derived key or the admin password to every local
-user.  Do not "simplify" any of these scripts back onto the openssl CLI.
+    /botauth <bot_nick>      re-authenticate      /botforget <bot_nick>   drop key (and pin)
 
 
-/* ircbot_hexchat_auth.py  (~A1, HexChat, requires python3-cryptography) */
 
-HexChat Python script.  In-process PBKDF2 + AES-256-GCM.
+/* ircbot_hexchat_auth.py  (HexChat, requires python3-cryptography) */
 
     pip install cryptography       (or: apt install python3-cryptography)
     cp ircbot_hexchat_auth.py ~/.config/hexchat/addons/
-    /BOTCMD passfile /home/you/.ircbot_admin_pass          # preferred, chmod 600
-    /BOTCMD password your_admin_password                   # or store in prefs
+    /BOTCMD keyfile /home/you/20260914120000_you.private.b64
+    /BOTCMD pinfile /home/you/.ircbot_bot_pins                (optional; "off" disables)
     /BOTCMD <bot_nick> <command> [args]
+    /BOTAUTH <bot_nick>      /BOTFORGET <bot_nick>
 
 
-/* ircbot_weechat_auth.py  (~A1, WeeChat, requires python3-cryptography) */
 
-WeeChat Python script.  In-process PBKDF2 + AES-256-GCM.
+/* ircbot_weechat_auth.py  (WeeChat, requires python3-cryptography) */
 
-    cp ircbot_weechat_auth.py ~/.weechat/python/   (or ~/.local/share/weechat/python/)
+    cp ircbot_weechat_auth.py ~/.local/share/weechat/python/   (or ~/.weechat/python/)
     /python load ircbot_weechat_auth.py
-    /set plugins.var.python.ircbot_weechat_auth.passfile /home/you/.ircbot_admin_pass
-    /botcmd <bot_nick> <command> [args]
-
-Run /botcmd from a buffer on the bot's network — the script sends on that
-buffer's server.
-
-
-/* repartee — NOT CURRENTLY POSSIBLE */
-
-Repartee (https://repart.ee/) scripts run in a sandboxed Lua 5.4 environment
-with `os`, `io`, `loadfile`, `dofile` and `package` removed.  That leaves no
-way to build a ~A1/~A1c frame:
-
-  - no `package`/`require`  -> no crypto binding (luaossl, lua-openssl)
-  - no `os`                 -> no clock for the <unix_ts> envelope field
-  - no `io`                 -> no /dev/urandom
-
-`math.random` is not a CSPRNG; deriving a salt, GCM IV or nonce from it would
-silently destroy the security of every command sent.  A script here needs one
-of: a crypto helper exposed on repartee's own `api` table, a whitelisted
-`require`, or an api call that returns cryptographically secure random bytes
-plus wall-clock time.  Until then, generate the blob with another client's
-script (or a shell) and send it with repartee's raw-line command.
+    /set plugins.var.python.ircbot_weechat_auth.keyfile /home/you/20260914120000_you.private.b64
+    /set plugins.var.python.ircbot_weechat_auth.pinfile /home/you/.ircbot_bot_pins   (optional)
+    /botcmd <bot_nick> <command> [args]       (run it from a buffer on the bot's network)
+    /botauth <bot_nick>      /botforget <bot_nick>
 
 
 
-/* bot-auth.mrc  (~A1c, mIRC) */
+/* bot-auth.c  (command-line client; also the engine behind bot-auth.mrc) */
 
-mIRC wrapper.  Delegates the openssl + PowerShell orchestration to
-bot-auth.cmd.  No compiled helper, no Python, no Perl.
+    gcc -O2 -Wall -Wextra -o bot-auth bot-auth.c -lcrypto
+    Windows (MSYS2 MinGW 64-bit shell):
+        pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
+        gcc -O2 -Wall -o bot-auth.exe bot-auth.c -lcrypto -static
 
-    /set %bot_auth_password your_admin_password
-    /set %bot_auth_helper   C:\path\to\utils\bot-auth.cmd
-    /set %bot_auth_openssl  C:\Program Files\Git\usr\bin\openssl.exe   ; optional
-    /botcmd <bot> <command> [args]
+Three steps, by hand (any client that can send a raw line works, e.g. repartee):
+
+    ./bot-auth auth KEY.private.b64 <botnick> <yournick>
+        -> ~A2A ... 1789326450:9f1c2e3a4b5c6d7e        send it:  /msg <botnick> <that line>
+    ./bot-auth open KEY.private.b64 <botnick> <yournick> 1789326450:9f1c2e3a4b5c6d7e "~A2K <reply>" [--pin FILE]
+        -> <bot pubkey> <fingerprint>
+    echo "op #chan" | ./bot-auth cmd KEY.private.b64 <botnick> <yournick> <bot pubkey>
+        -> ~A2 ...                                     send it:  /quote PRIVMSG <botnick> :<that line>
+    ./bot-auth fp <pubkey|file>                        print a key's fingerprint
+
+The command is read from stdin, never from the command line (ps(1) would show
+it).  Exit status: 1 usage/IO error, 2 verification failure, 3 pinned key
+changed.  Commands must fit one IRC line (about 200 characters).
 
 
 
-/* bot-auth.c  (~A1, compiled helper, optional) */
+/* bot-auth.mrc  (mIRC; drives bot-auth.exe) */
 
-A small native helper that produces the ~A1 (AES-256-GCM) format.  Build
-with:
+    /load -rs C:\path\to\bot-auth.mrc
+    /set %bot_auth_exe     C:\path\to\bot-auth.exe
+    /set %bot_auth_keyfile C:\path\to\20260914120000_you.private.b64
+    /set %bot_auth_pinfile C:\path\to\bot_pins.txt       (optional)
+    /botcmd <bot_nick> <command> [args]      /botauth <bot_nick>      /botforget <bot_nick>
 
-    gcc -O2 -Wall -o bot-auth bot-auth.c -lcrypto
+mIRC has no Curve25519 or AES-GCM, so every crypto step runs in bot-auth.exe;
+the command text reaches it through a temp file that is deleted right away
+(set %bot_auth_tmpdir to a private folder if your temp dir is shared).  This
+script has not been exercised in mIRC by the developers — report problems.
 
-On Windows, in MSYS2 MinGW 64-bit shell:
-    pacman -S mingw-w64-x86_64-gcc mingw-w64-x86_64-openssl
-    gcc -O2 -Wall -o bot-auth.exe bot-auth.c -lcrypto -static
-
-Reads BOT_AUTH_PASSWORD from env (or stdin in "-" mode) and prints
-"~A1 <base64>" to stdout.  Useful if you want a single tool with no
-runtime dependencies on openssl.exe / PowerShell.
+repartee: its sandboxed Lua has no crypto binding, no clock and no CSPRNG, so
+a native script is not possible; use bot-auth by hand (above) and repartee's
+raw-line command.
 
 
 
@@ -154,15 +139,14 @@ runtime dependencies on openssl.exe / PowerShell.
 
     ./encrypt_config <plaintext_file> <encrypted_out>
 
-encrypt_config is a tool for generating a config file to use with the bot. This is normally not necessary but can provide
-a good way to generate all of the channels, usermasks, passwords, etc without having to send the commands to the bot which
-is useful for loading up many bots.
+encrypt_config builds a bot config file from plaintext, e.g. to pre-load channels, users (a|/o| lines carry the
+user's PUBLIC key: a|<uuid>|<name>|<pubkey>|add|<last_seen>|<ts>|) and usermasks without sending commands to the bot.
 
-The password is prompted for after the tool starts (twice, no echo); it is never given on the command line, where ps(1)
-and shell history would see it. For scripting, pipe it in instead: when stdin is not a terminal the first line of stdin
-is the password (echo pw | ./encrypt_config plain.txt .ircbot.cnf). The output is written mode 0600 via a temp file
-and rename, so a failed run never leaves a half-written config. Input over MAX_CONFIG_SIZE (the bot's load limit), and
-input that is not a plaintext config (e.g. an already-encrypted file), is refused.
+The config password is prompted for after the tool starts (twice, no echo); it is never given on the command line,
+where ps(1) and shell history would see it. For scripting, pipe it in instead: when stdin is not a terminal the first
+line of stdin is the password (echo pw | ./encrypt_config plain.txt .ircbot.cnf). The output is written mode 0600 via
+a temp file and rename, so a failed run never leaves a half-written config. Input over MAX_CONFIG_SIZE (the bot's load
+limit), and input that is not a plaintext config (e.g. an already-encrypted file), is refused.
 
 
 
@@ -171,11 +155,11 @@ input that is not a plaintext config (e.g. an already-encrypted file), is refuse
     ./decrypt_config [config_file]              (default: .ircbot.cnf)
     ./decrypt_config .ircbot.cnf > plain.txt    (then encrypt_config plain.txt .ircbot.cnf; shred plain.txt)
 
-decrypt_config is a debugging tool to look at the contents of your config file. This is normally not necessary but helps
-debug issues with the bot.
+decrypt_config is a debugging tool to look at the contents of your config file (it holds the bot's private key in
+the k| line — treat the output accordingly).
 
-The password is prompted for after the tool starts (no echo), or piped in on stdin as above. stdout carries the raw
-plaintext and nothing else, so it can be redirected or piped; the prompt goes to the terminal and errors to stderr.
+The config password is prompted for after the tool starts (no echo), or piped in on stdin as above. stdout carries the
+raw plaintext and nothing else, so it can be redirected or piped; the prompt goes to the terminal and errors to stderr.
 
 Both tools share config_tool.h (must sit next to them when compiling); it takes SALT_SIZE, PBKDF2_ITERATIONS, MAX_PASS
 and MAX_CONFIG_SIZE from ../bot.h so the file format cannot drift from the bot's. Passwords longer than MAX_PASS-1
@@ -183,22 +167,7 @@ characters are rejected rather than silently truncated.
 
 
 
-/* legacy_encrypt_config.c :: Compile instructions: gcc legacy_encrypt_config.c -o decyrpt_tool -lssl -lcrypto */
+// Starting the bot
 
-legacy_encrypt_config.c is the old config encryption tool for versions < v1.1.2. It uses AES-256-CBC and that
-cipher was changed to AES-256-GCM in v1.1.2. Config files are not compatible using the different ciphers so you
-may use this tool on previous versions only.
-
-
-
-/* legacy_decrypt_config.c :: Compile instructions: gcc legacy_decrypt_config.c -o decyrpt_tool -lssl -lcrypto */
-
-legacy_decrypt_config.c is the old config decryption tool for versions < v1.1.2. It uses AES-256-CBC and that cipher
-was changed to AES-256-GCM in v1.1.2. You may use this tool to decrypt a AES-256-CBC config and use the AES-256-GCM
-config tool (encrypt_config.c) to migrate to the new cipher.
-
-
-
-/* test_auth.c :: Compile instructions: gcc test_auth.c -o test_auth -lssl -lcrypto */
-
-test_auth.c is a debug only tool that has been used to debug bot authorization commands during building of the bot code.
+See ../README.md: run ./ircbot and type the config password, or create a machine-bound password file once with
+./ircbot -p for unattended starts (crontab).
