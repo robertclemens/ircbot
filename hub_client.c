@@ -1,6 +1,7 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bot.h"
 #include <arpa/inet.h>
+#include <ctype.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <netdb.h>
@@ -215,6 +216,11 @@ void hub_client_disconnect(bot_state_t *state) {
   state->current_hub[0] = '\0'; // Clear current hub tracking
   state->last_hub_connect_attempt = time(NULL);
   last_pong_sent = 0;
+  /* The tree came from the hub we just lost; keep the rows so 'bots' can
+   * still answer, but clear the presence we believe the hub holds so the next
+   * authentication re-reports unconditionally. */
+  state->presence_server[0] = '\0';
+  state->last_presence_sent = 0;
 }
 
 void hub_client_heartbeat(bot_state_t *state) {
@@ -222,6 +228,9 @@ void hub_client_heartbeat(bot_state_t *state) {
       !state->hub_authenticated || state->hub_fd == -1)
     return;
   time_t now = time(NULL);
+  /* Presence is cheap and self-throttling, so it rides the same tick as the
+   * keepalive rather than needing a timer of its own. */
+  hub_client_send_presence(state, false);
   if (now - state->last_hub_ping_time < 30)
     return;
   state->last_hub_ping_time = now;
@@ -250,6 +259,126 @@ void hub_client_sync_hostmask(bot_state_t *state) {
               state->actual_hostname);
   hub_client_push_delta(state, "h", state->actual_hostname,
                         state->actual_hostname_ts);
+}
+
+/* Tell the hub what we are running: version, the IRC server we are actually
+ * on, and when this process started.  Volatile on both sides -- it feeds the
+ * 'bots' tree and nothing else, and is never written to either config.
+ *
+ * Sent when it changes (a jump to another server, a reconnect) and refreshed
+ * on a slow timer so a hub that restarted relearns us without waiting for the
+ * bot to do anything.  force re-sends even when nothing changed. */
+void hub_client_send_presence(bot_state_t *state, bool force) {
+  if (state->hub_count == 0 || state->hub_fd == -1 ||
+      !state->hub_authenticated) return;
+
+  /* Prefer the server name the link actually reported over the configured
+   * entry: after a redirect they differ, and the tree should show the truth. */
+  char server[TREE_SERVER_MAX + 1] = "";
+  if (state->status & S_CONNECTED) {
+    const char *cfg = (state->current_server_index >= 0 &&
+                       state->current_server_index < state->server_count)
+                          ? state->server_list[state->current_server_index]
+                          : NULL;
+    /* Explicit precision: a server name longer than the presence field is
+     * truncated on purpose, not an oversight. */
+    if (state->actual_server_name[0])
+      snprintf(server, sizeof(server), "%.*s", (int)sizeof(server) - 1,
+               state->actual_server_name);
+    else if (cfg)
+      snprintf(server, sizeof(server), "%.*s", (int)sizeof(server) - 1, cfg);
+  }
+
+  time_t now = time(NULL);
+  bool changed = strcmp(server, state->presence_server) != 0;
+  if (!force && !changed && state->last_presence_sent &&
+      now - state->last_presence_sent < BOT_PRESENCE_REPORT_INTERVAL)
+    return;
+
+  char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + 64];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld",
+                         BOT_VERSION, server, (long long)state->bot_start_time);
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
+
+  if (hub_send_frame(state, CMD_BOT_PRESENCE, payload, pay_len)) {
+    snprintf(state->presence_server, sizeof(state->presence_server), "%s",
+             server);
+    state->last_presence_sent = now;
+    if (changed)
+      log_message(L_DEBUG, state, "[HUB] Presence: %s on %s\n", BOT_VERSION,
+                  server[0] ? server : "(no server)");
+  }
+}
+
+/* Ingest a CMD_BOT_TREE push.  Every field is hub-supplied text that ends up
+ * in an admin's IRC client, so each one is length-capped and stripped of
+ * control bytes here rather than at render time.  A malformed row is skipped,
+ * never partially applied. */
+static void hub_client_process_tree(bot_state_t *state, char *payload,
+                                    int payload_len) {
+  if (!payload || payload_len <= 0) return;
+  payload[payload_len] = '\0';
+
+  int count = 0;
+  char *saveptr = NULL;
+  for (char *line = strtok_r(payload, "\n", &saveptr);
+       line && count < MAX_BOT_TREE_ROWS;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    if (line[0] == '\0' || line[1] != '|') continue;
+
+    /* Split on '|' in place: the hub strips '|' from every value it forwards,
+     * so a fixed field count is unambiguous. */
+    char *f[7] = {0};
+    int n = 0;
+    char *cur = line + 2;
+    while (n < 7) {
+      f[n++] = cur;
+      char *sep = strchr(cur, '|');
+      if (!sep) break;
+      *sep = '\0';
+      cur = sep + 1;
+    }
+
+    bot_tree_row_t row;
+    memset(&row, 0, sizeof(row));
+    row.kind = (char)tolower((unsigned char)line[0]);
+
+    if (row.kind == 'h' && n >= 5) {
+      row.depth = atoi(f[0]);
+      snprintf(row.name, sizeof(row.name), "%s", f[1]);
+      snprintf(row.uuid, sizeof(row.uuid), "%s", f[2]);
+      row.online = (atoi(f[3]) != 0);
+      row.uptime = (time_t)atoll(f[4]);
+      /* Version is the newest field on this row; a hub that does not send it
+       * simply leaves the column blank. */
+      if (n >= 6 && strcmp(f[5], "-") != 0)
+        snprintf(row.version, sizeof(row.version), "%s", f[5]);
+    } else if (row.kind == 'b' && n >= 6) {
+      row.depth = atoi(f[0]);
+      snprintf(row.name, sizeof(row.name), "%s", f[1]);
+      snprintf(row.uuid, sizeof(row.uuid), "%s", f[2]);
+      if (strcmp(f[3], "-") != 0)
+        snprintf(row.version, sizeof(row.version), "%s", f[3]);
+      if (strcmp(f[4], "-") != 0)
+        snprintf(row.server, sizeof(row.server), "%s", f[4]);
+      row.uptime = (time_t)atoll(f[5]);
+      row.online = true;
+    } else if (row.kind == 'd' && n >= 3) {
+      snprintf(row.name, sizeof(row.name), "%s", f[0]);
+      snprintf(row.uuid, sizeof(row.uuid), "%s", f[1]);
+      row.uptime = (time_t)atoll(f[2]); /* last seen, not a duration */
+      row.online = false;
+    } else {
+      continue;
+    }
+    if (strcmp(row.name, "-") == 0) row.name[0] = '\0';
+    if (row.depth < 0 || row.depth > 8) row.depth = 0;
+    state->bot_tree[count++] = row;
+  }
+
+  state->bot_tree_count = count;
+  state->bot_tree_ts = time(NULL);
+  log_message(L_DEBUG, state, "[HUB] Bot tree updated (%d rows)\n", count);
 }
 
 /* Push a single key=value change to the hub via CMD_BOT_DELTA.
@@ -1078,7 +1207,12 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
                          int payload_len) {
   switch (cmd) {
   case CMD_PING:
-    log_message(L_DEBUG, state, "[HUB] Received PING from hub\n");
+    if (!HIDEPINGPONG)
+      log_message(L_DEBUG, state, "[HUB] Received PING from hub\n");
+    break;
+
+  case CMD_BOT_TREE:
+    hub_client_process_tree(state, payload, payload_len);
     break;
 
   case CMD_CONFIG_PULL:
@@ -1537,6 +1671,9 @@ void hub_client_process(bot_state_t *state) {
           state->hub_connect_time = time(NULL);
           log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v2)!\n");
           hub_client_push_config(state);
+          /* This hub has no presence for us yet, so report unconditionally
+           * rather than waiting for the heartbeat's change check. */
+          hub_client_send_presence(state, true);
           if (state->admin_delta_pending) {
             /* After the config push (so the hub already knows v|2).  LWW
              * on the hub: only records changed here since carry a newer

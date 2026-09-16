@@ -19,6 +19,69 @@ static void status_fmt_elapsed(char *buf, size_t len, time_t since) {
            (d % 3600) / 60, d % 60);
 }
 
+/* Compact duration for the bot tree: "3d4h", "16h31m", "45s".  Two units is
+ * enough to judge an uptime at a glance and keeps the column narrow. */
+static void tree_fmt_uptime(char *buf, size_t len, time_t secs) {
+  if (secs <= 0) { snprintf(buf, len, "-"); return; }
+  long d = (long)secs / 86400, h = ((long)secs % 86400) / 3600;
+  long m = ((long)secs % 3600) / 60, s = (long)secs % 60;
+  if (d)      snprintf(buf, len, "%ldd%ldh", d, h);
+  else if (h) snprintf(buf, len, "%ldh%ldm", h, m);
+  else if (m) snprintf(buf, len, "%ldm%lds", m, s);
+  else        snprintf(buf, len, "%lds", s);
+}
+
+/* Display columns of a UTF-8 string: continuation bytes do not advance the
+ * cursor, so the box-drawing glyphs below line up with plain ASCII names.
+ * No attempt at double-width CJK -- names here are nicks and hub labels. */
+static size_t tree_width(const char *s) {
+  size_t w = 0;
+  for (; s && *s; s++)
+    if ((*s & 0xC0) != 0x80) w++;
+  return w;
+}
+
+/* A node is the last child at its level when no later row shares its depth
+ * before a shallower one appears.  The 'd' (disconnected) rows are a flat
+ * tail, not part of the tree, so they stop the scan. */
+static bool tree_is_last(const bot_state_t *state, int i) {
+  int d = state->bot_tree[i].depth;
+  for (int j = i + 1; j < state->bot_tree_count; j++) {
+    if (state->bot_tree[j].kind == 'd') break;
+    if (state->bot_tree[j].depth < d) return true;
+    if (state->bot_tree[j].depth == d) return false;
+  }
+  return true;
+}
+
+static bool tree_has_children(const bot_state_t *state, int i) {
+  int j = i + 1;
+  if (j >= state->bot_tree_count || state->bot_tree[j].kind == 'd')
+    return false;
+  return state->bot_tree[j].depth > state->bot_tree[i].depth;
+}
+
+/* Box-drawing prefix for one row.  last_at[] carries, for each open level,
+ * whether the ancestor there was the last of its siblings -- that is what
+ * decides between a continuing "|" and blank space in the gutter. */
+static void tree_prefix(char *out, size_t cap, int depth, const bool *last_at,
+                        bool is_last, bool has_kids) {
+  size_t o = 0;
+  out[0] = '\0';
+  if (depth == 0) return; /* the root carries no connector */
+  for (int a = 1; a < depth; a++) {
+    const char *seg = last_at[a] ? "  " : "\xe2\x94\x82 "; /* space or │ */
+    size_t sl = strlen(seg);
+    if (o + sl >= cap) return;
+    memcpy(out + o, seg, sl);
+    o += sl;
+  }
+  const char *corner = is_last ? "\xe2\x94\x94" : "\xe2\x94\x9c"; /* └ or ├ */
+  const char *joint = has_kids ? "\xe2\x94\xac" : "\xe2\x94\x80"; /* ┬ or ─ */
+  int n = snprintf(out + o, cap - o, "%s\xe2\x94\x80%s ", corner, joint);
+  if (n < 0 || (size_t)n >= cap - o) out[o] = '\0';
+}
+
 /* Anti-flood pause between reply lines on IRC.  A DCC chat is a direct
  * connection with no server flood limit, so its replies are not paced. */
 static void reply_pace(const bot_state_t *state, const struct timespec *d) {
@@ -52,7 +115,7 @@ static const cmd_log_rule_t LOGGABLE_CMDS[] = {
   {"match", 0},    {"-admin", 0},   {"-oper", 0},     {"+usermask", 0},
   {"-usermask", 0}, {"+server", 0}, {"-server", 0},   {"update", 0},
   {"+hub", 0},     {"-hub", 0},     {"rekey", 0},     {"help", 0},
-  {"dcc", 0},
+  {"dcc", 0},      {"servers", 0},  {"bots", 0},
   {NULL, 0}
 };
 
@@ -1736,6 +1799,261 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       hub_client_push_admin_delta(state);
       irc_printf(state, "PRIVMSG %s :Mask %s removed from %s\r\n", nick, arg2, arg1);
 
+    } else if (strcasecmp(command, "bots") == 0) {
+      /* bots [version|server|uptime] -- the mesh as this bot sees it.
+       *
+       * The tree is pushed by the hub (CMD_BOT_TREE) and cached; rendering is
+       * instant and needs no round trip, which also means a reply can still be
+       * sealed (~A2R wipes its context the moment dispatch returns, so a
+       * deferred answer could not be).  With no hub -- or before the first
+       * push -- fall back to the trusted-bot records for a flat listing. */
+      enum { COL_NONE, COL_VERSION, COL_SERVER, COL_UPTIME } col = COL_NONE;
+      const char *title = "bots";
+      if (arg1) {
+        if (strcasecmp(arg1, "version") == 0)      { col = COL_VERSION; title = "bots version"; }
+        else if (strcasecmp(arg1, "server") == 0)  { col = COL_SERVER;  title = "bots server"; }
+        else if (strcasecmp(arg1, "uptime") == 0)  { col = COL_UPTIME;  title = "bots uptime"; }
+        else {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: bots [version|server|uptime]\r\n",
+                     nick);
+          return;
+        }
+      }
+
+      struct timespec delay = {0, 100000000};
+      const bool have_tree = (state->bot_tree_ts != 0 &&
+                              state->bot_tree_count > 0);
+      irc_printf(state, "PRIVMSG %s :| ircbot %s %s\r\n", nick, BOT_VERSION,
+                 title);
+      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
+
+      const size_t name_col = 34; /* where the value column starts */
+      int shown = 0;
+
+      if (have_tree) {
+        bool last_at[10] = {false};
+        for (int i = 0; i < state->bot_tree_count &&
+                        shown < BOT_STATUS_MAX_LINES; i++) {
+          const bot_tree_row_t *r = &state->bot_tree[i];
+          if (r->kind == 'd') continue; /* the offline tail prints below */
+
+          bool is_last = tree_is_last(state, i);
+          bool has_kids = tree_has_children(state, i);
+          if (r->depth >= 0 && r->depth < (int)(sizeof(last_at) / sizeof(last_at[0])))
+            last_at[r->depth] = is_last;
+
+          char prefix[160];
+          tree_prefix(prefix, sizeof(prefix), r->depth, last_at, is_last,
+                      has_kids);
+
+          /* A hub node is labelled so it cannot be mistaken for a bot, and an
+           * unlinked peer says so rather than looking like a healthy branch. */
+          char label[TREE_NAME_MAX + 32];
+          if (r->kind == 'h')
+            snprintf(label, sizeof(label), "%s%s",
+                     r->name[0] ? r->name : "(hub)",
+                     r->online ? "" : " (unlinked)");
+          else
+            snprintf(label, sizeof(label), "%s",
+                     r->name[0] ? r->name : "(unnamed)");
+
+          char value[TREE_SERVER_MAX + 16] = "";
+          if (col == COL_VERSION) {
+            /* Hubs carry a version too (HUB_VERSION, gossiped in the roster
+             * header); an older hub that does not send one shows "-". */
+            snprintf(value, sizeof(value), "%s",
+                     r->version[0] ? r->version : "-");
+          } else if (col == COL_SERVER) {
+            /* Hubs have no IRC server at all -- say so explicitly. */
+            snprintf(value, sizeof(value), "%s",
+                     r->kind == 'h' ? "(hub)"
+                                    : (r->server[0] ? r->server : "-"));
+          } else if (col == COL_UPTIME) {
+            char up[32];
+            tree_fmt_uptime(up, sizeof(up), r->uptime);
+            snprintf(value, sizeof(value), "%s", up);
+          }
+
+          if (value[0]) {
+            size_t w = tree_width(prefix) + tree_width(label);
+            char pad[40];
+            size_t padlen = (w < name_col) ? (name_col - w) : 1;
+            if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
+            memset(pad, ' ', padlen);
+            pad[padlen] = '\0';
+            irc_printf(state, "PRIVMSG %s :| %s%s%s%s\r\n", nick, prefix,
+                       label, pad, value);
+          } else {
+            irc_printf(state, "PRIVMSG %s :| %s%s\r\n", nick, prefix, label);
+          }
+          shown++;
+          reply_pace(state, &delay);
+        }
+      } else {
+        /* Ad-hoc: no hub, so no topology -- one branch, this bot at the root
+         * and every trusted bot hanging off it.  Only our own row can carry a
+         * version or server; nothing reports the others to us. */
+        char self_val[TREE_SERVER_MAX + 16] = "";
+        if (col == COL_VERSION) snprintf(self_val, sizeof(self_val), "%s", BOT_VERSION);
+        else if (col == COL_SERVER)
+          snprintf(self_val, sizeof(self_val), "%.*s",
+                   (int)sizeof(self_val) - 1,
+                   (state->status & S_CONNECTED) && state->actual_server_name[0]
+                       ? state->actual_server_name : "-");
+        else if (col == COL_UPTIME)
+          tree_fmt_uptime(self_val, sizeof(self_val),
+                          time(NULL) - state->bot_start_time);
+
+        char selfname[MAX_NICK + 16];
+        snprintf(selfname, sizeof(selfname), "%s", state->current_nick[0]
+                     ? state->current_nick : "me");
+        if (self_val[0]) {
+          size_t w = tree_width(selfname);
+          char pad[40];
+          size_t padlen = (w < name_col) ? (name_col - w) : 1;
+          if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
+          memset(pad, ' ', padlen);
+          pad[padlen] = '\0';
+          irc_printf(state, "PRIVMSG %s :| %s%s%s\r\n", nick, selfname, pad,
+                     self_val);
+        } else {
+          irc_printf(state, "PRIVMSG %s :| %s\r\n", nick, selfname);
+        }
+        shown++;
+
+        int total = state->trusted_bot_count;
+        for (int i = 0; i < total && shown < BOT_STATUS_MAX_LINES; i++) {
+          char bnick[MAX_NICK];
+          auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
+          char prefix[160];
+          bool is_last = (i == total - 1);
+          tree_prefix(prefix, sizeof(prefix), 1, NULL, is_last, false);
+          if (col == COL_NONE) {
+            irc_printf(state, "PRIVMSG %s :| %s%s\r\n", nick, prefix,
+                       bnick[0] ? bnick : "(unnamed)");
+          } else {
+            size_t w = tree_width(prefix) + tree_width(bnick);
+            char pad[40];
+            size_t padlen = (w < name_col) ? (name_col - w) : 1;
+            if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
+            memset(pad, ' ', padlen);
+            pad[padlen] = '\0';
+            irc_printf(state, "PRIVMSG %s :| %s%s%s-\r\n", nick, prefix,
+                       bnick[0] ? bnick : "(unnamed)", pad);
+          }
+          shown++;
+          reply_pace(state, &delay);
+        }
+        if (total == 0)
+          irc_printf(state, "PRIVMSG %s :| (no other bots known)\r\n", nick);
+      }
+
+      /* Disconnected bots, one message, newest last-seen first is not worth
+       * a sort here -- the hub emits them in config order. */
+      if (have_tree) {
+        char offline[420];
+        size_t off = 0;
+        int listed = 0, omitted = 0;
+        for (int i = 0; i < state->bot_tree_count; i++) {
+          const bot_tree_row_t *r = &state->bot_tree[i];
+          if (r->kind != 'd') continue;
+          char ts_buf[48];
+          if (r->uptime <= 0) {
+            snprintf(ts_buf, sizeof(ts_buf), "never");
+          } else {
+            time_t ls = r->uptime;
+            struct tm *tm = gmtime(&ls);
+            if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M UTC", tm);
+            else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
+          }
+          int w = snprintf(offline + off, sizeof(offline) - off, "%s%s (%s)",
+                           off ? ", " : "",
+                           r->name[0] ? r->name : "(unnamed)", ts_buf);
+          if (w < 0 || (size_t)w >= sizeof(offline) - off) { omitted++; continue; }
+          off += (size_t)w;
+          listed++;
+        }
+        if (listed || omitted) {
+          if (omitted)
+            irc_printf(state, "PRIVMSG %s :| Disconnected: %s (+%d more)\r\n",
+                       nick, offline, omitted);
+          else
+            irc_printf(state, "PRIVMSG %s :| Disconnected: %s\r\n", nick,
+                       offline);
+        }
+      }
+
+      if (have_tree) {
+        time_t age = time(NULL) - state->bot_tree_ts;
+        if (age > BOT_TREE_STALE_AFTER) {
+          char ago[64];
+          tree_fmt_uptime(ago, sizeof(ago), age);
+          irc_printf(state,
+                     "PRIVMSG %s :| (hub last refreshed this %s ago)\r\n",
+                     nick, ago);
+        }
+      } else if (state->hub_count > 0) {
+        irc_printf(state,
+                   "PRIVMSG %s :| (no hub tree yet -- showing trusted bots "
+                   "only)\r\n", nick);
+      }
+      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
+
+    } else if (strcasecmp(command, "servers") == 0) {
+      /* Every configured IRC server and its port.  A slot with no ':' uses
+       * the bot's default port, so say so rather than printing a blank. */
+      struct timespec delay = {0, 100000000};
+      int host_w = 8;
+      for (int i = 0; i < state->server_count; i++) {
+        const char *s = state->server_list[i];
+        if (!s) continue;
+        const char *colon = strrchr(s, ':');
+        int hl = colon ? (int)(colon - s) : (int)strlen(s);
+        if (hl > host_w) host_w = hl;
+      }
+      irc_printf(state, "PRIVMSG %s :| ircbot %s servers\r\n", nick,
+                 BOT_VERSION);
+      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
+      int shown = 0;
+      for (int i = 0; i < state->server_count && shown < BOT_STATUS_MAX_LINES;
+           i++) {
+        const char *s = state->server_list[i];
+        if (!s) continue;
+        char host[256];
+        const char *port = "default";
+        const char *colon = strrchr(s, ':');
+        if (colon && colon[1]) {
+          size_t hl = (size_t)(colon - s);
+          if (hl >= sizeof(host)) hl = sizeof(host) - 1;
+          memcpy(host, s, hl);
+          host[hl] = '\0';
+          port = colon + 1;
+        } else {
+          snprintf(host, sizeof(host), "%s", s);
+        }
+        /* Mark the link we are actually on, not merely the one selected: a
+         * held slot can stay current while the bot is between servers. */
+        const char *marker = (i == state->current_server_index)
+                                 ? ((state->status & S_CONNECTED) ? "*" : ">")
+                                 : " ";
+        char held[64];
+        irc_server_block_desc(state, i, held, sizeof(held));
+        char note[96] = "";
+        if (held[0]) snprintf(note, sizeof(note), "  [%s]", held);
+        irc_printf(state, "PRIVMSG %s :| %s %-*s  port %-7s%s\r\n", nick,
+                   marker, host_w, host, port, note);
+        shown++;
+        reply_pace(state, &delay);
+      }
+      if (shown == 0)
+        irc_printf(state, "PRIVMSG %s :| (no servers configured)\r\n", nick);
+      else
+        irc_printf(state,
+                   "PRIVMSG %s :| '*' connected, '>' selected, [..] on hold\r\n",
+                   nick);
+      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
+
     } else if (strcasecmp(command, "+server") == 0) {
       if (!arg1) {
         irc_printf(state,
@@ -2008,12 +2326,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s : | \r\n", nick);
         if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers, match, dcc\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)\r\n", nick);
         } else {
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, join, part, status, givenick, chnick\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +server, -server, admins, opers, match, dcc\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +bot, -bot, +hub, -hub, rekey\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   saveconf, setlog, getlog, update, help\r\n", nick);
@@ -2066,6 +2384,24 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: -server <irc.network.net:6667> - "
                      "Removes a server from the bot's server list. Specify "
                      "server as it is listed in 'status' command.\r\n",
+                     nick);
+        } else if (strcasecmp(arg1, "servers") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: servers - List every configured IRC "
+                     "server and its port. '*' marks the one we are on, '>' "
+                     "the one selected, and [..] a ban or throttle hold.\r\n",
+                     nick);
+        } else if (strcasecmp(arg1, "bots") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: bots [version|server|uptime] - Draw "
+                     "the bot tree: this bot's hub at the root, peer hubs "
+                     "beneath it, each hub's bots under it.\r\n", nick);
+          irc_printf(state,
+                     "PRIVMSG %s :  'version' adds each bot's version, "
+                     "'server' its IRC server (hubs have none), 'uptime' how "
+                     "long each bot and hub has been up. Bots that are known "
+                     "but offline are listed last with their last-seen time. "
+                     "With no hub, all trusted bots list on one branch.\r\n",
                      nick);
         } else if (strcasecmp(arg1, "admins") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: admins - List all admins.\r\n", nick);

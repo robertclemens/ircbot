@@ -449,13 +449,33 @@ static int a2r_seal_reply(bot_state_t *state, const char *line, int len) {
   return ret;
 }
 
+/* True when a finished IRC line's command is PING or PONG -- the keepalive
+ * chatter HIDEPINGPONG keeps out of the RAW log.  Handles both directions:
+ * our own "PING :<token>" and a server's prefixed ":irc.example.net PONG ...".
+ * A CTCP PING rides inside PRIVMSG, so it is never matched here. */
+static bool irc_line_is_keepalive(const char *line) {
+  if (!line) return false;
+  while (*line == ' ') line++;
+  if (*line == ':') { /* skip a ":prefix " source */
+    while (*line && *line != ' ') line++;
+    while (*line == ' ') line++;
+  }
+  if (strncasecmp(line, "PING", 4) != 0 && strncasecmp(line, "PONG", 4) != 0)
+    return false;
+  /* Exact verb only, so a command merely starting with those letters stays
+   * logged. */
+  return line[4] == ' ' || line[4] == ':' || line[4] == '\r' ||
+         line[4] == '\0';
+}
+
 /* One finished line to the server -- or down a DCC chat, for a reply to a
  * command that came from one (dcc_divert_reply), even while the IRC link is
  * down. */
 static int irc_send_line(bot_state_t *state, const char *buffer, int len) {
   if (dcc_divert_reply(state, buffer, len)) return len;
   if (!(state->status & S_CONNECTED)) return -1;
-  log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
+  if (!HIDEPINGPONG || !irc_line_is_keepalive(buffer))
+    log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
   if (state->is_ssl) {
     int sent = SSL_write(state->ssl, buffer, len);
     if (sent <= 0) {
@@ -702,7 +722,8 @@ void irc_handle_read(bot_state_t *state) {
 
   while ((line_end = strstr(line_start, "\r\n")) != NULL) {
     *line_end = '\0';
-    log_message(L_RAW, state, "[RAW_RECV] %s\n", line_start);
+    if (!HIDEPINGPONG || !irc_line_is_keepalive(line_start))
+      log_message(L_RAW, state, "[RAW_RECV] %s\n", line_start);
     parser_handle_line(state, line_start);
     line_start = line_end + 2;
   }

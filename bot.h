@@ -184,6 +184,11 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define MAX_LOG_LINES                                                          \
   20 // Max number of lines to cap getlog request to help prevent flooding
 #define BOT_STATUS_MAX_LINES 30 // Max trusted-bot lines in status output (anti-flood)
+/* Keepalive traffic (IRC PING/PONG and the hub's CMD_PING) is pure noise in
+ * the RAW log: at one exchange every 30-60s it buries the lines that matter.
+ * true  = never log it; false = log it like any other line.  Only the logging
+ * is suppressed -- the keepalives themselves still run. */
+#define HIDEPINGPONG true
 #define MAX_IRC_CHANNELS 10     // Realistic per-bot IRC channel ceiling (server CHANLIMIT)
 #define OP_REQUEST_MIN_INTERVAL 5 // Minimum seconds between any OP-REQ sent by this bot
 #define MAX_CONFIG_SIZE                                                        \
@@ -264,6 +269,15 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 // Bot-to-Bot Relay Commands (via Hub)
 #define CMD_BOT_RELAY 0x50  // Bot -> Hub: relay encrypted bot command to target bot by UUID
 #define CMD_BOT_MSG   0x51  // Hub -> Bot: relayed encrypted bot command payload
+
+/* ---- Bot presence (the 'bots' tree) -- mirrors irchub/hub.h ---------------
+ * Volatile by design: version / IRC server / uptime never enter the config on
+ * either side.  We report ours with CMD_BOT_PRESENCE; the hub gossips its own
+ * bots to its peers and pushes the assembled tree back with CMD_BOT_TREE.  The
+ * cache below is display-only and is never consulted for trust -- the b|
+ * trusted-bot records remain the sole authority for that. */
+#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started
+#define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows
 
 extern volatile bool g_shutdown_flag;
 
@@ -387,6 +401,33 @@ struct chan_t {
   int op_request_retry_count;
   chan_t *next;
 };
+
+/* One row of the bot tree the hub pushed us (CMD_BOT_TREE).  Rows arrive in
+ * DFS pre-order and carry their depth, which is all the renderer needs: a node
+ * is the last child at its level when no later row shares its depth before a
+ * shallower one appears.  Purely for display -- nothing here grants trust. */
+#define MAX_BOT_TREE_ROWS  256
+#define TREE_VERSION_MAX   15
+#define TREE_SERVER_MAX    63
+#define TREE_NAME_MAX      64   /* hub friendly name; a nick is far shorter */
+/* A tree older than this is shown with a staleness note: the hub refreshes
+ * every BOT_TREE_REFRESH (300s) even when nothing changed, so silence past
+ * twice that means the hub link, not a quiet network. */
+#define BOT_TREE_STALE_AFTER 660
+/* How often we re-report presence when nothing changed, so a hub that
+ * restarted relearns us without waiting on the bot to do something. */
+#define BOT_PRESENCE_REPORT_INTERVAL 120
+
+typedef struct {
+  char   kind;                        /* 'h' hub, 'b' bot, 'd' disconnected */
+  int    depth;
+  char   name[TREE_NAME_MAX];         /* hub name, or the bot's nick        */
+  char   uuid[64];
+  char   version[TREE_VERSION_MAX + 1];
+  char   server[TREE_SERVER_MAX + 1];
+  time_t uptime;                      /* seconds; last-seen epoch when 'd'  */
+  bool   online;
+} bot_tree_row_t;
 
 /* One configured hub: its "host:port" address plus the hub's pinned
  * long-term Ed25519 public key (32 raw bytes). Per-hub pinning replaced the
@@ -576,6 +617,17 @@ struct bot_state {
   time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
   time_t last_op_request_sent;  // Global rate-limit: last OP-REQ sent across all channels
   time_t hub_connect_time;      // When current hub connection was authenticated
+
+  /* Bot tree pushed by the hub (CMD_BOT_TREE), for the 'bots' command.
+   * Volatile and display-only: never written to the config, never consulted
+   * for trust.  bot_tree_ts is 0 until the first push arrives. */
+  bot_tree_row_t bot_tree[MAX_BOT_TREE_ROWS];
+  int    bot_tree_count;
+  time_t bot_tree_ts;
+  /* Last presence we reported, so a reconnect or server change re-reports and
+   * an idle bot does not spam the hub with identical frames. */
+  char   presence_server[TREE_SERVER_MAX + 1];
+  time_t last_presence_sent;
 };
 
 // ... [Function Prototypes same as before] ...
@@ -748,6 +800,10 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
 void hub_client_push_channel(bot_state_t *state, chan_t *chan);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
+/* Report version / IRC server / start time to the hub for the 'bots' tree.
+ * force re-sends even when nothing changed (used right after authenticating,
+ * when the hub has no presence for us at all). */
+void hub_client_send_presence(bot_state_t *state, bool force);
 void hub_client_disconnect(bot_state_t *state);
 void hub_client_on_connect(bot_state_t *state);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
