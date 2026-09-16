@@ -2012,6 +2012,18 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         int hl = colon ? (int)(colon - s) : (int)strlen(s);
         if (hl > host_w) host_w = hl;
       }
+      /* The live link is irc_server_idx.  current_server_index is the rotation
+       * cursor, which irc_connect advances PAST the slot it just dialled, so
+       * using it here marks the next candidate instead of the server we are
+       * actually on.  When down, that cursor is exactly what we want: the slot
+       * the next attempt starts from (wrapped the way irc_pick_server wraps). */
+      const bool srv_up = (state->status & S_CONNECTED) != 0;
+      int connected_idx = srv_up ? state->irc_server_idx : -1;
+      int next_idx = -1;
+      if (connected_idx < 0) {
+        next_idx = state->current_server_index;
+        if (next_idx < 0 || next_idx >= state->server_count) next_idx = 0;
+      }
       irc_printf(state, "PRIVMSG %s :| ircbot %s servers\r\n", nick,
                  BOT_VERSION);
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
@@ -2032,11 +2044,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         } else {
           snprintf(host, sizeof(host), "%s", s);
         }
-        /* Mark the link we are actually on, not merely the one selected: a
-         * held slot can stay current while the bot is between servers. */
-        const char *marker = (i == state->current_server_index)
-                                 ? ((state->status & S_CONNECTED) ? "*" : ">")
-                                 : " ";
+        const char *marker = (i == connected_idx) ? "*"
+                             : (i == next_idx)    ? ">"
+                                                  : " ";
         char held[64];
         irc_server_block_desc(state, i, held, sizeof(held));
         char note[96] = "";
@@ -2048,10 +2058,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (shown == 0)
         irc_printf(state, "PRIVMSG %s :| (no servers configured)\r\n", nick);
+      else if (connected_idx >= 0)
+        irc_printf(state, "PRIVMSG %s :| '*' connected, [..] on hold\r\n", nick);
       else
         irc_printf(state,
-                   "PRIVMSG %s :| '*' connected, '>' selected, [..] on hold\r\n",
-                   nick);
+                   "PRIVMSG %s :| not connected; '>' tried next, [..] on "
+                   "hold\r\n", nick);
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "+server") == 0) {
