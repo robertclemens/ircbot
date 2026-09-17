@@ -974,7 +974,12 @@ int main(int argc, char *argv[]) {
 #ifdef HAVE_CURL
   curl_global_cleanup();
 #endif
-  close(state.pid_fd);
+  /* Unlink while the flock is still held, then release it: the locked pid
+   * file is what marks this bot as running, so a replacement that starts in
+   * this window is refused rather than having its own pid file unlinked by
+   * the copy on its way out (which would hide it from process control and
+   * let a third copy start on the same identity).  Same order as irchub. */
   remove(PID_FILE);
+  close(state.pid_fd);
   return 0;
 }

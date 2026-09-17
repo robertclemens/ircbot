@@ -840,6 +840,29 @@ static inline time_t lww_next_ts(time_t prev) {
   return now > prev ? now : prev + 1;
 }
 
+/* LWW acceptance for a replicated add/del record: a strictly newer stamp wins,
+ * and on an exact tie a delete beats an add.  lww_next_ts only separates
+ * writes made on ONE node; two nodes stamping the same second tie, and with a
+ * plain "newer wins" each keeps its own copy and refuses the other's forever
+ * (a parted channel staying joined on some bots).  Delete-over-add is
+ * deterministic, so every node converges.  Mirrors irchub hub.h
+ * hub_lww_accepts -- the rule must match on both. */
+static inline bool lww_accepts(time_t in_ts, bool in_active, time_t cur_ts,
+                               bool cur_active) {
+  return in_ts > cur_ts || (in_ts == cur_ts && cur_active && !in_active);
+}
+
+/* LWW acceptance for the network opt flags pushed by the hub.  Newer stamp
+ * wins; on a tie the byte-wise greater flag string wins (a set beats a clear).
+ * ">=" used to let whichever push arrived last win, so bots on different hubs
+ * settled on different flags for the same stamp.  Mirrors irchub hub.h
+ * hub_opt_accepts. */
+static inline bool opt_accepts(time_t in_ts, const char *in_flags,
+                               time_t cur_ts, const char *cur_flags) {
+  return in_ts > cur_ts ||
+         (in_ts == cur_ts && strcmp(in_flags, cur_flags) > 0);
+}
+
 static inline bool is_valid_bot_nick(const char *nick) {
   return nick && strlen(nick) > 0 && strlen(nick) < MAX_NICK &&
          strchr(nick, '|') == NULL;

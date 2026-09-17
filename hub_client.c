@@ -780,6 +780,61 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
   }
 }
 
+/* PURGE|<cutoff>: drop tombstones (unmanaged channels, inactive user and
+ * mask records) stamped before cutoff; 0 drops them all.  The hub sends it as
+ * its own CMD_CONFIG_DATA frame after the purged full config.  Channel
+ * tombstones are merged, not replaced, by a config push, so only this line
+ * removes them.  Returns the number of entries dropped (saved when > 0). */
+static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
+  char *end = NULL;
+  errno = 0;
+  long long cutoff_val = strtoll(arg, &end, 10);
+  if (errno || end == arg || *end != '\0' || cutoff_val < 0) {
+    log_message(L_INFO, state, "[HUB] Rejected malformed PURGE line\n");
+    return 0;
+  }
+  time_t cutoff = (time_t)cutoff_val;
+  int purged = 0;
+
+  chan_t *c = state->chanlist;
+  while (c) {
+    chan_t *next = c->next;
+    if (!c->is_managed && (cutoff == 0 || c->timestamp < cutoff)) {
+      channel_remove(state, c->name);
+      purged++;
+    }
+    c = next;
+  }
+
+  for (int i = 0; i < state->user_record_count; i++) {
+    if (!state->user_records[i].is_active &&
+        (cutoff == 0 || state->user_records[i].timestamp < cutoff)) {
+      memmove(&state->user_records[i], &state->user_records[i + 1],
+              (state->user_record_count - i - 1) * sizeof(user_record_t));
+      state->user_record_count--;
+      purged++;
+      i--;
+    }
+  }
+
+  for (int i = 0; i < state->mask_record_count; i++) {
+    if (!state->mask_records[i].is_active &&
+        (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
+      memmove(&state->mask_records[i], &state->mask_records[i + 1],
+              (state->mask_record_count - i - 1) * sizeof(mask_record_t));
+      state->mask_record_count--;
+      purged++;
+      i--;
+    }
+  }
+
+  if (purged > 0) {
+    log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
+    config_write_with_state_pass(state);
+  }
+  return purged;
+}
+
 void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
 
@@ -794,10 +849,11 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
    * combined with the updates>0 save-gate below, would diverge RAM from disk).
    * When such lines ARE present the "replace to drop stale UUIDs" semantics
    * still hold, because parsing rebuilds the whole set. */
-  bool has_user_lines = false, has_mask_lines = false;
+  bool has_user_lines = false, has_mask_lines = false, has_trust_set = false;
   for (const char *p = payload; p && *p; ) {
     if ((p[0] == 'a' || p[0] == 'o') && p[1] == '|') has_user_lines = true;
     else if (p[0] == 'm' && p[1] == '|') has_mask_lines = true;
+    else if (p[0] == 'T' && p[1] == '|') has_trust_set = true;
     const char *nl = strchr(p, '\n');
     if (!nl) break;
     p = nl + 1;
@@ -817,12 +873,28 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   static char work_buf[MAX_CONFIG_PAYLOAD];
   snprintf(work_buf, sizeof(work_buf), "%s", payload);
 
+  /* UUIDs named by this payload's b| lines.  With a T| marker the hub is
+   * saying "this is the whole trusted set", and every other trusted bot is
+   * dropped after the parse (a deleted or purged bot must lose ~B2 and op
+   * trust).  Static like work_buf: single-threaded, non-reentrant. */
+  static char listed_uuids[MAX_TRUSTED_BOTS][37];
+  int listed_count = 0;
+
   char *saveptr;
   char *line = strtok_r(work_buf, "\n", &saveptr);
   int updates = 0;
 
   while (line) {
     if (strlen(line) < 2 || line[0] == '#') {
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
+    /* PURGE|<cutoff> is the one line whose type is a word, not a letter:
+     * it has to be taken before the "X|" shape check below, which used to
+     * drop it (bots never applied a hub purge). */
+    if (strncmp(line, "PURGE|", 6) == 0) {
+      hub_client_apply_purge(state, line + 6);
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -892,8 +964,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             log_message(L_INFO, state, "[HUB] Added channel: %s\n", chan);
           }
         } else if (c) {
-          // Compare timestamps
-          if (ts > c->timestamp) {
+          // Compare timestamps (a same-second del beats an add: lww_accepts)
+          if (lww_accepts((time_t)ts, is_add, c->timestamp, c->is_managed)) {
             // Hub has newer data
             if (key[0]) {
               size_t len = strlen(key);
@@ -925,7 +997,7 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
               }
             }
           } else {
-            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%lld <= local_ts=%ld\n",
+            log_message(L_DEBUG, state, "[HUB-SYNC] Rejected channel %s: hub_ts=%lld local_ts=%ld (not newer)\n",
                         chan, ts, (long)c->timestamp);
           }
         } else if (!c && !is_add) {
@@ -964,7 +1036,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
             snprintf(found_m->uuid,sizeof(found_m->uuid),"%s",uuid);
             snprintf(found_m->mask,sizeof(found_m->mask),"%s",mask_s);
           }
-          if (found_m && ts > found_m->timestamp) {
+          if (found_m && lww_accepts((time_t)ts, is_active, found_m->timestamp,
+                                     found_m->is_active)) {
             found_m->is_active = is_active;
             if (last_used > found_m->last_used) found_m->last_used = last_used;
             found_m->timestamp = ts;
@@ -995,7 +1068,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
         memset(found_u, 0, sizeof(*found_u));
         memcpy(found_u->uuid, ul.uuid, sizeof(found_u->uuid));
       }
-      if (found_u && ul.timestamp > found_u->timestamp) {
+      if (found_u && lww_accepts(ul.timestamp, ul.is_active,
+                                 found_u->timestamp, found_u->is_active)) {
         memcpy(found_u->name, ul.name, sizeof(found_u->name));
         /* The hub is authoritative for the key too: a record that arrives
          * keyless leaves the user keyless (cannot authenticate). */
@@ -1023,15 +1097,18 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
                     ? (sscanf(data + 1, "%lld", &ts) == 1)
                     : (sscanf(data, "%32[^|]|%lld", flags, &ts) >= 1);
       if (ok) {
-        if (ts >= state->opt_flags_ts) {
-          int w = 0;
-          for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
-            char c = flags[i];
-            if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
-                (c >= '0' && c <= '9'))
-              state->opt_flags[w++] = c;
-          }
-          state->opt_flags[w] = '\0';
+        char clean[MAX_OPT_FLAGS + 1];
+        int w = 0;
+        for (int i = 0; flags[i] && w < MAX_OPT_FLAGS; i++) {
+          char c = flags[i];
+          if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z') ||
+              (c >= '0' && c <= '9'))
+            clean[w++] = c;
+        }
+        clean[w] = '\0';
+        if (opt_accepts((time_t)ts, clean, state->opt_flags_ts,
+                        state->opt_flags)) {
+          memcpy(state->opt_flags, clean, (size_t)w + 1);
           state->opt_flags_ts = (ts > 0) ? (time_t)ts : time(NULL);
           log_message(L_INFO, state, "[HUB-SYNC] opt flags updated -> '%s'\n",
                       state->opt_flags);
@@ -1054,6 +1131,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
                     "[HUB] Rejected malformed/oversized trusted-bot line\n");
         break;
       }
+      if (in.uuid[0] && listed_count < MAX_TRUSTED_BOTS)
+        memcpy(listed_uuids[listed_count++], in.uuid, sizeof(listed_uuids[0]));
 
       // Find existing entry: prefer UUID match (handles nick/host changes),
       // fall back to hostmask match.  Also sweep out any duplicate entries
@@ -1109,56 +1188,8 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
-    case 'P': // PURGE command — format: PURGE|<cutoff_epoch>
-    {
-      // cutoff == 0: purge all tombstones
-      // cutoff  > 0: purge tombstones older than cutoff
-      long long cutoff_val;
-      if (sscanf(data, "URGE|%lld", &cutoff_val) == 1) {
-        time_t cutoff = (time_t)cutoff_val;
-        int purged = 0;
-
-        // Purge tombstoned channels (is_managed=false)
-        chan_t *c = state->chanlist;
-        while (c) {
-          chan_t *next = c->next;
-          if (!c->is_managed && (cutoff == 0 || c->timestamp < cutoff)) {
-            channel_remove(state, c->name);
-            purged++;
-          }
-          c = next;
-        }
-
-        // Purge tombstoned user records (admins/opers)
-        for (int i = 0; i < state->user_record_count; i++) {
-          if (!state->user_records[i].is_active &&
-              (cutoff == 0 || state->user_records[i].timestamp < cutoff)) {
-            memmove(&state->user_records[i], &state->user_records[i+1],
-                    (state->user_record_count - i - 1) * sizeof(user_record_t));
-            state->user_record_count--;
-            purged++;
-            i--;
-          }
-        }
-
-        // Purge tombstoned usermask records
-        for (int i = 0; i < state->mask_record_count; i++) {
-          if (!state->mask_records[i].is_active &&
-              (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
-            memmove(&state->mask_records[i], &state->mask_records[i+1],
-                    (state->mask_record_count - i - 1) * sizeof(mask_record_t));
-            state->mask_record_count--;
-            purged++;
-            i--;
-          }
-        }
-
-        if (purged > 0) {
-          log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
-          config_write_with_state_pass(state);
-        }
-      }
-    } break;
+    case 'T': // T|<count>: end of the hub's complete trusted-bot list (swept below)
+      break;
 
     default:
       log_message(L_DEBUG, state, "[HUB-SYNC] Unrecognized line type '%c': %s\n", type, line);
@@ -1166,6 +1197,28 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
     }
 
     line = strtok_r(NULL, "\n", &saveptr);
+  }
+
+  if (has_trust_set) {
+    for (int i = 0; i < state->trusted_bot_count;) {
+      const trusted_bot_t *tb = &state->trusted_bots[i];
+      bool listed = false;
+      for (int j = 0; j < listed_count && !listed; j++)
+        listed = tb->uuid[0] && strcmp(listed_uuids[j], tb->uuid) == 0;
+      if (listed) {
+        i++;
+        continue;
+      }
+      log_message(L_INFO, state,
+                  "[HUB] Revoked trusted bot: %s (%s) - no longer registered "
+                  "on the hub\n", tb->mask, tb->uuid[0] ? tb->uuid : "no uuid");
+      memmove(&state->trusted_bots[i], &state->trusted_bots[i + 1],
+              (size_t)(state->trusted_bot_count - i - 1) * sizeof(trusted_bot_t));
+      state->trusted_bot_count--;
+      memset(&state->trusted_bots[state->trusted_bot_count], 0,
+             sizeof(trusted_bot_t));
+      updates++;
+    }
   }
 
   /* Restore locally-updated last_seen / last_used timestamps that are newer

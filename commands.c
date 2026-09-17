@@ -89,6 +89,141 @@ static void reply_pace(const bot_state_t *state, const struct timespec *d) {
     nanosleep(d, NULL);
 }
 
+/* Rows a list reply may print before it stops.  On IRC every row is paced and
+ * the dispatch blocks while it runs, so lists stop at BOT_STATUS_MAX_LINES
+ * (anti-flood); a DCC chat has neither problem, so it gets everything. */
+static int reply_row_cap(const bot_state_t *state) {
+  return state->dcc_reply ? INT_MAX : BOT_STATUS_MAX_LINES;
+}
+
+/* The line a capped list ends with, so a cut list never passes for a whole
+ * one.  Silent: nothing was left out. */
+static void reply_rows_omitted(bot_state_t *state, const char *nick,
+                               int omitted, const char *what) {
+  if (omitted <= 0)
+    return;
+  irc_printf(state,
+             "PRIVMSG %s :| (+%d more %s not shown -- ask over 'dcc' for the "
+             "full list)\r\n",
+             nick, omitted, what);
+}
+
+/* The 'bots' table: the name cell (tree connector + label), then version,
+ * uptime and IRC server, in the order the header names them.  A column never
+ * narrows below the width the header was drawn for; a wider value widens it
+ * for every row.  Names past BOTS_NAME_COL_MAX keep the minimum gap instead of
+ * pushing the whole table right. */
+#define BOTS_NAME_COL_MIN    19
+#define BOTS_NAME_COL_MAX    48
+#define BOTS_VERSION_COL_MIN 12
+#define BOTS_UPTIME_COL_MIN  13
+#define BOTS_COL_GAP         2
+
+typedef struct {
+  char name[160 + TREE_NAME_MAX + 32]; /* tree_prefix() output + label */
+  char version[TREE_VERSION_MAX + 1];
+  char uptime[32];
+  char server[TREE_SERVER_MAX + 1];
+} bots_row_t;
+
+/* Row i of the hub-pushed tree.  last_at[] carries the ancestors' last-child
+ * flags from row to row, exactly as tree_prefix() needs them. */
+static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
+                          size_t last_cap, bots_row_t *c) {
+  const bot_tree_row_t *r = &state->bot_tree[i];
+  bool is_last = tree_is_last(state, i);
+  if (r->depth >= 0 && (size_t)r->depth < last_cap)
+    last_at[r->depth] = is_last;
+
+  char prefix[160];
+  tree_prefix(prefix, sizeof(prefix), r->depth, last_at, is_last,
+              tree_has_children(state, i));
+
+  /* A hub node is labelled so it cannot be mistaken for a bot, and an
+   * unlinked peer says so rather than looking like a healthy branch. */
+  char label[TREE_NAME_MAX + 32];
+  if (r->kind == 'h')
+    snprintf(label, sizeof(label), "%s%s", r->name[0] ? r->name : "(hub)",
+             r->online ? "" : " (unlinked)");
+  else
+    snprintf(label, sizeof(label), "%s", r->name[0] ? r->name : "(unnamed)");
+  snprintf(c->name, sizeof(c->name), "%s%s", prefix, label);
+
+  /* Hubs carry a version too (HUB_VERSION, gossiped in the roster header);
+   * an older hub that does not send one shows "-".  Hubs have no IRC server
+   * at all, so that column says so explicitly. */
+  snprintf(c->version, sizeof(c->version), "%s",
+           r->version[0] ? r->version : "-");
+  /* The hub stamps uptimes when it pushes (every BOT_TREE_REFRESH), so a
+   * live node has been up that much longer by now; an unlinked hub has no
+   * uptime at all. */
+  time_t age = time(NULL) - state->bot_tree_ts;
+  tree_fmt_uptime(c->uptime, sizeof(c->uptime),
+                  (r->kind == 'h' && !r->online)
+                      ? 0 : r->uptime + (age > 0 ? age : 0));
+  snprintf(c->server, sizeof(c->server), "%s",
+           r->kind == 'h' ? "(hub)" : (r->server[0] ? r->server : "-"));
+}
+
+/* Ad-hoc (no hub tree): this bot at the root.  Only our own row can carry a
+ * version, uptime or server; nothing reports the trusted bots' to us. */
+static void bots_self_row(const bot_state_t *state, bots_row_t *c) {
+  snprintf(c->name, sizeof(c->name), "%s",
+           state->current_nick[0] ? state->current_nick : "me");
+  snprintf(c->version, sizeof(c->version), "%s", BOT_VERSION);
+  tree_fmt_uptime(c->uptime, sizeof(c->uptime),
+                  time(NULL) - state->bot_start_time);
+  snprintf(c->server, sizeof(c->server), "%.*s", (int)sizeof(c->server) - 1,
+           (state->status & S_CONNECTED) && state->actual_server_name[0]
+               ? state->actual_server_name : "-");
+}
+
+static void bots_trusted_row(const bot_state_t *state, int i, bots_row_t *c) {
+  char bnick[MAX_NICK];
+  auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
+  char prefix[160];
+  tree_prefix(prefix, sizeof(prefix), 1, NULL,
+              i == state->trusted_bot_count - 1, false);
+  snprintf(c->name, sizeof(c->name), "%s%s", prefix,
+           bnick[0] ? bnick : "(unnamed)");
+  snprintf(c->version, sizeof(c->version), "-");
+  snprintf(c->uptime, sizeof(c->uptime), "-");
+  snprintf(c->server, sizeof(c->server), "-");
+}
+
+static void bots_widen(const bots_row_t *c, size_t *name_col, size_t *ver_col,
+                       size_t *up_col) {
+  size_t w = tree_width(c->name) + BOTS_COL_GAP;
+  if (w > BOTS_NAME_COL_MAX) w = BOTS_NAME_COL_MAX;
+  if (w > *name_col) *name_col = w;
+  w = tree_width(c->version) + BOTS_COL_GAP;
+  if (w > *ver_col) *ver_col = w;
+  w = tree_width(c->uptime) + BOTS_COL_GAP;
+  if (w > *up_col) *up_col = w;
+}
+
+/* Spaces that take a cell of display width w out to col, never fewer than
+ * BOTS_COL_GAP so adjacent cells cannot run together. */
+static void bots_pad(char *out, size_t cap, size_t col, size_t w) {
+  size_t n = (w + BOTS_COL_GAP <= col) ? col - w : BOTS_COL_GAP;
+  if (n >= cap) n = cap - 1;
+  memset(out, ' ', n);
+  out[n] = '\0';
+}
+
+static void bots_emit(bot_state_t *state, const char *nick,
+                      const bots_row_t *c, size_t name_col, size_t ver_col,
+                      size_t up_col) {
+  char p1[BOTS_NAME_COL_MAX + 1];
+  char p2[sizeof(c->version) + BOTS_COL_GAP + 1];
+  char p3[sizeof(c->uptime) + BOTS_COL_GAP + 1];
+  bots_pad(p1, sizeof(p1), name_col, tree_width(c->name));
+  bots_pad(p2, sizeof(p2), ver_col, tree_width(c->version));
+  bots_pad(p3, sizeof(p3), up_col, tree_width(c->uptime));
+  irc_printf(state, "PRIVMSG %s :| %s%s%s%s%s%s%s\r\n", nick, c->name, p1,
+             c->version, p2, c->uptime, p3, c->server);
+}
+
 /* CMD-log redaction.  `secret` flags argument positions that carry a secret;
  * those are logged as REDACT_MASK, never as typed.  Since the passwordless
  * change no command takes one (public keys are not secret; channel keys have
@@ -1446,10 +1581,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       irc_printf(state, "PRIVMSG %s :| ircbot %s admins\r\n", nick, BOT_VERSION);
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-      int shown = 0;
-      for (int i = 0; i < state->user_record_count && shown < BOT_STATUS_MAX_LINES; i++) {
+      int shown = 0, omitted = 0;
+      const int cap = reply_row_cap(state);
+      for (int i = 0; i < state->user_record_count; i++) {
         user_record_t *u = &state->user_records[i];
         if (u->type != 'a') continue;
+        if (shown >= cap) { omitted++; continue; }
         char ts_buf[48];
         if (u->last_seen == 0) {
           snprintf(ts_buf, sizeof(ts_buf), "never");
@@ -1469,6 +1606,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (shown == 0)
         irc_printf(state, "PRIVMSG %s :| (no admins)\r\n", nick);
+      reply_rows_omitted(state, nick, omitted, "admins");
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "opers") == 0) {
@@ -1481,10 +1619,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       irc_printf(state, "PRIVMSG %s :| ircbot %s opers\r\n", nick, BOT_VERSION);
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-      int shown = 0;
-      for (int i = 0; i < state->user_record_count && shown < BOT_STATUS_MAX_LINES; i++) {
+      int shown = 0, omitted = 0;
+      const int cap = reply_row_cap(state);
+      for (int i = 0; i < state->user_record_count; i++) {
         user_record_t *u = &state->user_records[i];
         if (u->type != 'o') continue;
+        if (shown >= cap) { omitted++; continue; }
         char ts_buf[48];
         if (u->last_seen == 0) {
           snprintf(ts_buf, sizeof(ts_buf), "never");
@@ -1504,6 +1644,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (shown == 0)
         irc_printf(state, "PRIVMSG %s :| (no opers)\r\n", nick);
+      reply_rows_omitted(state, nick, omitted, "opers");
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "match") == 0) {
@@ -1517,11 +1658,22 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                  match_all ? " *" : "");
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
       struct timespec delay = {0, 100000000};
-      int shown = 0;
+      /* shown counts printed rows (a user line and each of its masks); once
+       * the cap is reached the rest are only counted, for the closing note. */
+      int shown = 0, omitted = 0;
+      const int cap = reply_row_cap(state);
       for (int i = 0; i < state->user_record_count; i++) {
         user_record_t *u = &state->user_records[i];
         if (!match_all && strcasecmp(u->name, arg1) != 0) continue;
         if (!u->is_active) continue;
+        if (shown >= cap) {
+          omitted++;
+          for (int j = 0; j < state->mask_record_count; j++)
+            if (state->mask_records[j].is_active &&
+                strcmp(state->mask_records[j].uuid, u->uuid) == 0)
+              omitted++;
+          continue;
+        }
         char ts_buf[48];
         if (u->last_seen == 0) {
           snprintf(ts_buf, sizeof(ts_buf), "never");
@@ -1535,10 +1687,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :| [%c] %-20s  key %s  (last seen: %s)\r\n",
                    nick, u->type, u->name, kfp, ts_buf);
         reply_pace(state, &delay);
+        shown++;
         for (int j = 0; j < state->mask_record_count; j++) {
           mask_record_t *m = &state->mask_records[j];
           if (strcmp(m->uuid, u->uuid) != 0) continue;
           if (!m->is_active) continue;
+          if (shown >= cap) { omitted++; continue; }
           char used_buf[48];
           if (m->last_used == 0) {
             snprintf(used_buf, sizeof(used_buf), "never");
@@ -1550,7 +1704,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
                      nick, m->mask, used_buf);
           reply_pace(state, &delay);
-          if (++shown >= BOT_STATUS_MAX_LINES) goto match_done;
+          shown++;
         }
       }
       /* If no user record found and not wildcard, check trusted bots */
@@ -1596,7 +1750,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (shown == 0 && !match_all)
         irc_printf(state, "PRIVMSG %s :| unknown user: %s\r\n", nick, arg1);
-      match_done:
+      reply_rows_omitted(state, nick, omitted, "records");
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "+admin") == 0 ||
@@ -1800,154 +1954,78 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :Mask %s removed from %s\r\n", nick, arg2, arg1);
 
     } else if (strcasecmp(command, "bots") == 0) {
-      /* bots [version|server|uptime] -- the mesh as this bot sees it.
+      /* bots -- the mesh as this bot sees it: one table, each node's version,
+       * uptime and IRC server beside its place in the tree.
        *
        * The tree is pushed by the hub (CMD_BOT_TREE) and cached; rendering is
        * instant and needs no round trip, which also means a reply can still be
        * sealed (~A2R wipes its context the moment dispatch returns, so a
        * deferred answer could not be).  With no hub -- or before the first
        * push -- fall back to the trusted-bot records for a flat listing. */
-      enum { COL_NONE, COL_VERSION, COL_SERVER, COL_UPTIME } col = COL_NONE;
-      const char *title = "bots";
       if (arg1) {
-        if (strcasecmp(arg1, "version") == 0)      { col = COL_VERSION; title = "bots version"; }
-        else if (strcasecmp(arg1, "server") == 0)  { col = COL_SERVER;  title = "bots server"; }
-        else if (strcasecmp(arg1, "uptime") == 0)  { col = COL_UPTIME;  title = "bots uptime"; }
-        else {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: bots [version|server|uptime]\r\n",
-                     nick);
-          return;
-        }
+        irc_printf(state, "PRIVMSG %s :Syntax: bots\r\n", nick);
+        return;
       }
 
       struct timespec delay = {0, 100000000};
       const bool have_tree = (state->bot_tree_ts != 0 &&
                               state->bot_tree_count > 0);
-      irc_printf(state, "PRIVMSG %s :| ircbot %s %s\r\n", nick, BOT_VERSION,
-                 title);
+      irc_printf(state,
+                 "PRIVMSG %s :| ircbot %s bots  [ version,  uptime,  irc "
+                 "server ]\r\n", nick, BOT_VERSION);
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
 
-      const size_t name_col = 34; /* where the value column starts */
-      int shown = 0;
-
-      if (have_tree) {
+      /* Two passes over the same rows: the first sizes the columns, the
+       * second prints.  The hub tree is printed whole -- it is bounded by
+       * MAX_BOT_TREE_ROWS, and a mesh cut at BOT_STATUS_MAX_LINES looked
+       * complete while whole hubs were missing.  The trusted-bot fallback
+       * keeps the list cap and says what it left out. */
+      size_t name_col = BOTS_NAME_COL_MIN, ver_col = BOTS_VERSION_COL_MIN;
+      size_t up_col = BOTS_UPTIME_COL_MIN;
+      const int cap = reply_row_cap(state);
+      int rows_omitted = 0;
+      for (int pass = 0; pass < 2; pass++) {
         bool last_at[10] = {false};
-        for (int i = 0; i < state->bot_tree_count &&
-                        shown < BOT_STATUS_MAX_LINES; i++) {
-          const bot_tree_row_t *r = &state->bot_tree[i];
-          if (r->kind == 'd') continue; /* the offline tail prints below */
-
-          bool is_last = tree_is_last(state, i);
-          bool has_kids = tree_has_children(state, i);
-          if (r->depth >= 0 && r->depth < (int)(sizeof(last_at) / sizeof(last_at[0])))
-            last_at[r->depth] = is_last;
-
-          char prefix[160];
-          tree_prefix(prefix, sizeof(prefix), r->depth, last_at, is_last,
-                      has_kids);
-
-          /* A hub node is labelled so it cannot be mistaken for a bot, and an
-           * unlinked peer says so rather than looking like a healthy branch. */
-          char label[TREE_NAME_MAX + 32];
-          if (r->kind == 'h')
-            snprintf(label, sizeof(label), "%s%s",
-                     r->name[0] ? r->name : "(hub)",
-                     r->online ? "" : " (unlinked)");
-          else
-            snprintf(label, sizeof(label), "%s",
-                     r->name[0] ? r->name : "(unnamed)");
-
-          char value[TREE_SERVER_MAX + 16] = "";
-          if (col == COL_VERSION) {
-            /* Hubs carry a version too (HUB_VERSION, gossiped in the roster
-             * header); an older hub that does not send one shows "-". */
-            snprintf(value, sizeof(value), "%s",
-                     r->version[0] ? r->version : "-");
-          } else if (col == COL_SERVER) {
-            /* Hubs have no IRC server at all -- say so explicitly. */
-            snprintf(value, sizeof(value), "%s",
-                     r->kind == 'h' ? "(hub)"
-                                    : (r->server[0] ? r->server : "-"));
-          } else if (col == COL_UPTIME) {
-            char up[32];
-            tree_fmt_uptime(up, sizeof(up), r->uptime);
-            snprintf(value, sizeof(value), "%s", up);
+        int shown = 0;
+        bots_row_t row;
+        if (have_tree) {
+          for (int i = 0; i < state->bot_tree_count; i++) {
+            if (state->bot_tree[i].kind == 'd') continue; /* offline: below */
+            bots_tree_row(state, i, last_at,
+                          sizeof(last_at) / sizeof(last_at[0]), &row);
+            if (pass == 0) {
+              bots_widen(&row, &name_col, &ver_col, &up_col);
+            } else {
+              bots_emit(state, nick, &row, name_col, ver_col, up_col);
+              reply_pace(state, &delay);
+            }
+            shown++;
           }
-
-          if (value[0]) {
-            size_t w = tree_width(prefix) + tree_width(label);
-            char pad[40];
-            size_t padlen = (w < name_col) ? (name_col - w) : 1;
-            if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
-            memset(pad, ' ', padlen);
-            pad[padlen] = '\0';
-            irc_printf(state, "PRIVMSG %s :| %s%s%s%s\r\n", nick, prefix,
-                       label, pad, value);
-          } else {
-            irc_printf(state, "PRIVMSG %s :| %s%s\r\n", nick, prefix, label);
-          }
-          shown++;
-          reply_pace(state, &delay);
+          continue;
         }
-      } else {
-        /* Ad-hoc: no hub, so no topology -- one branch, this bot at the root
-         * and every trusted bot hanging off it.  Only our own row can carry a
-         * version or server; nothing reports the others to us. */
-        char self_val[TREE_SERVER_MAX + 16] = "";
-        if (col == COL_VERSION) snprintf(self_val, sizeof(self_val), "%s", BOT_VERSION);
-        else if (col == COL_SERVER)
-          snprintf(self_val, sizeof(self_val), "%.*s",
-                   (int)sizeof(self_val) - 1,
-                   (state->status & S_CONNECTED) && state->actual_server_name[0]
-                       ? state->actual_server_name : "-");
-        else if (col == COL_UPTIME)
-          tree_fmt_uptime(self_val, sizeof(self_val),
-                          time(NULL) - state->bot_start_time);
 
-        char selfname[MAX_NICK + 16];
-        snprintf(selfname, sizeof(selfname), "%s", state->current_nick[0]
-                     ? state->current_nick : "me");
-        if (self_val[0]) {
-          size_t w = tree_width(selfname);
-          char pad[40];
-          size_t padlen = (w < name_col) ? (name_col - w) : 1;
-          if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
-          memset(pad, ' ', padlen);
-          pad[padlen] = '\0';
-          irc_printf(state, "PRIVMSG %s :| %s%s%s\r\n", nick, selfname, pad,
-                     self_val);
-        } else {
-          irc_printf(state, "PRIVMSG %s :| %s\r\n", nick, selfname);
-        }
+        bots_self_row(state, &row);
+        if (pass == 0) bots_widen(&row, &name_col, &ver_col, &up_col);
+        else bots_emit(state, nick, &row, name_col, ver_col, up_col);
         shown++;
-
-        int total = state->trusted_bot_count;
-        for (int i = 0; i < total && shown < BOT_STATUS_MAX_LINES; i++) {
-          char bnick[MAX_NICK];
-          auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
-          char prefix[160];
-          bool is_last = (i == total - 1);
-          tree_prefix(prefix, sizeof(prefix), 1, NULL, is_last, false);
-          if (col == COL_NONE) {
-            irc_printf(state, "PRIVMSG %s :| %s%s\r\n", nick, prefix,
-                       bnick[0] ? bnick : "(unnamed)");
+        for (int i = 0; i < state->trusted_bot_count; i++) {
+          if (shown >= cap) {
+            if (pass == 1) rows_omitted++;
+            continue;
+          }
+          bots_trusted_row(state, i, &row);
+          if (pass == 0) {
+            bots_widen(&row, &name_col, &ver_col, &up_col);
           } else {
-            size_t w = tree_width(prefix) + tree_width(bnick);
-            char pad[40];
-            size_t padlen = (w < name_col) ? (name_col - w) : 1;
-            if (padlen >= sizeof(pad)) padlen = sizeof(pad) - 1;
-            memset(pad, ' ', padlen);
-            pad[padlen] = '\0';
-            irc_printf(state, "PRIVMSG %s :| %s%s%s-\r\n", nick, prefix,
-                       bnick[0] ? bnick : "(unnamed)", pad);
+            bots_emit(state, nick, &row, name_col, ver_col, up_col);
+            reply_pace(state, &delay);
           }
           shown++;
-          reply_pace(state, &delay);
         }
-        if (total == 0)
+        if (pass == 1 && state->trusted_bot_count == 0)
           irc_printf(state, "PRIVMSG %s :| (no other bots known)\r\n", nick);
       }
+      reply_rows_omitted(state, nick, rows_omitted, "bots");
 
       /* Disconnected bots, one message, newest last-seen first is not worth
        * a sort here -- the hub emits them in config order. */
@@ -2105,6 +2183,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         config_write_with_state_pass(state);
         irc_printf(state,
                    "PRIVMSG %s :Removed server '%s' and saved config.\r\n",
+                   nick, arg1);
+      } else {
+        irc_printf(state, "PRIVMSG %s :Error: Server '%s' not found.\r\n",
                    nick, arg1);
       }
     } else if (strcasecmp(command, "update") == 0) {
@@ -2405,14 +2486,13 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      nick);
         } else if (strcasecmp(arg1, "bots") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: bots [version|server|uptime] - Draw "
-                     "the bot tree: this bot's hub at the root, peer hubs "
-                     "beneath it, each hub's bots under it.\r\n", nick);
+                     "PRIVMSG %s :Syntax: bots - Draw the bot tree: this bot's "
+                     "hub at the root, peer hubs beneath it, each hub's bots "
+                     "under it.\r\n", nick);
           irc_printf(state,
-                     "PRIVMSG %s :  'version' adds each bot's version, "
-                     "'server' its IRC server (hubs have none), 'uptime' how "
-                     "long each bot and hub has been up. Bots that are known "
-                     "but offline are listed last with their last-seen time. "
+                     "PRIVMSG %s :  Every row shows version, uptime and IRC "
+                     "server (hubs show '(hub)'). Bots that are known but "
+                     "offline are listed last with their last-seen time. "
                      "With no hub, all trusted bots list on one branch.\r\n",
                      nick);
         } else if (strcasecmp(arg1, "admins") == 0) {
