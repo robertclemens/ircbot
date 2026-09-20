@@ -159,6 +159,28 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
             irc_printf(state, "INVITE %s %s\r\n", bot_arg2, bot_arg1);
           }
         }
+      } else if (bot_command && bot_arg1 &&
+                 strcasecmp(bot_command, "UNBAN") == 0) {
+        /* Hubless counterpart of CMD_CHAN_ACTION unban.  The mask matched
+         * against the ban list is the sender's own b| record -- never
+         * anything the sender put in the message -- so this cannot be used
+         * to lift a ban on a third party. */
+        chan_access_service(state, "", CHAN_REQ_UNBAN, bot_arg1, sender->uuid,
+                            NULL, sender->mask, NULL);
+      } else if (bot_command && bot_arg1 &&
+                 strcasecmp(bot_command, "KEY") == 0) {
+        if (sender_nick)
+          chan_access_service(state, "", CHAN_REQ_KEY, bot_arg1, sender->uuid,
+                              NULL, NULL, sender_nick);
+        else
+          log_message(L_DEBUG, state,
+                      "[DEBUG] [BOT-COMM] KEY over hub relay has no reply "
+                      "nick; the hub path answers these\n");
+      } else if (bot_command && bot_arg1 &&
+                 strcasecmp(bot_command, "KEYIS") == 0) {
+        char *bot_arg2 = strtok_r(NULL, " ", &sp);
+        if (bot_arg2)
+          chan_access_accept_key(state, bot_arg1, bot_arg2);
       }
     }
   }

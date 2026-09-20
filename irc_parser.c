@@ -344,14 +344,53 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * disconnect alongside any 465/463. */
     irc_note_refusal(state, irc_trailing(params), false);
   } else if (strcmp(command, "474") == 0) {
+    /* ERR_BANNEDFROMCHAN: ask the mesh to lift the ban that matches us.  The
+     * hub supplies our hostmask, and the servicing bot removes only the ban
+     * masks that actually match it. */
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (chan_name) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_OUT;
+        if (c->is_managed) {
+          log_message(L_INFO, state,
+                      "[474] Banned from %s, requesting unban\n", chan_name);
+          chan_access_request(state, c, CHAN_REQ_UNBAN);
+        }
       }
     }
+  } else if (strcmp(command, "475") == 0) {
+    /* ERR_BADCHANNELKEY: our stored key is stale.  Only a bot sitting in the
+     * channel has the current one -- the hub's c| copy went stale with ours. */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name) {
+      chan_t *c = channel_find(state, chan_name);
+      if (c) {
+        c->status = C_OUT;
+        if (c->is_managed) {
+          log_message(L_INFO, state,
+                      "[475] Bad key for %s, requesting current key\n",
+                      chan_name);
+          chan_access_request(state, c, CHAN_REQ_KEY);
+        }
+      }
+    }
+  } else if (strcmp(command, "367") == 0) {
+    /* RPL_BANLIST: "<me> <channel> <mask> [setter ts]" -- only of interest
+     * while we are walking a list on another bot's behalf. */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    char *ban_mask = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name && ban_mask)
+      chan_unban_note_ban(state, chan_name, ban_mask);
+  } else if (strcmp(command, "368") == 0) {
+    /* RPL_ENDOFBANLIST: closes the walk. */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name)
+      chan_unban_finish(state, chan_name);
   } else if (strcmp(command, "405") == 0) {
     /* ERR_TOOMANYCHANNELS: server channel limit reached; stop retrying this channel */
     strtok_r(params, " ", &saveptr_irc);
@@ -375,17 +414,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
         log_message(L_INFO, state,
                     "[473] Channel %s is invite-only, requesting invite\n",
                     chan_name);
-        if (!hub_client_send_invite_request(state, state->current_nick,
-                                            chan_name)) {
-          for (int tb = 0; tb < state->trusted_bot_count; tb++) {
-            char tb_nick[MAX_NICK];
-            auth_trusted_bot_nick(&state->trusted_bots[tb], tb_nick);
-            if (tb_nick[0])
-              bot_comms_send_command(state, tb_nick,
-                                     "INVITE %s %s",
-                                     chan_name, state->current_nick);
-          }
-        }
+        chan_access_request(state, c, CHAN_REQ_INVITE);
       }
     }
   }

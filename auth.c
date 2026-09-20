@@ -4,7 +4,9 @@
 
 #include "bot.h"
 
-static bool wildcard_match(const char *pattern, const char *text) {
+/* Shared with the channel-access code, which matches a requester's hostmask
+ * against the ban masks a 367 walk returns.  Case-insensitive, '*' and '?'. */
+bool auth_wildcard_match(const char *pattern, const char *text) {
   const char *p = pattern;
   const char *t = text;
   const char *last_wildcard = NULL;
@@ -44,7 +46,7 @@ int auth_user_candidates(bot_state_t *state, const char *user_host,
   for (int i = 0; i < state->mask_record_count && n < max; i++) {
     mask_record_t *mr = &state->mask_records[i];
     if (!mr->is_active || mr->mask[0] == '\0') continue;
-    if (!wildcard_match(mr->mask, user_host)) continue;
+    if (!auth_wildcard_match(mr->mask, user_host)) continue;
     for (int j = 0; j < state->user_record_count; j++) {
       user_record_t *ur = &state->user_records[j];
       if (!ur->is_active || !ur->has_pubkey) continue;
@@ -104,7 +106,7 @@ trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
     char norm_hostmask[MAX_MASK_LEN];
     strip_ident_tilde(state->trusted_bots[i].mask, norm_hostmask,
                       sizeof(norm_hostmask));
-    if (wildcard_match(norm_hostmask, norm_user_host))
+    if (auth_wildcard_match(norm_hostmask, norm_user_host))
       return &state->trusted_bots[i];
   }
   return NULL;

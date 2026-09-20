@@ -279,6 +279,51 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started
 #define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows
 
+/* ---- Channel-access requests (unban / invite / key) ----------------------
+ * A bot locked out of a managed channel -- 474 banned, 473 invite-only, 475
+ * bad key -- asks the mesh to let it back in.  Hub-side the request routes
+ * exactly like CMD_OP_REQUEST: the hub stamps a request id, broadcasts the
+ * action to its own bots, forwards it to its peers under the same id (dropped
+ * on the second sighting), and routes any reply back down the fd the request
+ * arrived on.  With no hub reachable the bot falls back to a sealed ~B2
+ * PRIVMSG to one trusted bot at a time -- see bot_comms.c.
+ *
+ * The requester never supplies its own hostmask or nick: the hub fills both in
+ * from the authenticated bot's own `h` and `n` records, so a bot cannot ask
+ * for an unban of a mask that is not its own, nor have a third party invited.
+ * Only `key` produces a reply.  Mirrors irchub/hub.h. */
+#define CMD_CHAN_REQUEST 0x59 // Bot -> Hub: kind|channel
+#define CMD_CHAN_ACTION  0x5A // Hub -> Bot: id|kind|chan|uuid|nick|hostmask
+#define CMD_CHAN_REPLY   0x5B // Bot <-> Hub: id|kind|chan|status|data
+
+/* Wire tokens for the `kind` field, and the bot-side index that tracks one
+ * in-flight request per kind per channel. */
+#define CHAN_REQ_TOK_UNBAN  "unban"
+#define CHAN_REQ_TOK_INVITE "invite"
+#define CHAN_REQ_TOK_KEY    "key"
+
+typedef enum {
+  CHAN_REQ_UNBAN = 0,
+  CHAN_REQ_INVITE,
+  CHAN_REQ_KEY,
+  CHAN_REQ_KIND_COUNT
+} chan_req_kind_t;
+
+#define CHAN_REQUEST_MIN_INTERVAL 5  // Seconds between any two requests we send
+#define CHAN_REQUEST_RETRY_TIME  60  // Before re-asking for the same chan+kind
+#define CHAN_REQUEST_MAX_RETRIES  5  // Then back off until CHAN_REQUEST_COOLOFF
+#define CHAN_REQUEST_COOLOFF    300  // Idle time that clears the retry count
+/* How long after asking we will still adopt a key someone sends us.  Mirrors
+ * the hub's CHAN_REQUEST_TIMEOUT, which reaps the pending slot at the same
+ * age, so a reply the hub would no longer route is one we no longer accept. */
+#define CHAN_REPLY_ACCEPT_WINDOW 45
+
+/* Servicing an unban means asking the server for the ban list and matching it
+ * ourselves, so a job outlives the request frame until 368 closes the list. */
+#define MAX_UNBAN_JOBS        8
+#define UNBAN_JOB_TTL        30  // Give up on a ban list that never arrives
+#define UNBAN_MAX_REMOVALS    6  // Per job -- never blanket-clear a ban list
+
 extern volatile bool g_shutdown_flag;
 
 // Enums
@@ -399,8 +444,24 @@ struct chan_t {
   bool op_request_pending;
   time_t last_op_request_time;
   int op_request_retry_count;
+  /* Channel-access chasing, one slot per chan_req_kind_t: a channel we are
+   * both banned from and that is +i is chased on both counts independently. */
+  time_t last_access_request[CHAN_REQ_KIND_COUNT];
+  int access_retry_count[CHAN_REQ_KIND_COUNT];
   chan_t *next;
 };
+
+/* An unban we are servicing for another bot: raised when its CMD_CHAN_ACTION
+ * (or ~B2 UNBAN) arrives, closed by 368 or by UNBAN_JOB_TTL.  The mask is the
+ * requester's, as the hub resolved it; 367 entries are matched against it and
+ * only matching bans come off. */
+typedef struct {
+  char channel[MAX_CHAN];
+  char hostmask[MAX_MASK_LEN];
+  time_t started;
+  int removed;
+  bool active;
+} unban_job_t;
 
 /* One row of the bot tree the hub pushed us (CMD_BOT_TREE).  Rows arrive in
  * DFS pre-order and carry their depth, which is all the renderer needs: a node
@@ -616,6 +677,11 @@ struct bot_state {
   time_t last_hub_ping_time;    // Last time we sent a PING to the hub
   time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
   time_t last_op_request_sent;  // Global rate-limit: last OP-REQ sent across all channels
+  time_t last_chan_request_sent; // Global rate-limit: last channel-access request
+  int chan_req_fallback_idx;    // Round-robin cursor over trusted bots for the
+                                // hubless ~B2 fallback: one bot per attempt,
+                                // never a broadcast to the whole roster
+  unban_job_t unban_jobs[MAX_UNBAN_JOBS]; // Ban lists we are currently walking
   time_t hub_connect_time;      // When current hub connection was authenticated
 
   /* Bot tree pushed by the hub (CMD_BOT_TREE), for the 'bots' command.
@@ -647,6 +713,9 @@ trusted_bot_t *auth_trusted_bot_by_uuid(bot_state_t *state, const char *uuid);
 trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick);
 /* Nick part of a trusted bot's mask (up to '!'), bounded to MAX_NICK. */
 void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]);
+/* Case-insensitive IRC-style glob ('*', '?').  Used for usermasks and for
+ * matching a requester's hostmask against channel ban masks. */
+bool auth_wildcard_match(const char *pattern, const char *text);
 /* a|/o| and b| record codec shared by config.c and hub_client.c. */
 bool config_parse_user_line(const char *data, user_line_t *out);
 int config_format_user_line(const user_record_t *u, char *buf, size_t len);
@@ -810,6 +879,37 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
                                     const char *channel);
+/* Ask the mesh to let us into `chan`: CMD_CHAN_REQUEST when a hub is up,
+ * otherwise a sealed ~B2 to one trusted bot.  Rate-limited per chan+kind and
+ * globally; returns true when a request actually left the bot. */
+bool chan_access_request(bot_state_t *state, chan_t *chan,
+                         chan_req_kind_t kind);
+/* Service a request another bot made of us.  `hostmask` and `nick` are the
+ * requester's as the hub resolved them; both may be empty for kinds that do
+ * not need them.  Replies (key) go back via `reply_to`, which is NULL for the
+ * hub path and the requester's nick for the ~B2 fallback. */
+void chan_access_service(bot_state_t *state, const char *request_id,
+                         chan_req_kind_t kind, const char *channel,
+                         const char *req_uuid, const char *nick,
+                         const char *hostmask, const char *reply_to);
+/* Ban-list plumbing for an unban we are servicing (367 entry / 368 end). */
+void chan_unban_note_ban(bot_state_t *state, const char *channel,
+                         const char *ban_mask);
+void chan_unban_finish(bot_state_t *state, const char *channel);
+void chan_unban_expire(bot_state_t *state);
+/* Wire token <-> kind.  Returns CHAN_REQ_KIND_COUNT for an unknown token. */
+chan_req_kind_t chan_req_kind_from_token(const char *tok);
+const char *chan_req_kind_token(chan_req_kind_t kind);
+/* Adopt a key another bot sent us, then re-try the join immediately. */
+void chan_access_accept_key(bot_state_t *state, const char *channel,
+                            const char *key);
+/* Frame a channel-access request / reply to the hub.  False when no hub link
+ * is usable, which is the caller's cue to fall back to ~B2. */
+bool hub_client_send_chan_request(bot_state_t *state, const char *kind,
+                                  const char *channel);
+bool hub_client_send_chan_reply(bot_state_t *state, const char *request_id,
+                                const char *kind, const char *channel,
+                                const char *status, const char *data);
 bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
                                   const char *frame_line);
 /* Split the mlock'd identity key into its halves (caller wipes). */

@@ -378,7 +378,7 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
 
   state->bot_tree_count = count;
   state->bot_tree_ts = time(NULL);
-  log_message(L_DEBUG, state, "[HUB] Bot tree updated (%d rows)\n", count);
+ /* This logs excessively without much use; commented out for now. log_message(L_DEBUG, state, "[HUB] Bot tree updated (%d rows)\n", count); */
 }
 
 /* Push a single key=value change to the hub via CMD_BOT_DELTA.
@@ -608,6 +608,46 @@ bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
     hub_client_disconnect(state);
   }
   return false;
+}
+
+/* Ask the mesh to let us into a channel.  Only `kind|channel` goes on the
+ * wire: the hub resolves our nick and hostmask from its own records, so this
+ * frame cannot be used to ask for someone else's mask to be unbanned. */
+bool hub_client_send_chan_request(bot_state_t *state, const char *kind,
+                                  const char *channel) {
+  if (!state->hub_connected || !state->hub_authenticated ||
+      state->hub_fd == -1)
+    return false;
+
+  char payload[MAX_CHAN + 16];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s", kind, channel);
+  if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
+    return false;
+  if (!hub_send_frame(state, CMD_CHAN_REQUEST, payload, pay_len))
+    return false;
+
+  log_message(L_INFO, state, "[CHANREQ] Sent %s request for %s to hub\n", kind,
+              channel);
+  return true;
+}
+
+/* Answer one -- today only a `key`.  `data` carries the key, so the buffer is
+ * wiped before returning rather than being left on the stack. */
+bool hub_client_send_chan_reply(bot_state_t *state, const char *request_id,
+                                const char *kind, const char *channel,
+                                const char *status, const char *data) {
+  if (!state->hub_connected || !state->hub_authenticated ||
+      state->hub_fd == -1)
+    return false;
+
+  char payload[MAX_CHAN + MAX_KEY + 96];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s", request_id,
+                         kind, channel, status, data ? data : "");
+  bool ok = false;
+  if (pay_len > 0 && pay_len < (int)sizeof(payload))
+    ok = hub_send_frame(state, CMD_CHAN_REPLY, payload, pay_len);
+  secure_wipe(payload, sizeof(payload));
+  return ok;
 }
 
 // Alias for promoting local config to hub (e.g. on connect)
@@ -1363,6 +1403,55 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
             irc_printf(state, "INVITE %s %s\r\n", inv_nick, inv_chan);
           }
         }
+      }
+    }
+    break;
+
+  case CMD_CHAN_ACTION:
+    /* id|kind|channel|requester_uuid|nick|hostmask — another bot is locked
+     * out of a channel and the hub is asking whoever can help.  Every field
+     * past the kind was filled in by the hub from its own records. */
+    if (payload && payload_len > 0) {
+      char a_id[64], a_kind[16], a_chan[MAX_CHAN], a_uuid[64];
+      char a_nick[MAX_NICK] = "", a_mask[MAX_MASK_LEN] = "";
+      int n = sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%63[^|]|%9[^|]|%255[^|]",
+                     a_id, a_kind, a_chan, a_uuid, a_nick, a_mask);
+      if (n >= 4) {
+        chan_req_kind_t k = chan_req_kind_from_token(a_kind);
+        if (k < CHAN_REQ_KIND_COUNT)
+          chan_access_service(state, a_id, k, a_chan, a_uuid, a_nick, a_mask,
+                              NULL);
+        else
+          log_message(L_DEBUG, state,
+                      "[DEBUG] [CHANREQ] Unknown action kind '%s'\n", a_kind);
+      } else {
+        log_message(L_INFO, state, "[CHANREQ] Malformed CHAN_ACTION\n");
+      }
+    }
+    break;
+
+  case CMD_CHAN_REPLY:
+    /* id|kind|channel|status|data — the answer to something we asked for. */
+    if (payload && payload_len > 0) {
+      char r_id[64], r_kind[16], r_chan[MAX_CHAN], r_status[16];
+      if (sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%15[^|]", r_id, r_kind,
+                 r_chan, r_status) == 4) {
+        /* The data field is whatever follows the 4th '|', never re-split: a
+         * channel key may legitimately contain one. */
+        const char *data = "";
+        int bars = 0;
+        for (const char *p = payload; *p; p++)
+          if (*p == '|' && ++bars == 4) {
+            data = p + 1;
+            break;
+          }
+        if (chan_req_kind_from_token(r_kind) == CHAN_REQ_KEY &&
+            strcmp(r_status, "ok") == 0)
+          chan_access_accept_key(state, r_chan, data);
+        else
+          log_message(L_DEBUG, state,
+                      "[DEBUG] [CHANREQ] Reply %s for %s: %s\n", r_kind, r_chan,
+                      r_status);
       }
     }
     break;
