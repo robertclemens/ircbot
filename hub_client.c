@@ -310,6 +310,238 @@ void hub_client_send_presence(bot_state_t *state, bool force) {
   }
 }
 
+/* ---- Network upgrade (hub-orchestrated rolling upgrade) ------------------
+ * The bot is a follower here.  It answers CMD_UPGRADE_PREPARE with what it is
+ * and whether it could take the target build, touches nothing until
+ * CMD_UPGRADE_COMMIT names the same upgrade, and restores the retained build
+ * on CMD_UPGRADE_ABORT.  None of this is reachable from IRC or DCC: the
+ * frames only arrive on the authenticated hub link, which is the whole point
+ * of the standalone-only gate on the 'update' command. */
+
+/* Copy src into a '|'-free, control-byte-free field.  Reasons carry text that
+ * originated in a manifest, and the wire format splits on '|'. */
+static void upgrade_field(char *dst, size_t dst_size, const char *src) {
+  if (!dst || dst_size == 0) return;
+  size_t o = 0;
+  for (const char *p = src ? src : ""; *p && o + 1 < dst_size; p++) {
+    unsigned char c = (unsigned char)*p;
+    if (c == '|') c = '/';
+    if (c < 0x20 || c == 0x7f) c = ' ';
+    dst[o++] = (char)c;
+  }
+  dst[o] = '\0';
+}
+
+/* id|uuid|cur_ver|variant|arch|libc|ready|reason */
+static void hub_client_send_upgrade_ready(bot_state_t *state, const char *id,
+                                          bool ready, const char *reason) {
+  char arch[32], libc[16], clean_reason[192];
+  updater_host_arch(arch, sizeof(arch));
+  updater_host_libc(libc, sizeof(libc));
+  upgrade_field(clean_reason, sizeof(clean_reason), reason);
+
+  char payload[MAX_BUFFER / 8];
+  int n = snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s|%s|%d|%s", id,
+                   state->bot_uuid, BOT_VERSION, updater_host_variant(), arch,
+                   libc, ready ? 1 : 0, clean_reason);
+  if (n <= 0 || n >= (int)sizeof(payload)) return;
+  hub_send_frame(state, CMD_UPGRADE_READY, payload, n);
+  log_message(L_INFO, state, "[UPGRADE] %s upgrade %s%s%s\n",
+              ready ? "Ready for" : "Cannot take", id,
+              clean_reason[0] ? ": " : "", clean_reason);
+}
+
+/* id|uuid|status|new_ver */
+void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
+                                    const char *status, const char *detail) {
+  char clean_detail[192];
+  upgrade_field(clean_detail, sizeof(clean_detail), detail);
+  char payload[MAX_BUFFER / 8];
+  int n = snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s", id,
+                   state->bot_uuid, status, BOT_VERSION, clean_detail);
+  if (n <= 0 || n >= (int)sizeof(payload)) return;
+  hub_send_frame(state, CMD_UPGRADE_RESULT, payload, n);
+}
+
+/* Called once per authenticated link.  If this process is the product of a
+ * hub-driven upgrade, the marker left behind by updater_hub_commit() says
+ * which run it belongs to; report whether we came up on the version that run
+ * was aiming at.  The hub also infers success from the presence frame, so a
+ * lost RESULT costs nothing. */
+void hub_client_report_upgrade_result(bot_state_t *state) {
+  char id[64], want[64];
+  if (!updater_take_pending_upgrade(id, sizeof(id), want, sizeof(want))) return;
+  bool ok = (updater_version_cmp(BOT_VERSION, want) == 0);
+  log_message(L_INFO, state, "[UPGRADE] Restarted after %s: running %s (wanted %s)\n",
+              id, BOT_VERSION, want);
+  hub_client_send_upgrade_result(state, id, ok ? "ok" : "version-mismatch",
+                                 ok ? "" : want);
+}
+
+/* id|target_ver|variant|kind|min_from|manifest_base — the hub is asking
+ * whether we could move to target_ver.  Answer only; nothing is downloaded
+ * and nothing on disk is touched until COMMIT. */
+/* ==========================================================================
+ * '|'-delimited wire fields
+ *
+ * sscanf's "%[^|]" cannot match an EMPTY field: the conversion fails there
+ * and every field after it is left untouched.  An UPGRADE_PREPARE that names
+ * neither a variant nor an artifact kind — "id|2.99.0|||*|file://…" — was
+ * therefore read as two fields, silently dropping the manifest base and
+ * sending the updater back to the compiled-in release URL.  These are the C
+ * counterpart of split('|') in ircbot.rs, so both builds read a frame the
+ * same way.
+ * ========================================================================== */
+
+/* Field `idx` of `s`, NUL-terminated into `dst`.  An over-long field is a
+ * malformed frame, not something to truncate silently: false, `dst` empty. */
+static bool wire_field(const char *s, int idx, char *dst, size_t cap) {
+  if (!dst || cap == 0) return false;
+  dst[0] = '\0';
+  if (!s) return false;
+  for (int i = 0; i < idx; i++) {
+    const char *bar = strchr(s, '|');
+    if (!bar) return false;
+    s = bar + 1;
+  }
+  const char *bar = strchr(s, '|');
+  size_t len = bar ? (size_t)(bar - s) : strcspn(s, "\r\n");
+  if (len >= cap) return false;
+  memcpy(dst, s, len);
+  dst[len] = '\0';
+  return true;
+}
+
+/* Field `idx` and everything after it, minus any trailing CR/LF: the last
+ * field of a frame is free text and may itself contain '|'.  Display text is
+ * clamped to the buffer rather than rejected. */
+static bool wire_tail(const char *s, int idx, char *dst, size_t cap) {
+  if (!dst || cap == 0) return false;
+  dst[0] = '\0';
+  if (!s) return false;
+  for (int i = 0; i < idx; i++) {
+    const char *bar = strchr(s, '|');
+    if (!bar) return false;
+    s = bar + 1;
+  }
+  size_t len = strcspn(s, "\r\n");
+  if (len >= cap) len = cap - 1;
+  memcpy(dst, s, len);
+  dst[len] = '\0';
+  return true;
+}
+
+static void hub_client_handle_upgrade_prepare(bot_state_t *state,
+                                              const char *payload) {
+  char id[64] = "", ver[64] = "", variant[8] = "", kind[8] = "";
+  char min_from[64] = "", base[512] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) ||
+      !wire_field(payload, 1, ver, sizeof(ver)) || !id[0] || !ver[0]) {
+    log_message(L_INFO, state, "[UPGRADE] Malformed UPGRADE_PREPARE\n");
+    return;
+  }
+  wire_field(payload, 2, variant, sizeof(variant));
+  wire_field(payload, 3, kind, sizeof(kind));
+  wire_field(payload, 4, min_from, sizeof(min_from));
+  /* A bounded field, not the tail: a hub's peer-facing PREPARE appends the
+   * hubs' own target and base after it, and those are not the bot's. */
+  wire_field(payload, 5, base, sizeof(base));
+
+  const char *reason = "";
+  bool ready = true;
+  if (updater_version_cmp(ver, BOT_VERSION) == 0) {
+    ready = false;
+    reason = "already running the target version";
+  } else if (updater_version_cmp(ver, BOT_VERSION) < 0) {
+    ready = false;
+    reason = "target is older than the running version";
+  } else if (min_from[0] && strcmp(min_from, "*") != 0 &&
+             updater_version_cmp(BOT_VERSION, min_from) < 0) {
+    /* The hub walks the intermediate releases when it sees this. */
+    ready = false;
+    reason = "running version is below the target's min_from";
+  } else if (access(PASS_FILE, R_OK) != 0) {
+    /* Without the machine-bound password file the replacement binary would
+     * stop at a password prompt with nobody to answer it. */
+    ready = false;
+    reason = "no " PASS_FILE "; cannot restart unattended";
+  } else if (state->executable_path[0] != '/') {
+    ready = false;
+    reason = "executable path is not absolute";
+  }
+
+  if (ready) {
+    /* Remember the plan: COMMIT repeats only the id and the version. */
+    snprintf(state->upgrade_id, sizeof(state->upgrade_id), "%s", id);
+    snprintf(state->upgrade_target, sizeof(state->upgrade_target), "%s", ver);
+    snprintf(state->upgrade_variant, sizeof(state->upgrade_variant), "%s",
+             variant[0] ? variant : updater_host_variant());
+    snprintf(state->upgrade_base, sizeof(state->upgrade_base), "%s", base);
+    state->upgrade_prepared = time(NULL);
+  }
+  (void)kind; /* the artifact kind is chosen from the manifest at COMMIT */
+  hub_client_send_upgrade_ready(state, id, ready, reason);
+}
+
+/* id|target_ver|variant — go.  Only an id we acknowledged at PREPARE, and
+ * only while that acknowledgement is still fresh, may commit. */
+static void hub_client_handle_upgrade_commit(bot_state_t *state,
+                                             const char *payload) {
+  char id[64] = "", ver[64] = "", variant[8] = "";
+  if (!wire_field(payload, 0, id, sizeof(id)) ||
+      !wire_field(payload, 1, ver, sizeof(ver)) || !id[0] || !ver[0]) {
+    log_message(L_INFO, state, "[UPGRADE] Malformed UPGRADE_COMMIT\n");
+    return;
+  }
+  wire_field(payload, 2, variant, sizeof(variant));
+  if (!state->upgrade_id[0] || strcmp(state->upgrade_id, id) != 0) {
+    hub_client_send_upgrade_result(state, id, "fail",
+                                   "no matching UPGRADE_PREPARE");
+    return;
+  }
+  if (strcmp(state->upgrade_target, ver) != 0) {
+    hub_client_send_upgrade_result(state, id, "fail",
+                                   "commit version differs from prepare");
+    return;
+  }
+  if (time(NULL) - state->upgrade_prepared > UPGRADE_PREPARE_TTL) {
+    state->upgrade_id[0] = '\0';
+    hub_client_send_upgrade_result(state, id, "fail", "prepare expired");
+    return;
+  }
+
+  const char *err = NULL;
+  if (!updater_hub_commit(state, id, ver,
+                          variant[0] ? variant : state->upgrade_variant,
+                          state->upgrade_base, &err)) {
+    /* Nothing was changed on disk; stay on this build and say why. */
+    log_message(L_INFO, state, "[UPGRADE] Commit %s refused: %s\n", id,
+                err ? err : "unknown error");
+    hub_client_send_upgrade_result(state, id, "fail", err ? err : "failed");
+    state->upgrade_id[0] = '\0';
+  }
+  /* On success updater_hub_commit() does not return: the process is replaced
+   * and hub_client_report_upgrade_result() reports in after the restart. */
+}
+
+/* id|reason — put the retained build back.  By the time this arrives the new
+ * binary is usually already the running process, so undoing it is another
+ * exec; a bot that has nothing retained just says so. */
+static void hub_client_handle_upgrade_abort(bot_state_t *state,
+                                            const char *payload) {
+  char id[64] = "", reason[192] = "";
+  wire_field(payload, 0, id, sizeof(id));
+  wire_tail(payload, 1, reason, sizeof(reason));
+  log_message(L_INFO, state, "[UPGRADE] Abort %s: %s\n",
+              id[0] ? id : "(no id)", reason[0] ? reason : "no reason given");
+  state->upgrade_id[0] = '\0';
+  state->upgrade_prepared = 0;
+  if (!updater_hub_rollback(state, reason[0] ? reason : "hub aborted the upgrade"))
+    hub_client_send_upgrade_result(state, id[0] ? id : "-", "aborted",
+                                   "nothing retained to roll back to");
+  /* A successful rollback execs; the hub sees the old version reappear. */
+}
+
 /* Ingest a CMD_BOT_TREE push.  Every field is hub-supplied text that ends up
  * in an admin's IRC client, so each one is length-capped and stripped of
  * control bytes here rather than at render time.  A malformed row is skipped,
@@ -1464,6 +1696,18 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       bot_comms_process_payload(state, payload);
     }
     break;
+
+  case CMD_UPGRADE_PREPARE:
+    if (payload && payload_len > 0) hub_client_handle_upgrade_prepare(state, payload);
+    break;
+
+  case CMD_UPGRADE_COMMIT:
+    if (payload && payload_len > 0) hub_client_handle_upgrade_commit(state, payload);
+    break;
+
+  case CMD_UPGRADE_ABORT:
+    if (payload && payload_len > 0) hub_client_handle_upgrade_abort(state, payload);
+    break;
   }
 }
 
@@ -1816,6 +2060,9 @@ void hub_client_process(bot_state_t *state) {
           /* This hub has no presence for us yet, so report unconditionally
            * rather than waiting for the heartbeat's change check. */
           hub_client_send_presence(state, true);
+          /* If this process is the product of a hub-driven upgrade, close
+           * that run out now that there is a hub to tell. */
+          hub_client_report_upgrade_result(state);
           if (state->admin_delta_pending) {
             /* After the config push (so the hub already knows v|2).  LWW
              * on the hub: only records changed here since carry a newer

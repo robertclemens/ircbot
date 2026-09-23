@@ -2189,7 +2189,17 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                    nick, arg1);
       }
     } else if (strcasecmp(command, "update") == 0) {
-      if (arg1)
+      /* In-place 'update' is for standalone bots only.  A hub-configured bot is
+       * upgraded by its hub (hub_admin-initiated rolling upgrade), never via an
+       * IRC/DCC command.  The hub-driven path calls updater_perform_upgrade()
+       * directly and is NOT gated here. */
+      if (state->hub_count > 0) {
+        irc_printf(state,
+                   "PRIVMSG %s :Updates are hub-managed on this bot; run "
+                   "upgrades from hub_admin. In-place 'update' is only "
+                   "available on standalone (hub-less) bots.\r\n",
+                   nick);
+      } else if (arg1)
         updater_perform_upgrade(state, nick, arg1);
       else
         updater_check_for_updates(state, nick);

@@ -16,7 +16,13 @@
 #include <time.h>
 
 #define BOT_NAME "ircbot.c by trojanman"
-#define BOT_VERSION "2.3.0"
+/* -D-overridable so a release build can stamp its own version without
+ * editing the tree (the testnet builds a bumped-version artifact this
+ * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
+ * one every upgrade comparison is made against. */
+#ifndef BOT_VERSION
+#define BOT_VERSION "2.4.0"
+#endif
 
 // Only edit this section
 // #define DEFAULT_USER "ircbot"         // Default bot user
@@ -30,23 +36,54 @@
 // #define GECOS "ircbot"         // Gecos field storage
 #define CONFIG_FILE ".ircbot.cnf" // Config file name
 #define PID_FILE ".ircbot.pid"    // PID file name
+/* Hand-off note written just before a hub-driven upgrade execs the new
+ * binary: the restarted process has no memory of the run that replaced it,
+ * so it reads the upgrade id from here and answers CMD_UPGRADE_RESULT. */
+#define UPGRADE_MARKER_FILE ".ircbot.upgrade"
+/* Retained previous binary/config, kept (not deleted) after a hub-driven
+ * upgrade so CMD_UPGRADE_ABORT can put the node back. */
+#define UPGRADE_PREV_SUFFIX ".prev"
+/* How long a CMD_UPGRADE_PREPARE stays commitable.  A hub that stalls
+ * mid-roll has to ask again rather than commit against a stale plan. */
+#define UPGRADE_PREPARE_TTL 900
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
 #define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
 #define BOT_LOG_FILE_SIZE (10 * 1024 * 1024) // 10MB cap; LOGFILE is truncated past this
-#define BOT_UPDATE_URL                                                         \
-  "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
-  "releases.txt"
+// Signed-release channel (ircbot-releases).  All of these are -D-overridable
+// (the testnet injects a throwaway signing key), and at RUNTIME the
+// IRCBOT_UPDATE_BASE env var repoints the updater at a local ircbot-releases
+// tree (see updater_env_base() in utils.c).  Empty pubkey DISABLES updates
+// (fail-closed).
+//
+// BOT_UPDATE_BASE is the tree ROOT; one variant subdirectory below it holds
+// that build's manifest.  Keeping the root separate is what lets a hub-driven
+// upgrade flip a node between the C and Rust builds: updater_hub_commit()
+// appends the variant it was told to install, so one network-wide run can
+// leave each node on its own kind of build, or move it across.
+#ifndef BOT_UPDATE_BASE
+#define BOT_UPDATE_BASE                                                        \
+  "https://raw.githubusercontent.com/robertclemens/ircbot-releases/main/"      \
+  "ircbot"
+#endif
+// The variant THIS build is: the standalone 'update' command stays on it.
+#ifndef BOT_UPDATE_VARIANT
+#define BOT_UPDATE_VARIANT "c"
+#endif
+#ifndef BOT_UPDATE_URL
+#define BOT_UPDATE_URL BOT_UPDATE_BASE "/" BOT_UPDATE_VARIANT "/releases.txt"
+#endif
 // Detached Ed25519 signature for releases.txt (raw 64-byte sig, base64-encoded).
-#define BOT_UPDATE_SIG_URL                                                     \
-  "https://raw.githubusercontent.com/robertclemens/ircbot/main/releases/"      \
-  "releases.sig"
+#ifndef BOT_UPDATE_SIG_URL
+#define BOT_UPDATE_SIG_URL BOT_UPDATE_BASE "/" BOT_UPDATE_VARIANT "/releases.sig"
+#endif
 // Base64 of the 32-byte raw Ed25519 PUBLIC key that signs releases.txt.
 // MUST be set to enable the self-updater; an empty value DISABLES updates
-// (fail-closed).  Generate the keypair, publish releases.txt.sig, and paste the
-// 44-char base64 public key here.  Full procedure: docs/security.md ->
-// "Signed Release Process (Ed25519 detached signatures)".
+// (fail-closed).  Same key signs ircbot-releases and irchub-releases.
+// Full procedure: docs/security.md -> "Signed Release Process".
+#ifndef BOT_UPDATE_PUBKEY_B64
 #define BOT_UPDATE_PUBKEY_B64 "qkXMh/F8TC+cnKuIwrP5TJIynfrLBD+MDUwvkyh9lBU="
+#endif
 // End of edit section
 
 // You should not edit below this line. While some of the macros may be
@@ -295,6 +332,17 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_CHAN_REQUEST 0x59 // Bot -> Hub: kind|channel
 #define CMD_CHAN_ACTION  0x5A // Hub -> Bot: id|kind|chan|uuid|nick|hostmask
 #define CMD_CHAN_REPLY   0x5B // Bot <-> Hub: id|kind|chan|status|data
+
+/* ---- Network-wide upgrade coordination (hub_admin-initiated rolling upgrade).
+ * The bot answers PREPARE with READY/UNABLE, runs the updater on COMMIT (the
+ * standalone in-place 'update' gate does NOT block this hub path), rolls back
+ * to <exe>.prev on ABORT, and reports RESULT after it restarts.  Mirrors
+ * irchub/hub.h. */
+#define CMD_UPGRADE_PREPARE 0x5E // Hub -> Bot: id|ver|variant|kind|min_from|base
+#define CMD_UPGRADE_READY   0x5F // Bot -> Hub: id|uuid|cur|variant|arch|libc|ok|reason
+#define CMD_UPGRADE_COMMIT  0x60 // Hub -> Bot: id|ver|variant
+#define CMD_UPGRADE_RESULT  0x61 // Bot -> Hub: id|uuid|status|new_ver|detail
+#define CMD_UPGRADE_ABORT   0x62 // Hub -> Bot: id|reason
 
 /* Wire tokens for the `kind` field, and the bot-side index that tracks one
  * in-flight request per kind per channel. */
@@ -694,6 +742,17 @@ struct bot_state {
    * an idle bot does not spam the hub with identical frames. */
   char   presence_server[TREE_SERVER_MAX + 1];
   time_t last_presence_sent;
+  /* The hub-driven upgrade this bot has acknowledged (CMD_UPGRADE_PREPARE).
+   * COMMIT carries only the id and the version, so the release base the hub
+   * named at PREPARE time is remembered here; an id that never went through
+   * PREPARE, or one older than UPGRADE_PREPARE_TTL, is refused.  Volatile:
+   * never written to the config, and the upgrade itself hands over through
+   * UPGRADE_MARKER_FILE because exec() takes all of this with it. */
+  char   upgrade_id[64];
+  char   upgrade_target[64];
+  char   upgrade_variant[8];
+  char   upgrade_base[512];
+  time_t upgrade_prepared;
 };
 
 // ... [Function Prototypes same as before] ...
@@ -780,6 +839,25 @@ _Noreturn void handle_fatal_error(const char *message);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
                              const char *version);
+/* Hub-driven upgrade (CMD_UPGRADE_COMMIT).  Returns false with *err set and
+ * nothing touched; on success it does not return -- the process is replaced
+ * and reports the outcome after the restart. */
+bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
+                        const char *target_ver, const char *variant,
+                        const char *base, const char **err);
+/* CMD_UPGRADE_ABORT: restore <exe>.prev / <config>.prev and restart onto
+ * them.  Returns false when there is nothing retained to go back to. */
+bool updater_hub_rollback(bot_state_t *state, const char *reason);
+bool upgrade_marker_write(const char *upgrade_id, const char *target_ver);
+/* Reads and removes the hand-off marker left by updater_hub_commit(). */
+bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
+                                  size_t ver_size);
+/* Compare two version strings, tolerating a leading 'v' on either side. */
+int updater_version_cmp(const char *a, const char *b);
+/* Host capability probe answered in CMD_UPGRADE_READY. */
+void updater_host_arch(char *out, size_t out_size);
+void updater_host_libc(char *out, size_t out_size);
+const char *updater_host_variant(void);
 bool util_download_file(const char *url, const char *path);
 bool util_sha256_file(const char *path, char *output_hash_hex);
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
@@ -874,6 +952,11 @@ void hub_client_heartbeat(bot_state_t *state);
  * when the hub has no presence for us at all). */
 void hub_client_send_presence(bot_state_t *state, bool force);
 void hub_client_disconnect(bot_state_t *state);
+/* Network-upgrade reporting (CMD_UPGRADE_RESULT).  report_upgrade_result()
+ * is a no-op unless this process is a hub-driven upgrade's restart. */
+void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
+                                    const char *status, const char *detail);
+void hub_client_report_upgrade_result(bot_state_t *state);
 void hub_client_on_connect(bot_state_t *state);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
