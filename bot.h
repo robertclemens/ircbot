@@ -21,7 +21,7 @@
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.4.1"
+#define BOT_VERSION "2.4.2"
 #endif
 
 // Only edit this section

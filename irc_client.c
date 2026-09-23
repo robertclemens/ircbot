@@ -669,6 +669,7 @@ void irc_connect(bot_state_t *state) {
     state->server_fd = sockfd;
     state->status = S_CONNECTED;
     state->last_pong_time = time(NULL);
+    state->pong_pending = false;
     state->connection_time = time(NULL);
     snprintf(state->current_nick, sizeof(state->current_nick), "%s",
              state->target_nick);
