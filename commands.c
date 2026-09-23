@@ -121,10 +121,21 @@ static void reply_rows_omitted(bot_state_t *state, const char *nick,
 
 typedef struct {
   char name[160 + TREE_NAME_MAX + 32]; /* tree_prefix() output + label */
-  char version[TREE_VERSION_MAX + 1];
+  char version[TREE_VERSION_MAX + TREE_VARIANT_MAX + 4]; /* "2.4.0 (rs)" */
   char uptime[32];
   char server[TREE_SERVER_MAX + 1];
 } bots_row_t;
+
+/* The version cell: the version with the code base after it, "2.4.0 (rs)".
+ * A node whose hub did not report a code base shows the bare version. */
+static void bots_fmt_version(char *out, size_t cap, const char *version,
+                             const char *variant) {
+  const char *v = (version && version[0]) ? version : "-";
+  if (variant && variant[0])
+    snprintf(out, cap, "%s (%s)", v, variant);
+  else
+    snprintf(out, cap, "%s", v);
+}
 
 /* Row i of the hub-pushed tree.  last_at[] carries the ancestors' last-child
  * flags from row to row, exactly as tree_prefix() needs them. */
@@ -152,8 +163,7 @@ static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
   /* Hubs carry a version too (HUB_VERSION, gossiped in the roster header);
    * an older hub that does not send one shows "-".  Hubs have no IRC server
    * at all, so that column says so explicitly. */
-  snprintf(c->version, sizeof(c->version), "%s",
-           r->version[0] ? r->version : "-");
+  bots_fmt_version(c->version, sizeof(c->version), r->version, r->variant);
   /* The hub stamps uptimes when it pushes (every BOT_TREE_REFRESH), so a
    * live node has been up that much longer by now; an unlinked hub has no
    * uptime at all. */
@@ -170,7 +180,8 @@ static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
 static void bots_self_row(const bot_state_t *state, bots_row_t *c) {
   snprintf(c->name, sizeof(c->name), "%s",
            state->current_nick[0] ? state->current_nick : "me");
-  snprintf(c->version, sizeof(c->version), "%s", BOT_VERSION);
+  bots_fmt_version(c->version, sizeof(c->version), BOT_VERSION,
+                   BOT_UPDATE_VARIANT);
   tree_fmt_uptime(c->uptime, sizeof(c->uptime),
                   time(NULL) - state->bot_start_time);
   snprintf(c->server, sizeof(c->server), "%.*s", (int)sizeof(c->server) - 1,
@@ -2500,7 +2511,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "hub at the root, peer hubs beneath it, each hub's bots "
                      "under it.\r\n", nick);
           irc_printf(state,
-                     "PRIVMSG %s :  Every row shows version, uptime and IRC "
+                     "PRIVMSG %s :  Every row shows version with its code base "
+                     "(2.4.0 (c) or 2.4.0 (rs)), uptime and IRC "
                      "server (hubs show '(hub)'). Bots that are known but "
                      "offline are listed last with their last-seen time. "
                      "With no hub, all trusted bots list on one branch.\r\n",

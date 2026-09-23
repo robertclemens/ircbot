@@ -295,9 +295,12 @@ void hub_client_send_presence(bot_state_t *state, bool force) {
       now - state->last_presence_sent < BOT_PRESENCE_REPORT_INTERVAL)
     return;
 
-  char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + 64];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld",
-                         BOT_VERSION, server, (long long)state->bot_start_time);
+  /* The variant rides last: a hub that predates it reads the start time
+   * with atoll(), which stops at the '|', so older hubs are unaffected. */
+  char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + TREE_VARIANT_MAX + 64];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld|%s",
+                         BOT_VERSION, server, (long long)state->bot_start_time,
+                         BOT_UPDATE_VARIANT);
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
 
   if (hub_send_frame(state, CMD_BOT_PRESENCE, payload, pay_len)) {
@@ -560,10 +563,10 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
 
     /* Split on '|' in place: the hub strips '|' from every value it forwards,
      * so a fixed field count is unambiguous. */
-    char *f[7] = {0};
+    char *f[8] = {0};
     int n = 0;
     char *cur = line + 2;
-    while (n < 7) {
+    while (n < 8) {
       f[n++] = cur;
       char *sep = strchr(cur, '|');
       if (!sep) break;
@@ -585,6 +588,9 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
        * simply leaves the column blank. */
       if (n >= 6 && strcmp(f[5], "-") != 0)
         snprintf(row.version, sizeof(row.version), "%s", f[5]);
+      /* The code base (c / rs) came after it; same rule, blank if absent. */
+      if (n >= 7 && strcmp(f[6], "-") != 0)
+        snprintf(row.variant, sizeof(row.variant), "%s", f[6]);
     } else if (row.kind == 'b' && n >= 6) {
       row.depth = atoi(f[0]);
       snprintf(row.name, sizeof(row.name), "%s", f[1]);
@@ -594,6 +600,8 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
       if (strcmp(f[4], "-") != 0)
         snprintf(row.server, sizeof(row.server), "%s", f[4]);
       row.uptime = (time_t)atoll(f[5]);
+      if (n >= 7 && strcmp(f[6], "-") != 0)
+        snprintf(row.variant, sizeof(row.variant), "%s", f[6]);
       row.online = true;
     } else if (row.kind == 'd' && n >= 3) {
       snprintf(row.name, sizeof(row.name), "%s", f[0]);

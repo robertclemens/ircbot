@@ -21,7 +21,7 @@
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.4.0"
+#define BOT_VERSION "2.4.1"
 #endif
 
 // Only edit this section
@@ -313,7 +313,7 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  * bots to its peers and pushes the assembled tree back with CMD_BOT_TREE.  The
  * cache below is display-only and is never consulted for trust -- the b|
  * trusted-bot records remain the sole authority for that. */
-#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started
+#define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started|variant
 #define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows
 
 /* ---- Channel-access requests (unban / invite / key) ----------------------
@@ -517,6 +517,7 @@ typedef struct {
  * shallower one appears.  Purely for display -- nothing here grants trust. */
 #define MAX_BOT_TREE_ROWS  256
 #define TREE_VERSION_MAX   15
+#define TREE_VARIANT_MAX   7    /* "c" / "rs" -- the code base a node runs */
 #define TREE_SERVER_MAX    63
 #define TREE_NAME_MAX      64   /* hub friendly name; a nick is far shorter */
 /* A tree older than this is shown with a staleness note: the hub refreshes
@@ -533,6 +534,7 @@ typedef struct {
   char   name[TREE_NAME_MAX];         /* hub name, or the bot's nick        */
   char   uuid[64];
   char   version[TREE_VERSION_MAX + 1];
+  char   variant[TREE_VARIANT_MAX + 1]; /* "" when the hub did not say     */
   char   server[TREE_SERVER_MAX + 1];
   time_t uptime;                      /* seconds; last-seen epoch when 'd'  */
   bool   online;
