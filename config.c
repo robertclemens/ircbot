@@ -460,6 +460,14 @@ bool config_load(bot_state_t *state, const char *password,
         state->log_type = (log_type_t)atoi(data);
         break;
 
+      case 'L': { // Log file cap in bytes (bot-specific), clamped on load
+        long cap = strtol(data, NULL, 10);
+        if (cap < BOT_LOG_SIZE_MIN) cap = BOT_LOG_SIZE_MIN;
+        if (cap > BOT_LOG_SIZE_MAX) cap = BOT_LOG_SIZE_MAX;
+        state->log_max_size = cap;
+        break;
+      }
+
       case 'u': // User/ident (bot-specific)
         snprintf(state->user, sizeof(state->user), "%s", data);
         break;
@@ -877,6 +885,9 @@ static void config_write_file(const bot_state_t *state, const char *password) {
 
   if (state->log_type != DEFAULT_LOG_LEVEL)
     CFG_WRITE("l|%d\n", state->log_type);
+  /* 0 is a state that never ran state_init (the setup wizard): default. */
+  if (state->log_max_size > 0 && state->log_max_size != BOT_LOG_FILE_SIZE)
+    CFG_WRITE("L|%ld\n", state->log_max_size);
 
   CFG_WRITE("u|%s\n", state->user);
   CFG_WRITE("g|%s\n", state->gecos);

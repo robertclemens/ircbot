@@ -666,6 +666,49 @@ void updater_check_for_updates(bot_state_t *state, const char *nick) {
   }
 }
 
+/* ircbot -checkupdate [variant]: fetch the release manifest and its signature
+ * exactly as a hub-driven upgrade does — the release tree <base>/<variant>,
+ * the compiled-in base and pinned key unless IRCBOT_UPDATE_BASE says
+ * otherwise — verify one against the other, and report.  Nothing past the
+ * manifest is downloaded and nothing is installed, so an operator (or the
+ * testnet) can prove a host reaches and trusts the real release channel —
+ * TLS, CA store, pinned key — without upgrading anything.  0 = verified. */
+int updater_check_cli(const char *variant) {
+  const char *want = (variant && variant[0]) ? variant : updater_host_variant();
+  if (strpbrk(want, "/;|&`$ \t\r\n") || strlen(want) > 7) {
+    printf("checkupdate: FAIL malformed variant\n");
+    return 1;
+  }
+  if (!updater_env_base()) {
+    char tree[600];
+    snprintf(tree, sizeof(tree), "%s/%s", BOT_UPDATE_BASE, want);
+    setenv("IRCBOT_UPDATE_BASE", tree, 1);
+  }
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(&verr);
+  if (!manifest) {
+    printf("checkupdate: FAIL %s (%s)\n", verr ? verr : "manifest fetch failed",
+           getenv("IRCBOT_UPDATE_BASE"));
+    return 1;
+  }
+  int rows = 0;
+  char newest[64] = "";
+  char *saveptr = NULL;
+  for (char *line = strtok_r(manifest, "\n", &saveptr); line;
+       line = strtok_r(NULL, "\n", &saveptr)) {
+    char version[64];
+    if (line[0] == '#' || sscanf(line, "%63s", version) != 1) continue;
+    rows++;
+    if (!newest[0] || updater_version_cmp(version, newest) > 0)
+      snprintf(newest, sizeof(newest), "%s", version);
+  }
+  free(manifest);
+  printf("checkupdate: OK %s manifest verified: %d release row(s), newest %s, "
+         "running %s\n",
+         want, rows, newest[0] ? newest : "-", BOT_VERSION);
+  return 0;
+}
+
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
                              const char *version_to_install) {
   log_message(L_DEBUG, state,
@@ -1300,6 +1343,12 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   handle_fatal_error("execl upgrade.sh");
 }
 #else /* !HAVE_CURL */
+int updater_check_cli(const char *variant) {
+  (void)variant;
+  printf("checkupdate: FAIL bot compiled without curl support\n");
+  return 1;
+}
+
 void updater_check_for_updates(bot_state_t *state, const char *nick) {
   irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
 }

@@ -120,7 +120,7 @@ static void reply_rows_omitted(bot_state_t *state, const char *nick,
 #define BOTS_COL_GAP         2
 
 typedef struct {
-  char name[160 + TREE_NAME_MAX + 32]; /* tree_prefix() output + label */
+  char name[4 * MAX_TREE_DEPTH + 16 + TREE_NAME_MAX + 32]; /* prefix + label */
   char version[TREE_VERSION_MAX + TREE_VARIANT_MAX + 4]; /* "2.4.0 (rs)" */
   char uptime[32];
   char server[TREE_SERVER_MAX + 1];
@@ -146,7 +146,7 @@ static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
   if (r->depth >= 0 && (size_t)r->depth < last_cap)
     last_at[r->depth] = is_last;
 
-  char prefix[160];
+  char prefix[4 * MAX_TREE_DEPTH + 16]; /* "│ " is 4 bytes a level */
   tree_prefix(prefix, sizeof(prefix), r->depth, last_at, is_last,
               tree_has_children(state, i));
 
@@ -192,7 +192,7 @@ static void bots_self_row(const bot_state_t *state, bots_row_t *c) {
 static void bots_trusted_row(const bot_state_t *state, int i, bots_row_t *c) {
   char bnick[MAX_NICK];
   auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
-  char prefix[160];
+  char prefix[4 * MAX_TREE_DEPTH + 16]; /* "│ " is 4 bytes a level */
   tree_prefix(prefix, sizeof(prefix), 1, NULL,
               i == state->trusted_bot_count - 1, false);
   snprintf(c->name, sizeof(c->name), "%s%s", prefix,
@@ -1493,28 +1493,42 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
     } else if (strcasecmp(command, "setlog") == 0) {
       if (!arg1) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: setlog <loglevel> :: LOGLEVELS: "
-                   "0=NONE,15=INFO,63=DEBUG\r\n",
-                   nick);
+                   "PRIVMSG %s :Syntax: setlog <loglevel> [maxbytes] :: "
+                   "LOGLEVELS: 0=NONE,15=INFO,63=DEBUG :: log file is %ld "
+                   "bytes max\r\n",
+                   nick, state->log_max_size);
         return;
       }
-      bool is_valid_int = true;
-      for (int i = 0; arg1[i] != '\0'; i++)
-        if (!isdigit(arg1[i])) {
-          is_valid_int = false;
-          break;
-        }
-      if (is_valid_int) {
+      /* Digits only, and short enough that neither strtol can overflow: the
+       * level is a 6-bit mask, the size at most BOT_LOG_SIZE_MAX. */
+      bool is_valid_int = arg1[0] != '\0' && strlen(arg1) <= 2;
+      for (int i = 0; is_valid_int && arg1[i] != '\0'; i++)
+        if (!isdigit((unsigned char)arg1[i])) is_valid_int = false;
+      bool size_ok = !arg2 || (arg2[0] != '\0' && strlen(arg2) <= 10);
+      for (int i = 0; size_ok && arg2 && arg2[i] != '\0'; i++)
+        if (!isdigit((unsigned char)arg2[i])) size_ok = false;
+      long new_size = arg2 ? strtol(arg2, NULL, 10) : state->log_max_size;
+      if (!is_valid_int || atoi(arg1) > DEFAULT_LOG_LEVEL) {
+        irc_printf(state,
+                   "PRIVMSG %s :Invalid log level. Give a mask from 0 to "
+                   "%d.\r\n",
+                   nick, DEFAULT_LOG_LEVEL);
+      } else if (!size_ok || new_size < BOT_LOG_SIZE_MIN ||
+                 new_size > BOT_LOG_SIZE_MAX) {
+        irc_printf(state,
+                   "PRIVMSG %s :Invalid log size. Give bytes from %ld to "
+                   "%ld.\r\n",
+                   nick, BOT_LOG_SIZE_MIN, BOT_LOG_SIZE_MAX);
+      } else {
         int new_level = atoi(arg1);
         state->log_type = (log_type_t)new_level;
-        irc_printf(state, "PRIVMSG %s :Log level set to %d.\r\n", nick,
-                   new_level);
-        config_write_with_state_pass(state);
-      } else
+        state->log_max_size = new_size;
         irc_printf(state,
-                   "PRIVMSG %s :Invalid log level. Please provide a valid "
-                   "integer.\r\n",
-                   nick);
+                   "PRIVMSG %s :Log level set to %d, log file %ld bytes max."
+                   "\r\n",
+                   nick, new_level, new_size);
+        config_write_with_state_pass(state);
+      }
     } else if (strcasecmp(command, "getlog") == 0) {
       if (!arg1) {
         irc_printf(
@@ -1996,7 +2010,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       const int cap = reply_row_cap(state);
       int rows_omitted = 0;
       for (int pass = 0; pass < 2; pass++) {
-        bool last_at[10] = {false};
+        bool last_at[MAX_TREE_DEPTH + 1] = {false};
         int shown = 0;
         bots_row_t row;
         if (have_tree) {
@@ -2245,11 +2259,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           return;
         }
       }
-      if (state->hub_count >= MAX_SERVERS) {
-        irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
-        return;
-      }
-      /* Validate + decode the pinned pubkey. */
+      /* Validate + decode the pinned pubkey before the capacity check, so
+       * a malformed key is named as such even on a full list. */
       int dec_len = 0;
       unsigned char *dec = base64_decode(arg2, &dec_len);
       if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
@@ -2258,6 +2269,12 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                    "Ed25519 key (44 chars) or 64-byte combined Curve25519 "
                    "key (88 chars).\r\n", nick);
         if (dec) free(dec);
+        return;
+      }
+      if (state->hub_count >= MAX_SERVERS) {
+        secure_wipe(dec, (size_t)dec_len);
+        free(dec);
+        irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
         return;
       }
       hub_entry_t *he = &state->hubs[state->hub_count];
@@ -2594,8 +2611,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      nick);
         } else if (strcasecmp(arg1, "setlog") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: setlog <loglevel> - Set loglevel for "
-                     "output to a log file. 0=NONE,15=INFO,63=DEBUG.\r\n",
+                     "PRIVMSG %s :Syntax: setlog <loglevel> [maxbytes] - Set "
+                     "loglevel for output to a log file, and optionally its "
+                     "size cap. 0=NONE,15=INFO,63=DEBUG.\r\n",
                      nick);
         } else if (strcasecmp(arg1, "getlog") == 0) {
           irc_printf(state,

@@ -60,6 +60,7 @@ static void state_init(bot_state_t *state) {
                     "secrets may reach swap.\n", strerror(errno));
   state->status = S_NONE;
   state->log_type = DEFAULT_LOG_LEVEL;
+  state->log_max_size = BOT_LOG_FILE_SIZE;
   state->bot_start_time = time(NULL);
   state->last_pong_time = time(NULL);
   state->nick_release_time = time(NULL) - NICK_TAKE_TIME;
@@ -757,6 +758,10 @@ int main(int argc, char *argv[]) {
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-setup") == 0) do_setup = true;
     if (strcmp(argv[i], "-p")     == 0) do_passfile = true;
+    /* -checkupdate [variant]: verify the release channel and exit; needs no
+     * config, no password and no PID lock. */
+    if (strcmp(argv[i], "-checkupdate") == 0)
+      return updater_check_cli(i + 1 < argc ? argv[i + 1] : NULL);
   }
 
   if (do_setup) {

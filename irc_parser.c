@@ -287,10 +287,17 @@ void parser_handle_line(bot_state_t *state, char *line) {
         char srv_nick[MAX_NICK];
         memcpy(srv_nick, params, nlen);
         srv_nick[nlen] = '\0';
-        if (strcmp(state->current_nick, srv_nick) != 0) {
-          log_message(L_INFO, state,
-                      "[INFO] Server registered me as %s (was %s)\n", srv_nick,
-                      state->current_nick[0] ? state->current_nick : "unset");
+        /* Registered under anything but the target nick is news for the
+         * hub even when current_nick already says so: a 433 during
+         * registration switches current_nick to the fallback without a push,
+         * and a hub link that came up before that has only the target. */
+        bool renamed = strcmp(state->current_nick, srv_nick) != 0;
+        if (renamed || strcasecmp(srv_nick, state->target_nick) != 0) {
+          if (renamed)
+            log_message(L_INFO, state,
+                        "[INFO] Server registered me as %s (was %s)\n",
+                        srv_nick,
+                        state->current_nick[0] ? state->current_nick : "unset");
           snprintf(state->current_nick, sizeof(state->current_nick), "%s",
                    srv_nick);
           state->current_nick_ts = time(NULL);

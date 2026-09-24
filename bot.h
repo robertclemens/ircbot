@@ -49,7 +49,11 @@
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
 #define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
-#define BOT_LOG_FILE_SIZE (10 * 1024 * 1024) // 10MB cap; LOGFILE is truncated past this
+#define BOT_LOG_FILE_SIZE (10 * 1024 * 1024) // default cap; LOGFILE is truncated past it
+/* Bounds on the per-bot cap (L|<bytes> in the config, set by 'setlog <level>
+ * <maxbytes>'): same range the hub takes for CMD_ADMIN_SET_LOG_SIZE. */
+#define BOT_LOG_SIZE_MIN 1024L
+#define BOT_LOG_SIZE_MAX (1024L * 1024 * 1024)
 // Signed-release channel (ircbot-releases).  All of these are -D-overridable
 // (the testnet injects a throwaway signing key), and at RUNTIME the
 // IRCBOT_UPDATE_BASE env var repoints the updater at a local ircbot-releases
@@ -516,6 +520,10 @@ typedef struct {
  * is the last child at its level when no later row shares its depth before a
  * shallower one appears.  Purely for display -- nothing here grants trust. */
 #define MAX_BOT_TREE_ROWS  256
+/* Deepest row we draw.  A hub hangs every hub further out beneath the hub
+ * that links to it, so a chain of N hubs is N levels deep (plus its bots);
+ * a deeper row is drawn at this depth rather than dropped. */
+#define MAX_TREE_DEPTH     32
 #define TREE_VERSION_MAX   15
 #define TREE_VARIANT_MAX   7    /* "c" / "rs" -- the code base a node runs */
 #define TREE_SERVER_MAX    63
@@ -641,6 +649,7 @@ struct bot_state {
   SSL_CTX *ssl_ctx;
   SSL *ssl;
   log_type_t log_type;
+  long log_max_size;  /* LOGFILE cap in bytes (BOT_LOG_FILE_SIZE unless L| set) */
   chan_t *chanlist;
   char ignored_default_channel[MAX_CHAN];
   char ignored_default_mask[MAX_MASK_LEN];
@@ -755,6 +764,11 @@ struct bot_state {
   char   upgrade_variant[8];
   char   upgrade_base[512];
   time_t upgrade_prepared;
+  /* The run whose build this process IS: read from UPGRADE_MARKER_FILE when
+   * the upgraded binary first reports in.  An ABORT rolls back to <exe>.prev
+   * only for this run — .prev otherwise holds the build from before some
+   * earlier, completed run, and a bot that refused a COMMIT never moved. */
+  char   upgrade_installed_id[64];
 };
 
 // ... [Function Prototypes same as before] ...
@@ -839,6 +853,7 @@ void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
                             const char *target_nick, const char *format, ...);
 _Noreturn void handle_fatal_error(const char *message);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
+int updater_check_cli(const char *variant);
 void updater_perform_upgrade(bot_state_t *state, const char *nick,
                              const char *version);
 /* Hub-driven upgrade (CMD_UPGRADE_COMMIT).  Returns false with *err set and

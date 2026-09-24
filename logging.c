@@ -78,11 +78,12 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   printf("%s\n", full_log_line);
 #endif
 
-  /* Enforce the BOT_LOG_FILE_SIZE ceiling before appending: past the cap the
-   * file is truncated rather than allowed to grow without bound. */
+  /* Enforce the size cap (L|, else BOT_LOG_FILE_SIZE) before appending:
+   * past it the file is truncated rather than allowed to grow without bound,
+   * and this line is then written after the truncation notice. */
+  long cap = state->log_max_size > 0 ? state->log_max_size : BOT_LOG_FILE_SIZE;
   struct stat log_stat;
-  if (stat(LOGFILE, &log_stat) == 0 &&
-      log_stat.st_size >= (off_t)BOT_LOG_FILE_SIZE) {
+  if (stat(LOGFILE, &log_stat) == 0 && log_stat.st_size >= (off_t)cap) {
     int trunc_fd = open(LOGFILE, O_WRONLY | O_CREAT | O_TRUNC, 0600);
     if (trunc_fd >= 0) {
       FILE *trunc_stream = fdopen(trunc_fd, "a");

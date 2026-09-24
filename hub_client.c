@@ -375,6 +375,8 @@ void hub_client_report_upgrade_result(bot_state_t *state) {
   char id[64], want[64];
   if (!updater_take_pending_upgrade(id, sizeof(id), want, sizeof(want))) return;
   bool ok = (updater_version_cmp(BOT_VERSION, want) == 0);
+  snprintf(state->upgrade_installed_id, sizeof(state->upgrade_installed_id),
+           "%s", id);
   log_message(L_INFO, state, "[UPGRADE] Restarted after %s: running %s (wanted %s)\n",
               id, BOT_VERSION, want);
   hub_client_send_upgrade_result(state, id, ok ? "ok" : "version-mismatch",
@@ -539,6 +541,19 @@ static void hub_client_handle_upgrade_abort(bot_state_t *state,
               id[0] ? id : "(no id)", reason[0] ? reason : "no reason given");
   state->upgrade_id[0] = '\0';
   state->upgrade_prepared = 0;
+  /* Only the run that installed the build we are running may take it back.
+   * A bot that refused the COMMIT (a bad hash, no .ircbot.pass) never moved,
+   * and its <exe>.prev is the build from before an earlier, completed run:
+   * rolling back to it would walk a healthy node off the version the rest of
+   * the mesh is on. */
+  if (!id[0] || strcmp(id, state->upgrade_installed_id) != 0) {
+    log_message(L_INFO, state,
+                "[UPGRADE] Abort %s: this bot is not running that run's build; "
+                "nothing to roll back\n", id[0] ? id : "(no id)");
+    hub_client_send_upgrade_result(state, id[0] ? id : "-", "aborted",
+                                   "not moved by this run");
+    return;
+  }
   if (!updater_hub_rollback(state, reason[0] ? reason : "hub aborted the upgrade"))
     hub_client_send_upgrade_result(state, id[0] ? id : "-", "aborted",
                                    "nothing retained to roll back to");
@@ -612,7 +627,8 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
       continue;
     }
     if (strcmp(row.name, "-") == 0) row.name[0] = '\0';
-    if (row.depth < 0 || row.depth > 8) row.depth = 0;
+    if (row.depth < 0) row.depth = 0;
+    if (row.depth > MAX_TREE_DEPTH) row.depth = MAX_TREE_DEPTH;
     state->bot_tree[count++] = row;
   }
 
