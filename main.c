@@ -879,6 +879,7 @@ int main(int argc, char *argv[]) {
   while (!(state.status & S_DIE) && !g_shutdown_flag) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
+    commands_activity_tick(&state, time(NULL));
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin
@@ -887,11 +888,11 @@ int main(int argc, char *argv[]) {
      * CONFIG_WRITE_DEBOUNCE_S seconds instead.  select() below has a 1 s
      * timeout, so this is evaluated at least once a second.
      *
-     * Local writer on purpose: these timestamps are this bot's own view of
-     * when a mask was last used against it.  Pushing them to the hub would
-     * generate mesh sync traffic for every admin command.  Records that the
-     * hub is authoritative for still propagate via their own paths
-     * (hub_client_push_admin_delta on +admin/-admin, etc.).
+     * Local writer on purpose: a config push per admin command would be
+     * mesh sync traffic for every command.  The times reach the hub as
+     * CMD_ACTIVITY instead, once per record per clock hour (auth_mark_used).
+     * Records that the hub is authoritative for still propagate via their
+     * own paths (hub_client_push_admin_delta on +admin/-admin, etc.).
      *
      * The cleanup path after this loop calls config_write_with_state_pass()
      * unconditionally, so a still-dirty flag is flushed on clean shutdown. */

@@ -68,14 +68,29 @@ int auth_user_candidates(bot_state_t *state, const char *user_host,
   return n;
 }
 
+/* True when `now` opens a new ACTIVITY_BUCKET after `prev`: the first use
+ * within a clock hour, the only one reported to the hub. */
+static bool activity_new_bucket(time_t prev, time_t now) {
+  return prev / ACTIVITY_BUCKET < now / ACTIVITY_BUCKET;
+}
+
 /* Record a successful authentication.  Sets config_dirty so the debounced
- * flush in main.c persists last_seen/last_used locally. */
+ * flush in main.c persists last_seen/last_used locally; the first use of a
+ * record within a clock hour is also reported to the hub (CMD_ACTIVITY),
+ * with this use's exact time. */
 void auth_mark_used(bot_state_t *state, user_record_t *u, int mask_idx,
                     time_t now) {
-  if (u) u->last_seen = now;
-  if (mask_idx >= 0 && mask_idx < state->mask_record_count)
-    state->mask_records[mask_idx].last_used = now;
+  if (u) {
+    if (activity_new_bucket(u->last_seen, now)) u->act_pending = now;
+    u->last_seen = now;
+  }
+  if (mask_idx >= 0 && mask_idx < state->mask_record_count) {
+    mask_record_t *m = &state->mask_records[mask_idx];
+    if (activity_new_bucket(m->last_used, now)) m->act_pending = now;
+    m->last_used = now;
+  }
   state->config_dirty = true;
+  hub_client_send_activity(state);
 }
 
 // Strip leading '~' from the ident portion of nick!ident@host, writing the

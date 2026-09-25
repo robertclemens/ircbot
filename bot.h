@@ -348,6 +348,27 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_UPGRADE_RESULT  0x61 // Bot -> Hub: id|uuid|status|new_ver|detail
 #define CMD_UPGRADE_ABORT   0x62 // Hub -> Bot: id|reason
 
+/* ---- Activity (last seen / last used).  Mirrors irchub/hub.h.
+ * last_seen / last_used are max-merged outside LWW.  auth_mark_used() stores
+ * the exact time and, on a record's first use within an ACTIVITY_BUCKET (a
+ * clock hour), reports that time to the hub as CMD_ACTIVITY; with no hub
+ * link the latest such time waits per record and goes out after the next hub
+ * authentication.  admins / opers / match ask the hub for the network-wide
+ * times (CMD_ACTIVITY_QUERY), park the command for up to
+ * ACTIVITY_QUERY_TIMEOUT seconds, and show max(hub, local) per row; with no
+ * hub or no answer they show the local times.
+ *   CMD_ACTIVITY        a|<user_uuid>|<ts>  /  m|<user_uuid>|<mask>|<ts>
+ *   CMD_ACTIVITY_QUERY  <req_id>|users  /  <req_id>|masks|<user_uuid or *>
+ *   CMD_ACTIVITY_REPLY  <req_id>|<more>, then a|/m| lines; more=0 last */
+#define CMD_ACTIVITY       0x69 // Bot -> Hub
+#define CMD_ACTIVITY_QUERY 0x6A // Bot -> Hub
+#define CMD_ACTIVITY_REPLY 0x6B // Hub -> Bot
+#define ACTIVITY_BUCKET        3600
+#define ACTIVITY_MAX_FUTURE    300  /* hub times further ahead are refused */
+#define ACTIVITY_QUERY_TIMEOUT 3
+#define MAX_ACTIVITY_QUERIES   4
+#define ACTIVITY_REQ_ID_MAX    32
+
 /* Wire tokens for the `kind` field, and the bot-side index that tracks one
  * in-flight request per kind per channel. */
 #define CHAN_REQ_TOK_UNBAN  "unban"
@@ -426,6 +447,7 @@ typedef struct {
   time_t last_seen;
   time_t timestamp;
   time_t last_auth_reply; /* runtime only: ~A2K rate limit, never persisted */
+  time_t act_pending;     /* runtime only: CMD_ACTIVITY time not yet sent */
 } user_record_t;
 
 /* Parsed a|/o| line body (config file, hub sync, bot push).  legacy is true
@@ -458,6 +480,7 @@ typedef struct {
   bool   is_active;    /* false when action == "del" */
   time_t last_used;    /* 0 = never used */
   time_t timestamp;
+  time_t act_pending;  /* runtime only: CMD_ACTIVITY time not yet sent */
 } mask_record_t;
 
 typedef struct {
@@ -545,6 +568,9 @@ typedef struct {
   char   variant[TREE_VARIANT_MAX + 1]; /* "" when the hub did not say     */
   char   server[TREE_SERVER_MAX + 1];
   time_t uptime;                      /* seconds; last-seen epoch when 'd'  */
+  time_t started;                     /* absolute start time, 0 = unknown   */
+  bool   has_started;                 /* the hub sent started: the uptime  */
+                                      /* is ours to work out                */
   bool   online;
 } bot_tree_row_t;
 
@@ -588,6 +614,34 @@ typedef struct {
   char *outbuf;                  /* unsent replies (heap, <= DCC_OUTBUF_MAX) */
   size_t outlen, outcap;
 } dcc_session_t;
+
+/* The ~A2R reply context of one ~A2S command (state->a2r). */
+typedef struct {
+  bool active;
+  unsigned char key[32];
+  unsigned char aad[A2_NICK_MAX * 2 + 16];
+  size_t aad_len;
+  char nick[A2_NICK_MAX];
+  unsigned long seq;
+} a2r_ctx_t;
+
+typedef enum { ACTQ_ADMINS = 0, ACTQ_OPERS, ACTQ_MATCH } actq_kind_t;
+
+/* One admins / opers / match command parked on CMD_ACTIVITY_QUERY, with
+ * everything needed to answer it later: the asker, the DCC chat it came in
+ * on (slot + token, so a reused slot is not mistaken for it) and a ~A2S
+ * command's reply key (wiped as soon as the command is answered). */
+typedef struct {
+  bool active;
+  char id[ACTIVITY_REQ_ID_MAX + 1];
+  actq_kind_t kind;
+  char arg[64];                  /* match: the name, or "*" */
+  char nick[A2_NICK_MAX];
+  dcc_session_t *dcc;
+  uint32_t dcc_token;
+  a2r_ctx_t a2r;
+  time_t deadline;
+} activity_query_t;
 
 /* Why a server_list[] slot is being skipped (irc_client.c). */
 typedef enum {
@@ -681,14 +735,9 @@ struct bot_state {
   /* Set only while a ~A2S command is dispatched: irc_printf then seals that
    * command's replies to the asker into ~A2R frames.  Wiped right after, so
    * the bot keeps no session state (passwordless.md §4.7). */
-  struct {
-    bool active;
-    unsigned char key[32];
-    unsigned char aad[A2_NICK_MAX * 2 + 16];
-    size_t aad_len;
-    char nick[A2_NICK_MAX];
-    unsigned long seq;
-  } a2r;
+  a2r_ctx_t a2r;
+  /* admins / opers / match waiting on a CMD_ACTIVITY_REPLY (commands.c). */
+  activity_query_t activity_queries[MAX_ACTIVITY_QUERIES];
   roster_entry_t channel_roster[MAX_ROSTER_SIZE];
   char who_request_channel[MAX_CHAN];
   nonce_entry_t recent_nonces[NONCE_CACHE_SIZE];
@@ -974,6 +1023,10 @@ void hub_client_disconnect(bot_state_t *state);
 void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
                                     const char *status, const char *detail);
 void hub_client_report_upgrade_result(bot_state_t *state);
+void hub_client_send_activity(bot_state_t *state);
+bool hub_client_send_activity_query(bot_state_t *state, const char *payload);
+void commands_activity_reply(bot_state_t *state, char *payload);
+void commands_activity_tick(bot_state_t *state, time_t now);
 void hub_client_on_connect(bot_state_t *state);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);

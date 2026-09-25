@@ -400,6 +400,56 @@ void hub_client_report_upgrade_result(bot_state_t *state) {
 
 /* Field `idx` of `s`, NUL-terminated into `dst`.  An over-long field is a
  * malformed frame, not something to truncate silently: false, `dst` empty. */
+/* Send every pending activity report (auth_mark_used) to the hub, chunked
+ * under MAX_BUFFER.  A record is cleared only once its frame went out; with
+ * no hub link they wait for the next authentication. */
+void hub_client_send_activity(bot_state_t *state) {
+  if (!state->hub_authenticated || state->hub_fd == -1) return;
+  const int cap = MAX_BUFFER - 64;
+  char *buf = malloc((size_t)cap);
+  if (!buf) return;
+  int len = 0, total = state->user_record_count + state->mask_record_count;
+  int first = 0; /* first record index in the current chunk */
+  for (int i = 0; i <= total; i++) {
+    char line[MAX_MASK_LEN + 96];
+    int w = 0;
+    if (i < state->user_record_count) {
+      const user_record_t *u = &state->user_records[i];
+      if (u->act_pending > 0)
+        w = snprintf(line, sizeof(line), "a|%s|%lld\n", u->uuid,
+                     (long long)u->act_pending);
+    } else if (i < total) {
+      const mask_record_t *m = &state->mask_records[i - state->user_record_count];
+      if (m->act_pending > 0)
+        w = snprintf(line, sizeof(line), "m|%s|%s|%lld\n", m->uuid, m->mask,
+                     (long long)m->act_pending);
+    }
+    if (w >= (int)sizeof(line)) w = 0;
+    /* Flush when the chunk is full or at the end. */
+    if (len > 0 && (i == total || len + w > cap)) {
+      if (!hub_send_frame(state, CMD_ACTIVITY, buf, len)) break;
+      for (int j = first; j < i; j++) {
+        if (j < state->user_record_count)
+          state->user_records[j].act_pending = 0;
+        else
+          state->mask_records[j - state->user_record_count].act_pending = 0;
+      }
+      len = 0;
+    }
+    if (len == 0) first = i;
+    if (w > 0) {
+      memcpy(buf + len, line, (size_t)w);
+      len += w;
+    }
+  }
+  free(buf);
+}
+
+bool hub_client_send_activity_query(bot_state_t *state, const char *payload) {
+  return hub_send_frame(state, CMD_ACTIVITY_QUERY, payload,
+                        (int)strlen(payload));
+}
+
 static bool wire_field(const char *s, int idx, char *dst, size_t cap) {
   if (!dst || cap == 0) return false;
   dst[0] = '\0';
@@ -606,6 +656,11 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
       /* The code base (c / rs) came after it; same rule, blank if absent. */
       if (n >= 7 && strcmp(f[6], "-") != 0)
         snprintf(row.variant, sizeof(row.variant), "%s", f[6]);
+      /* Then the absolute start time, which replaces the uptime field. */
+      if (n >= 8) {
+        row.started = (time_t)atoll(f[7]);
+        row.has_started = true;
+      }
     } else if (row.kind == 'b' && n >= 6) {
       row.depth = atoi(f[0]);
       snprintf(row.name, sizeof(row.name), "%s", f[1]);
@@ -617,6 +672,10 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
       row.uptime = (time_t)atoll(f[5]);
       if (n >= 7 && strcmp(f[6], "-") != 0)
         snprintf(row.variant, sizeof(row.variant), "%s", f[6]);
+      if (n >= 8) {
+        row.started = (time_t)atoll(f[7]);
+        row.has_started = true;
+      }
       row.online = true;
     } else if (row.kind == 'd' && n >= 3) {
       snprintf(row.name, sizeof(row.name), "%s", f[0]);
@@ -1564,6 +1623,13 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     hub_client_process_tree(state, payload, payload_len);
     break;
 
+  case CMD_ACTIVITY_REPLY:
+    if (payload && payload_len > 0) {
+      payload[payload_len] = '\0';
+      commands_activity_reply(state, payload);
+    }
+    break;
+
   case CMD_CONFIG_PULL:
     log_message(L_INFO, state, "[HUB] Hub requested config sync\n");
     break;
@@ -2087,6 +2153,8 @@ void hub_client_process(bot_state_t *state) {
           /* If this process is the product of a hub-driven upgrade, close
            * that run out now that there is a hub to tell. */
           hub_client_report_upgrade_result(state);
+          /* Activity reports held while the hub was unreachable. */
+          hub_client_send_activity(state);
           if (state->admin_delta_pending) {
             /* After the config push (so the hub already knows v|2).  LWW
              * on the hub: only records changed here since carry a newer

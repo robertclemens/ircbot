@@ -164,13 +164,18 @@ static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
    * an older hub that does not send one shows "-".  Hubs have no IRC server
    * at all, so that column says so explicitly. */
   bots_fmt_version(c->version, sizeof(c->version), r->version, r->variant);
-  /* The hub stamps uptimes when it pushes (every BOT_TREE_REFRESH), so a
-   * live node has been up that much longer by now; an unlinked hub has no
-   * uptime at all. */
-  time_t age = time(NULL) - state->bot_tree_ts;
-  tree_fmt_uptime(c->uptime, sizeof(c->uptime),
-                  (r->kind == 'h' && !r->online)
-                      ? 0 : r->uptime + (age > 0 ? age : 0));
+  /* A hub that sends the node's start time leaves the uptime to us (a clock
+   * skew past it is "-", not a negative).  An older hub stamped the uptime
+   * when it pushed, so a live node has been up that much longer by now.  An
+   * unlinked hub has no uptime at all. */
+  time_t now = time(NULL), age = now - state->bot_tree_ts, up;
+  if (r->kind == 'h' && !r->online)
+    up = 0;
+  else if (r->has_started)
+    up = r->started > 0 ? now - r->started : 0;
+  else
+    up = r->uptime + (age > 0 ? age : 0);
+  tree_fmt_uptime(c->uptime, sizeof(c->uptime), up);
   snprintf(c->server, sizeof(c->server), "%s",
            r->kind == 'h' ? "(hub)" : (r->server[0] ? r->server : "-"));
 }
@@ -825,6 +830,305 @@ static void help_auth(bot_state_t *state, const char *nick) {
   for (int i = 0; lines[i]; i++) {
     irc_printf(state, "PRIVMSG %s :%s\r\n", nick, lines[i]);
     reply_pace(state, &d);
+  }
+}
+
+/* admins (type 'a') / opers (type 'o'): every record of that type with its
+ * key fingerprint and last-seen time. */
+static void list_users(bot_state_t *state, const char *nick, char type) {
+  const char *what = type == 'a' ? "admins" : "opers";
+  struct timespec delay = {0, 100000000};
+  /* Find max name width for alignment (min 8) */
+  int name_w = 8;
+  for (int i = 0; i < state->user_record_count; i++) {
+    if (state->user_records[i].type != type) continue;
+    int nl = (int)strlen(state->user_records[i].name);
+    if (nl > name_w) name_w = nl;
+  }
+  irc_printf(state, "PRIVMSG %s :| ircbot %s %s\r\n", nick, BOT_VERSION, what);
+  irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
+  int shown = 0, omitted = 0;
+  const int cap = reply_row_cap(state);
+  for (int i = 0; i < state->user_record_count; i++) {
+    user_record_t *u = &state->user_records[i];
+    if (u->type != type) continue;
+    if (shown >= cap) { omitted++; continue; }
+    char ts_buf[48];
+    if (u->last_seen == 0) {
+      snprintf(ts_buf, sizeof(ts_buf), "never");
+    } else {
+      struct tm *tm = gmtime(&u->last_seen);
+      if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
+      else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
+    }
+    char del_tag[16] = "";
+    if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
+    char kfp[KEY_FP_LEN + 1];
+    user_key_fp(u, kfp);
+    irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
+               nick, name_w, u->name, kfp, ts_buf, del_tag);
+    shown++;
+    reply_pace(state, &delay);
+  }
+  if (shown == 0)
+    irc_printf(state, "PRIVMSG %s :| (no %s)\r\n", nick, what);
+  reply_rows_omitted(state, nick, omitted, what);
+  irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
+}
+
+/* match <name|*>: the named user's (or every) active record and its masks. */
+static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
+  /* Show active records for named user or * for all */
+  bool match_all = (strcmp(arg1, "*") == 0);
+  irc_printf(state, "PRIVMSG %s :| ircbot %s match%s\r\n", nick, BOT_VERSION,
+             match_all ? " *" : "");
+  irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
+  struct timespec delay = {0, 100000000};
+  /* shown counts printed rows (a user line and each of its masks); once
+   * the cap is reached the rest are only counted, for the closing note. */
+  int shown = 0, omitted = 0;
+  const int cap = reply_row_cap(state);
+  for (int i = 0; i < state->user_record_count; i++) {
+    user_record_t *u = &state->user_records[i];
+    if (!match_all && strcasecmp(u->name, arg1) != 0) continue;
+    if (!u->is_active) continue;
+    if (shown >= cap) {
+      omitted++;
+      for (int j = 0; j < state->mask_record_count; j++)
+        if (state->mask_records[j].is_active &&
+            strcmp(state->mask_records[j].uuid, u->uuid) == 0)
+          omitted++;
+      continue;
+    }
+    char ts_buf[48];
+    if (u->last_seen == 0) {
+      snprintf(ts_buf, sizeof(ts_buf), "never");
+    } else {
+      struct tm *tm_utc = gmtime(&u->last_seen);
+      if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+      else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
+    }
+    char kfp[KEY_FP_LEN + 1];
+    user_key_fp(u, kfp);
+    irc_printf(state, "PRIVMSG %s :| [%c] %-20s  key %s  (last seen: %s)\r\n",
+               nick, u->type, u->name, kfp, ts_buf);
+    reply_pace(state, &delay);
+    shown++;
+    for (int j = 0; j < state->mask_record_count; j++) {
+      mask_record_t *m = &state->mask_records[j];
+      if (strcmp(m->uuid, u->uuid) != 0) continue;
+      if (!m->is_active) continue;
+      if (shown >= cap) { omitted++; continue; }
+      char used_buf[48];
+      if (m->last_used == 0) {
+        snprintf(used_buf, sizeof(used_buf), "never");
+      } else {
+        struct tm *tm_used = gmtime(&m->last_used);
+        if (tm_used) strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tm_used);
+        else         snprintf(used_buf, sizeof(used_buf), "invalid");
+      }
+      irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
+                 nick, m->mask, used_buf);
+      reply_pace(state, &delay);
+      shown++;
+    }
+  }
+  /* If no user record found and not wildcard, check trusted bots */
+  if (shown == 0 && !match_all) {
+    for (int i = 0; i < state->trusted_bot_count; i++) {
+      const trusted_bot_t *tb = &state->trusted_bots[i];
+      const char *bot_mask = tb->mask, *bot_uuid = tb->uuid;
+      long long bot_ts = (long long)tb->ts;
+      char bot_nick[MAX_NICK];
+      auth_trusted_bot_nick(tb, bot_nick);
+      if (strcasecmp(bot_nick, arg1) != 0) continue;
+      /* Found a matching bot */
+      char ts_buf[48];
+      if (bot_ts == 0) {
+        snprintf(ts_buf, sizeof(ts_buf), "never");
+      } else {
+        time_t bts = (time_t)bot_ts;
+        struct tm *tm_utc = gmtime(&bts);
+        if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
+        else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
+      }
+      irc_printf(state, "PRIVMSG %s :| [b] %-20s  (last seen: %s)\r\n",
+                 nick, bot_nick, ts_buf);
+      reply_pace(state, &delay);
+      if (bot_mask[0])
+        irc_printf(state, "PRIVMSG %s :|   mask: %s\r\n", nick, bot_mask);
+      if (bot_uuid[0])
+        irc_printf(state, "PRIVMSG %s :|   uuid: %s\r\n", nick, bot_uuid);
+      if (tb->has_pub) {
+        char bfp[KEY_FP_LEN + 1];
+        crypto_key_fingerprint(tb->pub, bfp);
+        irc_printf(state, "PRIVMSG %s :|   key : %s\r\n", nick, bfp);
+      } else {
+        irc_printf(state, "PRIVMSG %s :|   key : (none on file)\r\n", nick);
+      }
+      const char *hub_str = (state->hub_connected && state->current_hub[0])
+                            ? state->current_hub : "none";
+      irc_printf(state, "PRIVMSG %s :|   hub : %s\r\n", nick, hub_str);
+      shown++;
+      reply_pace(state, &delay);
+      break;
+    }
+  }
+  if (shown == 0 && !match_all)
+    irc_printf(state, "PRIVMSG %s :| unknown user: %s\r\n", nick, arg1);
+  reply_rows_omitted(state, nick, omitted, "records");
+  irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
+}
+
+/* ---- admins / opers / match: network-wide activity ----------------------
+ * The command asks the hub for its last-seen / last-used times
+ * (CMD_ACTIVITY_QUERY) and is parked until the answer, or
+ * ACTIVITY_QUERY_TIMEOUT, whichever comes first; the IRC loop keeps running
+ * meanwhile.  The hub's times are max-merged into the local records, so every
+ * row shows max(hub, local); with no hub or no answer, the local times. */
+
+static void activity_render(bot_state_t *state, const char *nick,
+                            actq_kind_t kind, const char *arg) {
+  if (kind == ACTQ_MATCH)
+    list_match(state, nick, arg);
+  else
+    list_users(state, nick, kind == ACTQ_ADMINS ? 'a' : 'o');
+}
+
+/* Ask the hub and park the command.  False when it must be answered now:
+ * no hub, no free slot, or nothing the hub could add. */
+static bool activity_park(bot_state_t *state, const char *nick,
+                          actq_kind_t kind, const char *arg) {
+  if (!state->hub_authenticated || state->hub_fd == -1) return false;
+  activity_query_t *q = NULL;
+  for (int i = 0; i < MAX_ACTIVITY_QUERIES && !q; i++)
+    if (!state->activity_queries[i].active) q = &state->activity_queries[i];
+  if (!q || strlen(nick) >= sizeof(q->nick) ||
+      (arg && strlen(arg) >= sizeof(q->arg)))
+    return false;
+
+  char what[64];
+  if (kind != ACTQ_MATCH) {
+    snprintf(what, sizeof(what), "users");
+  } else if (strcmp(arg, "*") == 0) {
+    snprintf(what, sizeof(what), "masks|*");
+  } else {
+    const user_record_t *u = NULL;
+    for (int i = 0; i < state->user_record_count && !u; i++)
+      if (state->user_records[i].is_active &&
+          strcasecmp(state->user_records[i].name, arg) == 0)
+        u = &state->user_records[i];
+    if (!u) return false; /* a trusted bot, or unknown: local only */
+    snprintf(what, sizeof(what), "masks|%s", u->uuid);
+  }
+
+  unsigned char rnd[8];
+  if (RAND_bytes(rnd, sizeof(rnd)) != 1) return false;
+  char id[ACTIVITY_REQ_ID_MAX + 1];
+  for (size_t i = 0; i < sizeof(rnd); i++)
+    snprintf(id + 2 * i, 3, "%02x", rnd[i]);
+  char payload[128];
+  snprintf(payload, sizeof(payload), "%s|%s", id, what);
+  if (!hub_client_send_activity_query(state, payload)) return false;
+
+  memset(q, 0, sizeof(*q));
+  q->active = true;
+  snprintf(q->id, sizeof(q->id), "%s", id);
+  q->kind = kind;
+  snprintf(q->arg, sizeof(q->arg), "%s", arg ? arg : "");
+  snprintf(q->nick, sizeof(q->nick), "%s", nick);
+  q->dcc = state->dcc_reply;
+  q->dcc_token = q->dcc ? q->dcc->token : 0;
+  q->a2r = state->a2r; /* a ~A2S command's reply key; wiped when answered */
+  q->deadline = time(NULL) + ACTIVITY_QUERY_TIMEOUT;
+  log_message(L_DEBUG, state, "[ACTIVITY] query %s sent (%s)\n", id, what);
+  return true;
+}
+
+static void activity_run(bot_state_t *state, const char *nick,
+                         actq_kind_t kind, const char *arg) {
+  if (!activity_park(state, nick, kind, arg))
+    activity_render(state, nick, kind, arg);
+}
+
+/* Answer a parked command in the context it arrived in, then wipe it.  A
+ * command from a DCC chat that has closed since is dropped. */
+static void activity_finish(bot_state_t *state, activity_query_t *q) {
+  bool dcc_gone = q->dcc && (q->dcc->phase != DCC_OPEN ||
+                             q->dcc->token != q->dcc_token);
+  if (!dcc_gone) {
+    a2r_ctx_t saved_a2r = state->a2r;
+    dcc_session_t *saved_dcc = state->dcc_reply;
+    state->a2r = q->a2r;
+    state->dcc_reply = q->dcc;
+    activity_render(state, q->nick, q->kind, q->arg);
+    state->a2r = saved_a2r;
+    state->dcc_reply = saved_dcc;
+    secure_wipe(&saved_a2r, sizeof(saved_a2r));
+  }
+  secure_wipe(q, sizeof(*q));
+}
+
+/* Max-merge one hub-reported time into a local one (in memory only: the
+ * next config flush persists it along with anything else). */
+static void activity_merge(time_t *slot, const char *ts_s, time_t now) {
+  char *end = NULL;
+  long long ts = strtoll(ts_s, &end, 10);
+  if (!end || *end != '\0' || ts <= 0 || ts > (long long)now + ACTIVITY_MAX_FUTURE)
+    return;
+  if ((time_t)ts > *slot) *slot = (time_t)ts;
+}
+
+/* CMD_ACTIVITY_REPLY: "<req_id>|<more>" then a|uuid|ts / m|uuid|mask|ts. */
+void commands_activity_reply(bot_state_t *state, char *payload) {
+  char *save = NULL;
+  char *hdr = strtok_r(payload, "\n", &save);
+  char *bar = hdr ? strchr(hdr, '|') : NULL;
+  if (!bar) return;
+  *bar = '\0';
+  bool more = strcmp(bar + 1, "0") != 0;
+  activity_query_t *q = NULL;
+  for (int i = 0; i < MAX_ACTIVITY_QUERIES && !q; i++)
+    if (state->activity_queries[i].active &&
+        strcmp(state->activity_queries[i].id, hdr) == 0)
+      q = &state->activity_queries[i];
+  if (!q) return; /* timed out already, or not ours */
+
+  time_t now = time(NULL);
+  for (char *line = strtok_r(NULL, "\n", &save); line;
+       line = strtok_r(NULL, "\n", &save)) {
+    /* uuid is field 1; the time is always the last field, so a mask may
+     * hold a '|' of its own. */
+    char *f1 = strchr(line, '|');
+    char *last = strrchr(line, '|');
+    if (!f1 || line[1] != '|' || last == f1 || last - f1 - 1 < 36) continue;
+    char uuid[37];
+    memcpy(uuid, f1 + 1, 36);
+    uuid[36] = '\0';
+    if (line[0] == 'a' && last == f1 + 37) {
+      for (int i = 0; i < state->user_record_count; i++)
+        if (strcmp(state->user_records[i].uuid, uuid) == 0)
+          activity_merge(&state->user_records[i].last_seen, last + 1, now);
+    } else if (line[0] == 'm' && f1[37] == '|' && last > f1 + 38) {
+      *last = '\0';
+      const char *mask = f1 + 38;
+      for (int i = 0; i < state->mask_record_count; i++)
+        if (strcmp(state->mask_records[i].uuid, uuid) == 0 &&
+            strcasecmp(state->mask_records[i].mask, mask) == 0)
+          activity_merge(&state->mask_records[i].last_used, last + 1, now);
+    }
+  }
+  if (!more) activity_finish(state, q);
+}
+
+/* Answer, from local times, every parked command the hub did not. */
+void commands_activity_tick(bot_state_t *state, time_t now) {
+  for (int i = 0; i < MAX_ACTIVITY_QUERIES; i++) {
+    activity_query_t *q = &state->activity_queries[i];
+    if (!q->active || now < q->deadline) continue;
+    log_message(L_DEBUG, state, "[ACTIVITY] query %s: no hub answer, "
+                                "showing local times\n", q->id);
+    activity_finish(state, q);
   }
 }
 
@@ -1596,188 +1900,15 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       irc_printf(state, "PRIVMSG %s :--- End of Log (%s) --- \r\n", nick, arg1);
     } else if (strcasecmp(command, "admins") == 0) {
-      struct timespec delay = {0, 100000000};
-      /* Find max name width for alignment (min 8) */
-      int name_w = 8;
-      for (int i = 0; i < state->user_record_count; i++) {
-        if (state->user_records[i].type != 'a') continue;
-        int nl = (int)strlen(state->user_records[i].name);
-        if (nl > name_w) name_w = nl;
-      }
-      irc_printf(state, "PRIVMSG %s :| ircbot %s admins\r\n", nick, BOT_VERSION);
-      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-      int shown = 0, omitted = 0;
-      const int cap = reply_row_cap(state);
-      for (int i = 0; i < state->user_record_count; i++) {
-        user_record_t *u = &state->user_records[i];
-        if (u->type != 'a') continue;
-        if (shown >= cap) { omitted++; continue; }
-        char ts_buf[48];
-        if (u->last_seen == 0) {
-          snprintf(ts_buf, sizeof(ts_buf), "never");
-        } else {
-          struct tm *tm = gmtime(&u->last_seen);
-          if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
-          else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
-        }
-        char del_tag[16] = "";
-        if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
-        char kfp[KEY_FP_LEN + 1];
-        user_key_fp(u, kfp);
-        irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
-                   nick, name_w, u->name, kfp, ts_buf, del_tag);
-        shown++;
-        reply_pace(state, &delay);
-      }
-      if (shown == 0)
-        irc_printf(state, "PRIVMSG %s :| (no admins)\r\n", nick);
-      reply_rows_omitted(state, nick, omitted, "admins");
-      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
-
+      activity_run(state, nick, ACTQ_ADMINS, NULL);
     } else if (strcasecmp(command, "opers") == 0) {
-      struct timespec delay = {0, 100000000};
-      int name_w = 8;
-      for (int i = 0; i < state->user_record_count; i++) {
-        if (state->user_records[i].type != 'o') continue;
-        int nl = (int)strlen(state->user_records[i].name);
-        if (nl > name_w) name_w = nl;
-      }
-      irc_printf(state, "PRIVMSG %s :| ircbot %s opers\r\n", nick, BOT_VERSION);
-      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-      int shown = 0, omitted = 0;
-      const int cap = reply_row_cap(state);
-      for (int i = 0; i < state->user_record_count; i++) {
-        user_record_t *u = &state->user_records[i];
-        if (u->type != 'o') continue;
-        if (shown >= cap) { omitted++; continue; }
-        char ts_buf[48];
-        if (u->last_seen == 0) {
-          snprintf(ts_buf, sizeof(ts_buf), "never");
-        } else {
-          struct tm *tm = gmtime(&u->last_seen);
-          if (tm) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm);
-          else    snprintf(ts_buf, sizeof(ts_buf), "invalid");
-        }
-        char del_tag[16] = "";
-        if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
-        char kfp[KEY_FP_LEN + 1];
-        user_key_fp(u, kfp);
-        irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
-                   nick, name_w, u->name, kfp, ts_buf, del_tag);
-        shown++;
-        reply_pace(state, &delay);
-      }
-      if (shown == 0)
-        irc_printf(state, "PRIVMSG %s :| (no opers)\r\n", nick);
-      reply_rows_omitted(state, nick, omitted, "opers");
-      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
-
+      activity_run(state, nick, ACTQ_OPERS, NULL);
     } else if (strcasecmp(command, "match") == 0) {
-      /* Show active records for named user or * for all */
       if (!arg1) {
         irc_printf(state, "PRIVMSG %s :Syntax: match <name|*>\r\n", nick);
         return;
       }
-      bool match_all = (strcmp(arg1, "*") == 0);
-      irc_printf(state, "PRIVMSG %s :| ircbot %s match%s\r\n", nick, BOT_VERSION,
-                 match_all ? " *" : "");
-      irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-      struct timespec delay = {0, 100000000};
-      /* shown counts printed rows (a user line and each of its masks); once
-       * the cap is reached the rest are only counted, for the closing note. */
-      int shown = 0, omitted = 0;
-      const int cap = reply_row_cap(state);
-      for (int i = 0; i < state->user_record_count; i++) {
-        user_record_t *u = &state->user_records[i];
-        if (!match_all && strcasecmp(u->name, arg1) != 0) continue;
-        if (!u->is_active) continue;
-        if (shown >= cap) {
-          omitted++;
-          for (int j = 0; j < state->mask_record_count; j++)
-            if (state->mask_records[j].is_active &&
-                strcmp(state->mask_records[j].uuid, u->uuid) == 0)
-              omitted++;
-          continue;
-        }
-        char ts_buf[48];
-        if (u->last_seen == 0) {
-          snprintf(ts_buf, sizeof(ts_buf), "never");
-        } else {
-          struct tm *tm_utc = gmtime(&u->last_seen);
-          if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
-          else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
-        }
-        char kfp[KEY_FP_LEN + 1];
-        user_key_fp(u, kfp);
-        irc_printf(state, "PRIVMSG %s :| [%c] %-20s  key %s  (last seen: %s)\r\n",
-                   nick, u->type, u->name, kfp, ts_buf);
-        reply_pace(state, &delay);
-        shown++;
-        for (int j = 0; j < state->mask_record_count; j++) {
-          mask_record_t *m = &state->mask_records[j];
-          if (strcmp(m->uuid, u->uuid) != 0) continue;
-          if (!m->is_active) continue;
-          if (shown >= cap) { omitted++; continue; }
-          char used_buf[48];
-          if (m->last_used == 0) {
-            snprintf(used_buf, sizeof(used_buf), "never");
-          } else {
-            struct tm *tm_used = gmtime(&m->last_used);
-            if (tm_used) strftime(used_buf, sizeof(used_buf), "%Y-%m-%d %H:%M:%S UTC", tm_used);
-            else         snprintf(used_buf, sizeof(used_buf), "invalid");
-          }
-          irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
-                     nick, m->mask, used_buf);
-          reply_pace(state, &delay);
-          shown++;
-        }
-      }
-      /* If no user record found and not wildcard, check trusted bots */
-      if (shown == 0 && !match_all) {
-        for (int i = 0; i < state->trusted_bot_count; i++) {
-          const trusted_bot_t *tb = &state->trusted_bots[i];
-          const char *bot_mask = tb->mask, *bot_uuid = tb->uuid;
-          long long bot_ts = (long long)tb->ts;
-          char bot_nick[MAX_NICK];
-          auth_trusted_bot_nick(tb, bot_nick);
-          if (strcasecmp(bot_nick, arg1) != 0) continue;
-          /* Found a matching bot */
-          char ts_buf[48];
-          if (bot_ts == 0) {
-            snprintf(ts_buf, sizeof(ts_buf), "never");
-          } else {
-            time_t bts = (time_t)bot_ts;
-            struct tm *tm_utc = gmtime(&bts);
-            if (tm_utc) strftime(ts_buf, sizeof(ts_buf), "%Y-%m-%d %H:%M:%S UTC", tm_utc);
-            else        snprintf(ts_buf, sizeof(ts_buf), "invalid");
-          }
-          irc_printf(state, "PRIVMSG %s :| [b] %-20s  (last seen: %s)\r\n",
-                     nick, bot_nick, ts_buf);
-          reply_pace(state, &delay);
-          if (bot_mask[0])
-            irc_printf(state, "PRIVMSG %s :|   mask: %s\r\n", nick, bot_mask);
-          if (bot_uuid[0])
-            irc_printf(state, "PRIVMSG %s :|   uuid: %s\r\n", nick, bot_uuid);
-          if (tb->has_pub) {
-            char bfp[KEY_FP_LEN + 1];
-            crypto_key_fingerprint(tb->pub, bfp);
-            irc_printf(state, "PRIVMSG %s :|   key : %s\r\n", nick, bfp);
-          } else {
-            irc_printf(state, "PRIVMSG %s :|   key : (none on file)\r\n", nick);
-          }
-          const char *hub_str = (state->hub_connected && state->current_hub[0])
-                                ? state->current_hub : "none";
-          irc_printf(state, "PRIVMSG %s :|   hub : %s\r\n", nick, hub_str);
-          shown++;
-          reply_pace(state, &delay);
-          break;
-        }
-      }
-      if (shown == 0 && !match_all)
-        irc_printf(state, "PRIVMSG %s :| unknown user: %s\r\n", nick, arg1);
-      reply_rows_omitted(state, nick, omitted, "records");
-      irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
-
+      activity_run(state, nick, ACTQ_MATCH, arg1);
     } else if (strcasecmp(command, "+admin") == 0 ||
                strcasecmp(command, "+oper") == 0) {
       /* +admin|+oper <name> <pubkey> <nick!user@host>.  The user makes their
