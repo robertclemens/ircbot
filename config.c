@@ -137,6 +137,11 @@ static void gen_uuid_v4(char out[37]) {
            r[11], r[12], r[13], r[14], r[15]);
 }
 
+/* Set by -selftest: load and validate, never rewrite.  A staged build is
+ * checked against the live config before it is installed, and must not
+ * migrate that config out from under the build that is still running. */
+bool g_config_readonly = false;
+
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {
   int legacy_user_lines = 0;  // records that still carried a password
@@ -802,8 +807,9 @@ bool config_load(bot_state_t *state, const char *password,
                 "keys now.\n");
 
   /* Rewrite once if anything above changed the on-disk shape. */
-  if (needs_migration || migrated_from_legacy || legacy_user_lines > 0 ||
-      dropped_botpass || identity_minted)
+  if ((needs_migration || migrated_from_legacy || legacy_user_lines > 0 ||
+       dropped_botpass || identity_minted) &&
+      !g_config_readonly)
     config_write(state, password);
 
   // Validation changed

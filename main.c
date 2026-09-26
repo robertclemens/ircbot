@@ -747,6 +747,38 @@ static void run_config_wizard(void) {
   state_destroy(&state);
 }
 
+static int run_selftest(void) {
+  if (access(CONFIG_FILE, R_OK) != 0) {
+    printf("selftest: FAIL no readable %s\n", CONFIG_FILE);
+    return 1;
+  }
+  char pw[MAX_PASS];
+  memset(pw, 0, sizeof(pw));
+  if (!passfile_load(PASS_FILE, pw, sizeof(pw))) {
+    printf("selftest: FAIL cannot read %s\n", PASS_FILE);
+    return 1;
+  }
+  bot_state_t *st = calloc(1, sizeof(*st));
+  if (!st) {
+    OPENSSL_cleanse(pw, sizeof(pw));
+    printf("selftest: FAIL out of memory\n");
+    return 1;
+  }
+  state_init(st);
+  g_config_readonly = true;
+  bool ok = config_load(st, pw, CONFIG_FILE);
+  OPENSSL_cleanse(pw, sizeof(pw));
+  state_destroy(st);
+  OPENSSL_cleanse(st, sizeof(*st));
+  free(st);
+  if (!ok) {
+    printf("selftest: FAIL cannot load %s\n", CONFIG_FILE);
+    return 1;
+  }
+  printf("selftest: OK ircbot %s %s\n", BOT_VERSION, updater_host_variant());
+  return 0;
+}
+
 int main(int argc, char *argv[]) {
   harden_process();
 #ifdef HAVE_CURL
@@ -762,6 +794,10 @@ int main(int argc, char *argv[]) {
      * config, no password and no PID lock. */
     if (strcmp(argv[i], "-checkupdate") == 0)
       return updater_check_cli(i + 1 < argc ? argv[i + 1] : NULL);
+    /* -selftest: could this binary run here, on this config?  No daemon, no
+     * PID lock, no network, no config rewrite — run on a STAGED build by the
+     * hub-driven updater before anything is swapped. */
+    if (strcmp(argv[i], "-selftest") == 0) return run_selftest();
   }
 
   if (do_setup) {
@@ -880,6 +916,7 @@ int main(int argc, char *argv[]) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
     commands_activity_tick(&state, time(NULL));
+    hub_client_upgrade_report_tick(&state);
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin

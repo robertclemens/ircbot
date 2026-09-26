@@ -372,15 +372,81 @@ void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
  * was aiming at.  The hub also infers success from the presence frame, so a
  * lost RESULT costs nothing. */
 void hub_client_report_upgrade_result(bot_state_t *state) {
-  char id[64], want[64];
-  if (!updater_take_pending_upgrade(id, sizeof(id), want, sizeof(want))) return;
-  bool ok = (updater_version_cmp(BOT_VERSION, want) == 0);
+  char id[64], want[64], want_variant[16], ops[UPGRADE_OPS_MAX];
+  if (!updater_take_pending_upgrade(id, sizeof(id), want, sizeof(want),
+                                    want_variant, sizeof(want_variant), ops,
+                                    sizeof(ops)))
+    return;
+  bool ok = updater_version_cmp(BOT_VERSION, want) == 0 &&
+            (!want_variant[0] ||
+             strcmp(want_variant, updater_host_variant()) == 0);
   snprintf(state->upgrade_installed_id, sizeof(state->upgrade_installed_id),
            "%s", id);
-  log_message(L_INFO, state, "[UPGRADE] Restarted after %s: running %s (wanted %s)\n",
-              id, BOT_VERSION, want);
-  hub_client_send_upgrade_result(state, id, ok ? "ok" : "version-mismatch",
-                                 ok ? "" : want);
+  char wanted[96];
+  snprintf(wanted, sizeof(wanted), "%s%s%s", want, want_variant[0] ? "/" : "",
+           want_variant);
+  log_message(L_INFO, state,
+              "[UPGRADE] Restarted after %s: running %s/%s (wanted %s)\n", id,
+              BOT_VERSION, updater_host_variant(), wanted);
+  if (!ok) {
+    char detail[112];
+    snprintf(detail, sizeof(detail), "wanted %s", wanted);
+    hub_client_send_upgrade_result(state, id, "version-mismatch", detail);
+    return;
+  }
+  /* On the right build — but not "done" until back where it was: on IRC and
+   * re-opped in every channel it held ops in before (the marker's ops line).
+   * The hub refills its wave only on done, so reporting now would let the
+   * next bot leave a channel before this one holds ops in it again. */
+  snprintf(state->upgrade_report_id, sizeof(state->upgrade_report_id), "%s", id);
+  snprintf(state->upgrade_report_ops, sizeof(state->upgrade_report_ops), "%s", ops);
+  state->upgrade_report_since = time(NULL);
+  log_message(L_INFO, state, "[UPGRADE] Reporting done once back%s%s\n",
+              ops[0] ? " and re-opped in " : " on IRC", ops);
+  hub_client_upgrade_report_tick(state);
+}
+
+/* The channels of `ops` (space-separated) this bot is not yet back in with
+ * ops, written to `missing`; true when there are none.  Channels come and go
+ * from the config between runs, so one no longer configured is not waited
+ * for — it can never be joined. */
+static bool upgrade_ops_back(const bot_state_t *state, const char *ops,
+                             char *missing, size_t missing_size) {
+  missing[0] = '\0';
+  char work[UPGRADE_OPS_MAX];
+  snprintf(work, sizeof(work), "%s", ops);
+  char *save = NULL;
+  for (char *ch = strtok_r(work, " ", &save); ch; ch = strtok_r(NULL, " ", &save)) {
+    const chan_t *c = state->chanlist;
+    while (c && strcasecmp(c->name, ch) != 0) c = c->next;
+    if (!c) continue;
+    if (c->status == C_IN && c->i_am_opped) continue;
+    size_t ml = strlen(missing);
+    snprintf(missing + ml, missing_size - ml, "%s%s", ml ? " " : "", ch);
+  }
+  return missing[0] == '\0';
+}
+
+void hub_client_upgrade_report_tick(bot_state_t *state) {
+  if (!state->upgrade_report_id[0] || !state->hub_authenticated) return;
+  bool on_irc = (state->status & S_AUTHED) != 0;
+  char missing[UPGRADE_OPS_MAX];
+  bool back = on_irc && upgrade_ops_back(state, state->upgrade_report_ops,
+                                         missing, sizeof(missing));
+  bool expired = time(NULL) - state->upgrade_report_since >= UPGRADE_OPS_WAIT;
+  if (!back && !expired) return;
+  char detail[UPGRADE_OPS_MAX + 64] = "";
+  if (!back) {
+    if (!on_irc)
+      snprintf(detail, sizeof(detail), "back; IRC not reconnected");
+    else
+      snprintf(detail, sizeof(detail), "back; not re-opped in %s", missing);
+  }
+  log_message(L_INFO, state, "[UPGRADE] Reporting %s done%s%s\n",
+              state->upgrade_report_id, detail[0] ? ": " : "", detail);
+  hub_client_send_upgrade_result(state, state->upgrade_report_id, "ok", detail);
+  state->upgrade_report_id[0] = '\0';
+  state->upgrade_report_ops[0] = '\0';
 }
 
 /* id|target_ver|variant|kind|min_from|manifest_base — the hub is asking
@@ -502,29 +568,12 @@ static void hub_client_handle_upgrade_prepare(bot_state_t *state,
    * hubs' own target and base after it, and those are not the bot's. */
   wire_field(payload, 5, base, sizeof(base));
 
-  const char *reason = "";
-  bool ready = true;
-  if (updater_version_cmp(ver, BOT_VERSION) == 0) {
-    ready = false;
-    reason = "already running the target version";
-  } else if (updater_version_cmp(ver, BOT_VERSION) < 0) {
-    ready = false;
-    reason = "target is older than the running version";
-  } else if (min_from[0] && strcmp(min_from, "*") != 0 &&
-             updater_version_cmp(BOT_VERSION, min_from) < 0) {
-    /* The hub walks the intermediate releases when it sees this. */
-    ready = false;
-    reason = "running version is below the target's min_from";
-  } else if (access(PASS_FILE, R_OK) != 0) {
-    /* Without the machine-bound password file the replacement binary would
-     * stop at a password prompt with nobody to answer it. */
-    ready = false;
-    reason = "no " PASS_FILE "; cannot restart unattended";
-  } else if (state->executable_path[0] != '/') {
-    ready = false;
-    reason = "executable path is not absolute";
-  }
-
+  /* Everything COMMIT will need is checked now — including the signed
+   * manifest for the wanted build — so a "ready" answer is one COMMIT can
+   * keep. */
+  char reason[320];
+  bool ready = updater_hub_prepare_check(state, ver, variant, min_from, base,
+                                         reason, sizeof(reason));
   if (ready) {
     /* Remember the plan: COMMIT repeats only the id and the version. */
     snprintf(state->upgrade_id, sizeof(state->upgrade_id), "%s", id);
@@ -549,19 +598,26 @@ static void hub_client_handle_upgrade_commit(bot_state_t *state,
     return;
   }
   wire_field(payload, 2, variant, sizeof(variant));
+  /* Every refusal here touched nothing, so it is answered "skip": this bot
+   * stays healthy on its build and the driver takes it out of the run
+   * instead of aborting everyone else's upgrade. */
   if (!state->upgrade_id[0] || strcmp(state->upgrade_id, id) != 0) {
-    hub_client_send_upgrade_result(state, id, "fail",
-                                   "no matching UPGRADE_PREPARE");
+    /* No run state (restarted since PREPARE?).  Already on that build means
+     * the COMMIT's work is done. */
+    bool there = updater_version_cmp(BOT_VERSION, ver) == 0 &&
+                 (!variant[0] || strcmp(variant, updater_host_variant()) == 0);
+    hub_client_send_upgrade_result(state, id, there ? "ok" : "skip",
+                                   there ? "" : "no matching UPGRADE_PREPARE");
     return;
   }
   if (strcmp(state->upgrade_target, ver) != 0) {
-    hub_client_send_upgrade_result(state, id, "fail",
+    hub_client_send_upgrade_result(state, id, "skip",
                                    "commit version differs from prepare");
     return;
   }
   if (time(NULL) - state->upgrade_prepared > UPGRADE_PREPARE_TTL) {
     state->upgrade_id[0] = '\0';
-    hub_client_send_upgrade_result(state, id, "fail", "prepare expired");
+    hub_client_send_upgrade_result(state, id, "skip", "prepare expired");
     return;
   }
 
@@ -572,7 +628,17 @@ static void hub_client_handle_upgrade_commit(bot_state_t *state,
     /* Nothing was changed on disk; stay on this build and say why. */
     log_message(L_INFO, state, "[UPGRADE] Commit %s refused: %s\n", id,
                 err ? err : "unknown error");
-    hub_client_send_upgrade_result(state, id, "fail", err ? err : "failed");
+    /* A bad RELEASE (tampered, corrupt, the wrong product) is still "fail"
+     * although nothing here changed: every node would hit the same artifact
+     * and the run must stop.  Anything else is this bot's own refusal. */
+    static const char *const marks[] = {
+        "SHA-256 mismatch", "signature INVALID", "is not a ircbot release",
+        "untrusted artifact URL"};
+    bool integrity = false;
+    for (size_t i = 0; err && i < sizeof(marks) / sizeof(marks[0]); i++)
+      if (strstr(err, marks[i])) integrity = true;
+    hub_client_send_upgrade_result(state, id, integrity ? "fail" : "skip",
+                                   err ? err : "failed");
     state->upgrade_id[0] = '\0';
   }
   /* On success updater_hub_commit() does not return: the process is replaced

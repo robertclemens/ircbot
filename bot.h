@@ -21,7 +21,7 @@
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.4.4"
+#define BOT_VERSION "2.4.5"
 #endif
 
 // Only edit this section
@@ -46,6 +46,27 @@
 /* How long a CMD_UPGRADE_PREPARE stays commitable.  A hub that stalls
  * mid-roll has to ask again rather than commit against a stale plan. */
 #define UPGRADE_PREPARE_TTL 900
+/* Updater transfer budgets (seconds).  A manifest read answered from the
+ * event loop (a PREPARE check) gets the short one: the bot serves neither IRC
+ * nor its hub link while curl blocks.  COMMIT's download gets the long one,
+ * which still bounds it — an unbounded transfer would wedge the bot. */
+#define UPGRADE_QUICK_TIMEOUT 8L
+#define UPDATE_FETCH_TIMEOUT 300L
+/* The upgrade script's startup watchdog: how long the new build's daemon has
+ * to be up before the script keeps it (mirrors irchub). */
+#define UPGRADE_WATCH_SECS 20
+/* After an upgrade restart the bot holds its "ok" RESULT until it is back on
+ * IRC and re-opped in every channel it was opped in before (the marker's ops
+ * line), or this many seconds have passed — the hub refills its wave only
+ * when a bot is done, so no channel loses its ops to a fast rolling run. */
+#define UPGRADE_OPS_WAIT 180
+/* The staged new binary's -selftest must finish within this many seconds. */
+#define UPGRADE_SELFTEST_SECS 15
+/* The first ircbot release that knows -selftest: an older target would take
+ * the flag for a normal start, so its staged binary is never run. */
+#define UPGRADE_SELFTEST_MIN "2.4.5"
+/* Marker ops line capacity: channel names, space-separated. */
+#define UPGRADE_OPS_MAX 1024
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
 #define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
@@ -818,6 +839,11 @@ struct bot_state {
    * only for this run — .prev otherwise holds the build from before some
    * earlier, completed run, and a bot that refused a COMMIT never moved. */
   char   upgrade_installed_id[64];
+  /* The "ok" RESULT this restarted build owes its hub, held until it is back
+   * where it was (see UPGRADE_OPS_WAIT): "" = nothing owed. */
+  char   upgrade_report_id[64];
+  char   upgrade_report_ops[UPGRADE_OPS_MAX];
+  time_t upgrade_report_since;
 };
 
 // ... [Function Prototypes same as before] ...
@@ -914,10 +940,23 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / <config>.prev and restart onto
  * them.  Returns false when there is nothing retained to go back to. */
 bool updater_hub_rollback(bot_state_t *state, const char *reason);
-bool upgrade_marker_write(const char *upgrade_id, const char *target_ver);
-/* Reads and removes the hand-off marker left by updater_hub_commit(). */
+/* CMD_UPGRADE_PREPARE: could this bot take target_ver as `variant`?  Checks
+ * everything COMMIT will need short of the download (signed manifest, host
+ * artifact, min_from, unattended restart).  False with `reason` filled in. */
+bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
+                               const char *variant, const char *min_from,
+                               const char *base, char *reason,
+                               size_t reason_size);
+bool upgrade_marker_write(const char *upgrade_id, const char *target_ver,
+                          const char *variant, const char *ops);
+/* Reads and removes the hand-off marker left by updater_hub_commit():
+ * id|version|variant ("" variant from an older build's two-field marker). */
 bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
-                                  size_t ver_size);
+                                  size_t ver_size, char *variant_out,
+                                  size_t variant_size, char *ops_out,
+                                  size_t ops_size);
+/* config_load() never rewrites the config while this is set (-selftest). */
+extern bool g_config_readonly;
 /* Compare two version strings, tolerating a leading 'v' on either side. */
 int updater_version_cmp(const char *a, const char *b);
 /* Host capability probe answered in CMD_UPGRADE_READY. */
@@ -1023,6 +1062,9 @@ void hub_client_disconnect(bot_state_t *state);
 void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
                                     const char *status, const char *detail);
 void hub_client_report_upgrade_result(bot_state_t *state);
+/* Main-loop tick: send the held "ok" RESULT once this bot is back and
+ * re-opped where it was, or UPGRADE_OPS_WAIT has passed. */
+void hub_client_upgrade_report_tick(bot_state_t *state);
 void hub_client_send_activity(bot_state_t *state);
 bool hub_client_send_activity_query(bot_state_t *state, const char *payload);
 void commands_activity_reply(bot_state_t *state, char *payload);

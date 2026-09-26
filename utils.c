@@ -15,6 +15,9 @@
 #include <strings.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
+#include <sys/wait.h>
+#include <signal.h>
+#include <time.h>
 #include <fcntl.h>
 #include <unistd.h>
 
@@ -152,13 +155,21 @@ static bool version_eq(const char *a, const char *b) {
  * the version we were aiming at are left in a file for the new binary to
  * find.  It is read exactly once, on the first authenticated hub link after
  * the restart, and removed there — see hub_client_report_upgrade_result(). */
-bool upgrade_marker_write(const char *upgrade_id, const char *target_ver) {
-  if (!upgrade_id || !target_ver) return false;
+bool upgrade_marker_write(const char *upgrade_id, const char *target_ver,
+                          const char *variant, const char *ops) {
+  if (!upgrade_id || !target_ver || !variant || !ops) return false;
   int fd = open(UPGRADE_MARKER_FILE, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC,
                 0600);
   if (fd < 0) return false;
-  char line[256];
-  int n = snprintf(line, sizeof(line), "%s|%s\n", upgrade_id, target_ver);
+  char line[256 + UPGRADE_OPS_MAX];
+  /* Line 1: id|version|variant.  The variant is what makes a C<->Rust switch
+   * at the same version checkable: without it the old build, restored by the
+   * script's watchdog, would read the marker and report "ok".
+   * Line 2: "ops #a #b" — the channels this bot is opped in now; the new
+   * build reports done only once it is re-opped in each.  Older builds read
+   * line 1 only. */
+  int n = snprintf(line, sizeof(line), "%s|%s|%s\nops%s%s\n", upgrade_id,
+                   target_ver, variant, ops[0] ? " " : "", ops);
   bool ok = (n > 0 && n < (int)sizeof(line) && write(fd, line, (size_t)n) == n);
   if (close(fd) != 0) ok = false;
   if (!ok) remove(UPGRADE_MARKER_FILE);
@@ -168,25 +179,44 @@ bool upgrade_marker_write(const char *upgrade_id, const char *target_ver) {
 /* Read and consume the marker.  Returns false when no upgrade is pending,
  * which is the normal case for every ordinary start. */
 bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
-                                  size_t ver_size) {
-  if (!id_out || !ver_out || id_size == 0 || ver_size == 0) return false;
-  id_out[0] = ver_out[0] = '\0';
+                                  size_t ver_size, char *variant_out,
+                                  size_t variant_size, char *ops_out,
+                                  size_t ops_size) {
+  if (!id_out || !ver_out || !variant_out || !ops_out || id_size == 0 ||
+      ver_size == 0 || variant_size == 0 || ops_size == 0)
+    return false;
+  id_out[0] = ver_out[0] = variant_out[0] = ops_out[0] = '\0';
 
   FILE *f = fopen(UPGRADE_MARKER_FILE, "r");
   if (!f) return false;
   char line[256] = "";
+  char ops_line[UPGRADE_OPS_MAX + 8] = "";
   bool got = (fgets(line, sizeof(line), f) != NULL);
+  if (got && fgets(ops_line, sizeof(ops_line), f) &&
+      strncmp(ops_line, "ops", 3) == 0 &&
+      (ops_line[3] == ' ' || ops_line[3] == '\r' || ops_line[3] == '\n' ||
+       ops_line[3] == '\0')) {
+    /* "ops" alone (nothing opped) or "ops #a #b"; the Rust twin writes the
+     * same, so a C<->Rust switch reads either. */
+    ops_line[strcspn(ops_line, "\r\n")] = '\0';
+    const char *p = ops_line + 3;
+    while (*p == ' ') p++;
+    snprintf(ops_out, ops_size, "%s", p);
+  }
   fclose(f);
   /* Consumed whatever it said: a marker we cannot parse must not be retried
    * on every reconnect for the rest of this process's life. */
   remove(UPGRADE_MARKER_FILE);
   if (!got) return false;
 
-  char id[64] = "", ver[64] = "";
-  if (sscanf(line, "%63[^|\r\n]|%63[^\r\n]", id, ver) != 2) return false;
+  char id[64] = "", ver[64] = "", variant[16] = "";
+  if (sscanf(line, "%63[^|\r\n]|%63[^|\r\n]|%15[^|\r\n]", id, ver,
+             variant) < 2)
+    return false;
   if (!id[0] || !ver[0]) return false;
   snprintf(id_out, id_size, "%s", id);
   snprintf(ver_out, ver_size, "%s", ver);
+  snprintf(variant_out, variant_size, "%s", variant);
   return true;
 }
 
@@ -305,6 +335,16 @@ static size_t write_file_callback(void *ptr, size_t size, size_t nmemb,
   return fwrite(ptr, size, nmemb, stream);
 }
 
+/* Set around a manifest read made from the event loop (see
+ * UPGRADE_QUICK_TIMEOUT); 0 = the full budget. */
+static long g_fetch_quick = 0;
+
+static void updater_set_timeouts(CURL *h) {
+  curl_easy_setopt(h, CURLOPT_CONNECTTIMEOUT, g_fetch_quick ? 5L : 30L);
+  curl_easy_setopt(h, CURLOPT_TIMEOUT,
+                   g_fetch_quick ? g_fetch_quick : UPDATE_FETCH_TIMEOUT);
+}
+
 static bool fetch_url(const char *url, http_response_t *response) {
   CURL *curl_handle = curl_easy_init();
   if (!curl_handle) return false;
@@ -328,6 +368,7 @@ static bool fetch_url(const char *url, http_response_t *response) {
   curl_easy_setopt(curl_handle, CURLOPT_FAILONERROR, 1L);
   UPDATER_SET_PROTOCOLS(curl_handle);
   updater_set_ca(curl_handle);
+  updater_set_timeouts(curl_handle);
 
   CURLcode res = curl_easy_perform(curl_handle);
   curl_easy_cleanup(curl_handle);
@@ -361,7 +402,7 @@ static bool download_file(const char *url, const char *outfile) {
   curl_easy_setopt(curl, CURLOPT_FAILONERROR, 1L);
   UPDATER_SET_PROTOCOLS(curl);
   updater_set_ca(curl);
-
+  updater_set_timeouts(curl);
 
   CURLcode res = curl_easy_perform(curl);
   curl_easy_cleanup(curl);
@@ -1013,7 +1054,74 @@ typedef struct {
   char arch[32];    /* x86_64 | any           */
   char libc[16];    /* gnu | musl | any       */
   char min_from[64];/* oldest version this may upgrade FROM; '*' = any */
+  char cpu[256];    /* CPU features it needs, "-" = none (column 10)    */
 } manifest_row_t;
+
+/* The variant whose tree manifest_select() is reading, for its reasons. */
+static const char *g_select_variant = NULL;
+
+/* Is CPU feature `f` present, per /proc/cpuinfo ("flags" on x86_64,
+ * "Features" on aarch64; "neon" is that file's "asimd")?  A host whose
+ * cpuinfo cannot be read is not refused here: the staged -selftest and the
+ * upgrade script's watchdog still stand between it and a build it cannot
+ * run. */
+static bool host_cpu_has(const char *f) {
+  static char flags[8192];
+  static bool loaded = false;
+  if (!loaded) {
+    loaded = true;
+    FILE *fp = fopen("/proc/cpuinfo", "r");
+    if (fp) {
+      char line[8192];
+      while (fgets(line, sizeof(line), fp)) {
+        if (strncmp(line, "flags", 5) != 0 && strncmp(line, "Features", 8) != 0)
+          continue;
+        const char *colon = strchr(line, ':');
+        if (!colon) continue;
+        snprintf(flags, sizeof(flags), " %s", colon + 1);
+        flags[strcspn(flags, "\r\n")] = '\0';
+        size_t fl = strlen(flags);
+        if (fl + 1 < sizeof(flags)) {
+          flags[fl] = ' ';
+          flags[fl + 1] = '\0';
+        }
+        break;
+      }
+      fclose(fp);
+    }
+  }
+  if (!flags[0]) return true;
+  if (strcmp(f, "neon") == 0) f = "asimd";
+  char needle[80];
+  snprintf(needle, sizeof(needle), " %s ", f);
+  return strstr(flags, needle) != NULL;
+}
+
+/* The first CPU feature a row's column 10 names that this host lacks, or
+ * NULL.  Entries are comma-separated; "arch:feature" applies only on that
+ * arch. */
+static const char *row_cpu_missing(const manifest_row_t *r) {
+  static char miss[64];
+  if (!r->cpu[0] || strcmp(r->cpu, "-") == 0) return NULL;
+  char arch[32];
+  updater_host_arch(arch, sizeof(arch));
+  char work[256];
+  snprintf(work, sizeof(work), "%s", r->cpu);
+  char *save = NULL;
+  for (char *e = strtok_r(work, ",", &save); e; e = strtok_r(NULL, ",", &save)) {
+    const char *feat = e;
+    char *colon = strchr(e, ':');
+    if (colon) {
+      *colon = '\0';
+      if (strcasecmp(e, arch) != 0) continue;
+      feat = colon + 1;
+    }
+    if (!feat[0] || host_cpu_has(feat)) continue;
+    snprintf(miss, sizeof(miss), "%s", feat);
+    return miss;
+  }
+  return NULL;
+}
 
 /* Does this row's {arch,libc} fit the running host?  "any" fits everything,
  * which is what source tarballs and older manifests carry. */
@@ -1073,9 +1181,10 @@ static bool manifest_select(char *manifest, const char *version,
     snprintf(row.arch, sizeof(row.arch), "any");
     snprintf(row.libc, sizeof(row.libc), "any");
     snprintf(row.min_from, sizeof(row.min_from), "*");
-    int n = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s",
+    snprintf(row.cpu, sizeof(row.cpu), "-");
+    int n = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s %255s",
                    row.version, date, row.url, row.hash, row.deps, row.kind,
-                   row.arch, row.libc, row.min_from);
+                   row.arch, row.libc, row.min_from, row.cpu);
     if (n < 5) continue;
     if (!version_eq(row.version, version)) continue;
 
@@ -1085,6 +1194,12 @@ static bool manifest_select(char *manifest, const char *version,
     }
     if (!row_fits_host(&row)) {
       snprintf(reason, reason_size, "no artifact for this host arch/libc");
+      continue;
+    }
+    const char *lacks = row_cpu_missing(&row);
+    if (lacks) {
+      snprintf(reason, reason_size, "this CPU lacks %s, which the %s build needs",
+               lacks, g_select_variant ? g_select_variant : updater_host_variant());
       continue;
     }
     if (strcmp(row.min_from, "*") != 0 &&
@@ -1109,12 +1224,245 @@ static bool manifest_select(char *manifest, const char *version,
   return have_pick;
 }
 
+/* The checks a hub-driven upgrade needs that touch no network: version
+ * order, the variant, min_from and the unattended-restart prerequisites.
+ * The same version is only "already running" when the variant matches too —
+ * a different variant is a switch between the C and Rust builds. */
+static bool hub_local_check(const bot_state_t *state, const char *target_ver,
+                            const char *want_variant, const char *min_from,
+                            char *reason, size_t reason_size) {
+  if (!want_variant[0] || strpbrk(want_variant, "/;|&`$ \t\r\n") ||
+      strlen(want_variant) > 7) {
+    snprintf(reason, reason_size, "rejected malformed variant from hub");
+    return false;
+  }
+  /* Same downgrade guard as the standalone path: a validly signed but stale
+   * manifest must not be able to walk us back onto a known-bad build. */
+  int cmp = updater_version_cmp(target_ver, BOT_VERSION);
+  if (cmp < 0) {
+    snprintf(reason, reason_size, "target is older than the running version");
+    return false;
+  }
+  if (cmp == 0 && strcmp(want_variant, updater_host_variant()) == 0) {
+    snprintf(reason, reason_size, "already running the target version");
+    return false;
+  }
+  if (min_from && min_from[0] && strcmp(min_from, "*") != 0 &&
+      updater_version_cmp(BOT_VERSION, min_from) < 0) {
+    /* The hub walks the intermediate releases when it sees this. */
+    snprintf(reason, reason_size,
+             "running version is below the target's min_from");
+    return false;
+  }
+  /* An unattended restart needs the machine-bound password file; without it
+   * the new binary would stop at a password prompt with nobody to answer. */
+  if (access(PASS_FILE, R_OK) != 0) {
+    snprintf(reason, reason_size, "no " PASS_FILE "; cannot restart unattended");
+    return false;
+  }
+  if (state->executable_path[0] != '/') {
+    snprintf(reason, reason_size, "executable path is not absolute");
+    return false;
+  }
+  return true;
+}
+
+/* Point the updater at the tree a hub-driven run names: <root>/<variant>.
+ * It travels the way the operator's env override does, so signature and
+ * hash checks are unchanged — see updater_env_base(). */
+static bool hub_set_tree(const char *base, const char *want_variant,
+                         char *reason, size_t reason_size) {
+  /* The hub names the release tree ROOT; the variant picks the subtree.
+   * That is what lets one network-wide run leave each node on its own kind
+   * of build — and lets an admin move a node from the C build to the Rust
+   * one by naming the other variant. */
+  const char *root = (base && base[0]) ? base : BOT_UPDATE_BASE;
+  if (strlen(root) >= 512 || strpbrk(root, ";|&`$ \t\r\n")) {
+    snprintf(reason, reason_size, "rejected malformed manifest base from hub");
+    return false;
+  }
+  char tree[600];
+  if (snprintf(tree, sizeof(tree), "%s/%s", root, want_variant) >=
+      (int)sizeof(tree)) {
+    snprintf(reason, reason_size, "manifest base too long");
+    return false;
+  }
+  setenv("IRCBOT_UPDATE_BASE", tree, 1);
+  return true;
+}
+
+/* CMD_UPGRADE_PREPARE.  Everything COMMIT will need short of the download is
+ * checked here — the signed manifest for the wanted build must verify and
+ * list an artifact for this host.  A node that answers "ready" and then fails
+ * at COMMIT is what turns a routine run into an abort, so the question is
+ * asked in full up front. */
+bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
+                               const char *variant, const char *min_from,
+                               const char *base, char *reason,
+                               size_t reason_size) {
+  reason[0] = '\0';
+  const char *want_variant = (variant && variant[0]) ? variant
+                                                     : updater_host_variant();
+  if (!hub_local_check(state, target_ver, want_variant, min_from, reason,
+                       reason_size) ||
+      !hub_set_tree(base, want_variant, reason, reason_size))
+    return false;
+  const char *verr = NULL;
+  g_fetch_quick = UPGRADE_QUICK_TIMEOUT;
+  char *manifest = fetch_verified_manifest(&verr);
+  g_fetch_quick = 0;
+  if (!manifest) {
+    snprintf(reason, reason_size, "%s", verr ? verr : "manifest fetch failed");
+    return false;
+  }
+  manifest_row_t row;
+  memset(&row, 0, sizeof(row));
+  g_select_variant = want_variant;
+  bool picked = manifest_select(manifest, target_ver, &row, reason, reason_size);
+  free(manifest);
+  if (!picked) {
+    /* Can't run this build here — would the other one?  Say so, never
+     * switch: which build a node runs is the admin's call. */
+    const char *other = strcmp(want_variant, "c") == 0 ? "rs" : "c";
+    char why_other[320] = "";
+    if (strncmp(reason, "this CPU lacks ", 15) == 0 &&
+        hub_set_tree(base, other, why_other, sizeof(why_other))) {
+      g_fetch_quick = UPGRADE_QUICK_TIMEOUT;
+      char *om = fetch_verified_manifest(&verr);
+      g_fetch_quick = 0;
+      if (om) {
+        manifest_row_t orow;
+        memset(&orow, 0, sizeof(orow));
+        g_select_variant = other;
+        bool fits = manifest_select(om, target_ver, &orow, why_other,
+                                    sizeof(why_other));
+        free(om);
+        if (fits) {
+          size_t rl = strlen(reason);
+          snprintf(reason + rl, reason_size - rl,
+                   " — the %s build fits: select this node with =%s", other,
+                   other);
+        }
+      }
+      hub_set_tree(base, want_variant, why_other, sizeof(why_other));
+    }
+    g_select_variant = NULL;
+    return false;
+  }
+  g_select_variant = NULL;
+  const char *slash = strrchr(row.url, '/');
+  if (strncmp(slash ? slash + 1 : row.url, "ircbot-", 7) != 0) {
+    snprintf(reason, reason_size, "manifest artifact is not a ircbot release");
+    return false;
+  }
+  return true;
+}
+
+/* Run argv[0] with argv, stdout+stderr captured into `out` (first line
+ * kept), killed after `timeout_s`.  Returns its exit status, or -1 when it
+ * could not run or timed out.  No shell: every argument is passed as-is. */
+static int run_bounded(char *const argv[], int timeout_s, char *out,
+                       size_t out_size) {
+  if (out && out_size) out[0] = '\0';
+  int pipefd[2];
+  if (pipe(pipefd) != 0) return -1;
+  pid_t pid = fork();
+  if (pid < 0) {
+    close(pipefd[0]);
+    close(pipefd[1]);
+    return -1;
+  }
+  if (pid == 0) {
+    dup2(pipefd[1], STDOUT_FILENO);
+    dup2(pipefd[1], STDERR_FILENO);
+    int devnull = open("/dev/null", O_RDONLY);
+    if (devnull >= 0) dup2(devnull, STDIN_FILENO);
+    /* Nothing of this process leaks into the child: not the IRC socket, not
+     * the hub link, not the PID lock. */
+    long maxfd = sysconf(_SC_OPEN_MAX);
+    if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
+    for (int fd = 3; fd < maxfd; fd++) close(fd);
+    execv(argv[0], argv);
+    _exit(127);
+  }
+  close(pipefd[1]);
+  fcntl(pipefd[0], F_SETFL, fcntl(pipefd[0], F_GETFL) | O_NONBLOCK);
+  size_t got = 0;
+  int status = 0;
+  bool done = false;
+  for (int waited_ms = 0; waited_ms < timeout_s * 1000; waited_ms += 100) {
+    char buf[256];
+    ssize_t n;
+    while ((n = read(pipefd[0], buf, sizeof(buf))) > 0) {
+      if (out && got + 1 < out_size) {
+        size_t take = (size_t)n < out_size - 1 - got ? (size_t)n : out_size - 1 - got;
+        memcpy(out + got, buf, take);
+        got += take;
+        out[got] = '\0';
+      }
+    }
+    if (waitpid(pid, &status, WNOHANG) == pid) {
+      done = true;
+      break;
+    }
+    struct timespec tick = {0, 100 * 1000 * 1000};
+    nanosleep(&tick, NULL);
+  }
+  if (!done) {
+    kill(pid, SIGKILL);
+    waitpid(pid, &status, 0);
+  }
+  close(pipefd[0]);
+  if (out) out[strcspn(out, "\r\n")] = '\0';
+  if (!done) return -1;
+  return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+}
+
+/* Unpack `archive` into a scratch directory and run the binary in it with
+ * -selftest, from this directory (so it reads this config and pass file).
+ * Nothing live is touched either way; the scratch directory is removed. */
+static bool staged_selftest(const char *archive, char *err, size_t err_size) {
+  static const char *dir = "./ircbot_selftest_tmp";
+  char *rm[] = {"/bin/rm", "-rf", (char *)dir, NULL};
+  run_bounded(rm, 30, NULL, 0);
+  if (mkdir(dir, 0700) != 0) {
+    snprintf(err, err_size, "could not stage the new build for its selftest");
+    return false;
+  }
+  char out[256];
+  char *tar[] = {"/bin/tar", "-xzf", (char *)archive, "--strip-components=1",
+                 "-C", (char *)dir, NULL};
+  if (access("/bin/tar", X_OK) != 0) tar[0] = "/usr/bin/tar";
+  if (run_bounded(tar, 60, out, sizeof(out)) != 0) {
+    run_bounded(rm, 30, NULL, 0);
+    snprintf(err, err_size, "could not unpack the new build for its selftest");
+    return false;
+  }
+  char bin[64];
+  snprintf(bin, sizeof(bin), "%s/ircbot", dir);
+  char *st[] = {bin, "-selftest", NULL};
+  int rc = run_bounded(st, UPGRADE_SELFTEST_SECS, out, sizeof(out));
+  run_bounded(rm, 30, NULL, 0);
+  if (rc != 0) {
+    if (out[0])
+      snprintf(err, err_size, "new build failed its selftest: %.160s", out);
+    else if (rc < 0)
+      snprintf(err, err_size, "new build failed its selftest: timed out after %d s",
+               UPGRADE_SELFTEST_SECS);
+    else
+      snprintf(err, err_size, "new build failed its selftest: exited with %d", rc);
+    return false;
+  }
+  return true;
+}
+
 /* Write the upgrade script for a hub-driven commit.  `kind` decides the
  * middle of it: a prebuilt binary is unpacked and moved into place, a source
  * tarball is compiled first.  Either way the previous binary stays at
  * <exe>.prev — the hub, not the script, decides whether to keep it. */
 static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
-                                     const char *archive, const char *prev_path) {
+                                     const char *archive, const char *prev_path,
+                                     bool selftest) {
   /* 0700 at creation: no umask-dependent window on a script we are about to
    * exec (same reasoning as the standalone path). */
   int fd = open("upgrade.sh", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
@@ -1129,7 +1477,10 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   fprintf(f, "#!/bin/bash\n");
   fprintf(f, "set -u\n");
   fprintf(f, "OLD_PID=%d\n", getpid());
+  /* The bot execs this script, so OLD_PID is usually the script itself;
+   * waiting on it would only burn 30 s of every restart. */
   fprintf(f, "for i in $(seq 1 30); do\n");
+  fprintf(f, "  [ \"$OLD_PID\" = \"$$\" ] && break\n");
   fprintf(f, "  kill -0 $OLD_PID 2>/dev/null || break\n");
   fprintf(f, "  sleep 1\n");
   fprintf(f, "done\n");
@@ -1141,7 +1492,9 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   fprintf(f, "rollback() {\n");
   fprintf(f, "  echo \"[UPGRADE] FAILED: $1 — restoring previous build\"\n");
   fprintf(f, "  mv -f \"%s\" \"%s\" 2>/dev/null\n", prev_path, exe);
-  fprintf(f, "  rm -f \"%s\" \"%s\"\n", PID_FILE, UPGRADE_MARKER_FILE);
+  /* The marker stays: the old build reports "version-mismatch" on its first
+   * hub link, so the driver learns of the failure at once. */
+  fprintf(f, "  rm -f \"%s\"\n", PID_FILE);
   fprintf(f, "  rm -rf \"$UPGRADE_DIR\" \"%s\"\n", archive);
   fprintf(f, "  exec \"%s\"\n", exe);
   fprintf(f, "}\n");
@@ -1166,6 +1519,10 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
     fprintf(f, "cd ..\n");
     fprintf(f, "NEW_BIN=\"$UPGRADE_DIR/ircbot\"\n");
     fprintf(f, "[ -f \"$NEW_BIN\" ] || rollback \"build failed (see $UPGRADE_DIR/make.log)\"\n");
+    /* A prebuilt binary was selftested before the swap; a source build can
+     * only be checked here, once it exists. */
+    if (selftest)
+      fprintf(f, "\"$NEW_BIN\" -selftest >/dev/null 2>&1 || rollback \"new build failed its selftest\"\n");
   }
 
   /* Atomic same-directory rename into place; <exe> was already renamed to
@@ -1173,9 +1530,27 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   fprintf(f, "mv -f \"$NEW_BIN\" \"%s\" || rollback \"could not install new binary\"\n", exe);
   fprintf(f, "chmod 700 \"%s\"\n", exe);
   fprintf(f, "rm -f \"%s\"\n", PID_FILE);
-  fprintf(f, "(sleep 5; rm -rf \"$UPGRADE_DIR\" \"%s\" \"./upgrade.sh\" 2>/dev/null) &\n",
-          archive);
-  fprintf(f, "exec \"%s\"\n", exe);
+  fprintf(f, "rm -rf \"$UPGRADE_DIR\" \"%s\" 2>/dev/null\n", archive);
+  /* Startup watchdog.  The new build daemonizes, so the script outlives it:
+   * start it, give it UPGRADE_WATCH_SECS, and if its daemon is not alive by
+   * then put the retained build (and config) back and start that instead.  A
+   * build that cannot come up on this host costs one restart, not a dead
+   * node only an admin can revive.  The marker is kept, so the old build
+   * reports "version-mismatch" at once. */
+  fprintf(f, "\"%s\" </dev/null >/dev/null 2>&1\n", exe);
+  fprintf(f, "sleep %d\n", UPGRADE_WATCH_SECS);
+  fprintf(f, "P=$(cat \"%s\" 2>/dev/null | tr -dc 0-9)\n", PID_FILE);
+  fprintf(f, "if [ -z \"$P\" ] || ! kill -0 \"$P\" 2>/dev/null; then\n");
+  fprintf(f, "  echo \"[UPGRADE] new build did not stay up — restoring previous build\"\n");
+  fprintf(f, "  mv -f \"%s\" \"%s.failed\" 2>/dev/null\n", exe, exe);
+  fprintf(f, "  mv -f \"%s\" \"%s\" || exit 1\n", prev_path, exe);
+  fprintf(f, "  [ -f \"%s%s\" ] && cp -f \"%s%s\" \"%s\"\n", CONFIG_FILE,
+          UPGRADE_PREV_SUFFIX, CONFIG_FILE, UPGRADE_PREV_SUFFIX, CONFIG_FILE);
+  fprintf(f, "  rm -f \"%s\" ./upgrade.sh\n", PID_FILE);
+  fprintf(f, "  exec \"%s\"\n", exe);
+  fprintf(f, "fi\n");
+  fprintf(f, "rm -f ./upgrade.sh\n");
+  fprintf(f, "exit 0\n");
 
   (void)fchmod(fileno(f), 0700);
   return fclose(f) == 0;
@@ -1194,51 +1569,13 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     return false;
   }
 
-  /* The hub may point us at a different release base than the compiled-in
-   * one (the testnet serves a local ircbot-releases tree).  It travels the
-   * same path as the operator-set env var, so signature and hash checks are
-   * unchanged — see updater_env_base(). */
   const char *want_variant = (variant && variant[0]) ? variant
                                                      : updater_host_variant();
-  if (strpbrk(want_variant, "/;|&`$ \t\r\n") || strlen(want_variant) > 7) {
-    *err = "rejected malformed variant from hub";
-    return false;
-  }
-  {
-    /* The hub names the release tree ROOT; the variant picks the subtree.
-     * That is what lets one network-wide run leave each node on its own kind
-     * of build — and lets an admin move a node from the C build to the Rust
-     * one by naming the other variant. */
-    const char *root = (base && base[0]) ? base : BOT_UPDATE_BASE;
-    if (strlen(root) >= 512 || strpbrk(root, ";|&`$ \t\r\n")) {
-      *err = "rejected malformed manifest base from hub";
-      return false;
-    }
-    char tree[600];
-    if (snprintf(tree, sizeof(tree), "%s/%s", root, want_variant) >=
-        (int)sizeof(tree)) {
-      *err = "manifest base too long";
-      return false;
-    }
-    setenv("IRCBOT_UPDATE_BASE", tree, 1);
-  }
-
-  /* Same downgrade guard as the standalone path: a validly signed but stale
-   * manifest must not be able to walk us back onto a known-bad build. */
-  if (updater_version_cmp(target_ver, BOT_VERSION) < 0) {
-    *err = "refusing downgrade";
-    return false;
-  }
-  /* Nothing to do is a success, not a failure: the hub's rolling plan can
-   * then move straight on to the next node. */
-  if (updater_version_cmp(target_ver, BOT_VERSION) == 0) {
-    *err = "already running the target version";
-    return false;
-  }
-  /* An unattended restart needs the machine-bound password file; without it
-   * the new binary would stop at a password prompt with nobody to answer. */
-  if (access(PASS_FILE, R_OK) != 0) {
-    *err = "no " PASS_FILE "; unattended restart is impossible";
+  static char why_local[320];
+  if (!hub_local_check(state, target_ver, want_variant, "", why_local,
+                       sizeof(why_local)) ||
+      !hub_set_tree(base, want_variant, why_local, sizeof(why_local))) {
+    *err = why_local;
     return false;
   }
   log_message(L_INFO, state, "[UPGRADE] Hub commit %s: %s -> %s (variant %s)\n",
@@ -1254,7 +1591,9 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   manifest_row_t row;
   memset(&row, 0, sizeof(row));
   static char why[320];
+  g_select_variant = want_variant;
   bool picked = manifest_select(manifest, target_ver, &row, why, sizeof(why));
+  g_select_variant = NULL;
   free(manifest);
   if (!picked) {
     *err = why[0] ? why : "no usable artifact";
@@ -1290,6 +1629,22 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     return false;
   }
 
+  /* Run the NEW binary's -selftest before anything is swapped: CPU, libraries
+   * and this very config, checked by the build that would have to run on
+   * them.  A target older than -selftest would take the flag for a normal
+   * start, so it is never run; a source build is checked by the script. */
+  bool can_selftest = updater_version_cmp(target_ver, UPGRADE_SELFTEST_MIN) >= 0;
+  if (can_selftest && strcasecmp(row.kind, "bin") == 0) {
+    static char st_err[320];
+    if (!staged_selftest(archive, st_err, sizeof(st_err))) {
+      remove(archive);
+      *err = st_err;
+      return false;
+    }
+    log_message(L_INFO, state, "[UPGRADE] Staged %s passed its selftest\n",
+                target_ver);
+  }
+
   /* Flush the live config, then snapshot the pair we may have to restore.
    * The config is copied (the running bot still needs it); the binary is
    * renamed, which is atomic and leaves <exe>.prev ready for a rollback. */
@@ -1317,8 +1672,18 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   }
   /* From here a failure is the script's to handle: it restores <exe>.prev
    * and restarts the old build rather than leaving the node with no binary. */
-  if (!upgrade_marker_write(upgrade_id, target_ver) ||
-      !write_hub_upgrade_script(state, row.kind, archive, prev_exe)) {
+  /* The channels this bot holds ops in right now: the new build reports done
+   * only once it holds them again (see UPGRADE_OPS_WAIT). */
+  char ops[UPGRADE_OPS_MAX] = "";
+  for (chan_t *c = state->chanlist; c; c = c->next) {
+    if (c->status != C_IN || !c->i_am_opped) continue;
+    size_t ol = strlen(ops);
+    if (ol + strlen(c->name) + 2 >= sizeof(ops)) break;
+    snprintf(ops + ol, sizeof(ops) - ol, "%s%s", ol ? " " : "", c->name);
+  }
+  if (!upgrade_marker_write(upgrade_id, target_ver, want_variant, ops) ||
+      !write_hub_upgrade_script(state, row.kind, archive, prev_exe,
+                                can_selftest)) {
     remove(UPGRADE_MARKER_FILE);
     rename(prev_exe, state->executable_path);
     remove(prev_cfg);
@@ -1357,6 +1722,15 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
                              const char *version_to_install) {
   (void)version_to_install;  /* Unused parameter */
   irc_printf(state, "PRIVMSG %s :Update feature unavailable - bot compiled without curl support.\r\n", nick);
+}
+
+bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
+                               const char *variant, const char *min_from,
+                               const char *base, char *reason,
+                               size_t reason_size) {
+  (void)state; (void)target_ver; (void)variant; (void)min_from; (void)base;
+  snprintf(reason, reason_size, "bot compiled without curl support");
+  return false;
 }
 
 bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
