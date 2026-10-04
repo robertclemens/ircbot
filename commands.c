@@ -821,8 +821,8 @@ static void help_auth(bot_state_t *state, const char *nick) {
     "shows its fingerprint). Commands then travel sealed as ~A2 frames; as "
     "~A2S, the bot's replies are sealed too (~A2R) and the script shows them "
     "decrypted, marked with a lock.",
-    "Compare that fingerprint once with this bot's 'status' or hub_admin's "
-    "bot list. After a bot 'rekey', run /botforget <bot> so the script "
+    "Compare that fingerprint once with this bot's 'status' or the hub console's "
+    "'bot list'. After a bot 'rekey', run /botforget <bot> so the script "
     "fetches the new key.",
     NULL
   };
@@ -1143,7 +1143,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
   if (is_admin) {
     /* opt 'h' (OPT_HUB_ONLY_MUTATIONS): when set by the network, the bot
      * refuses local mutation of hub-authoritative records.  These commands
-     * must be performed via hub_admin instead.  Help text also hides them. */
+     * must be performed on the hub console instead.  Help text also hides them. */
     if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
       static const char * const HUB_ONLY_CMDS[] = {
         "+admin", "-admin", "+oper", "-oper",
@@ -1162,7 +1162,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         if (strcasecmp(command, HUB_ONLY_CMDS[i]) == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Error: '%s' is disabled — network is in "
-                     "hub-only-mutation mode (opt 'h'). Use hub_admin.\r\n",
+                     "hub-only-mutation mode (opt 'h'). Use the hub console.\r\n",
                      nick, HUB_ONLY_CMDS[i]);
           return;
         }
@@ -1812,11 +1812,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       for (int i = 0; size_ok && arg2 && arg2[i] != '\0'; i++)
         if (!isdigit((unsigned char)arg2[i])) size_ok = false;
       long new_size = arg2 ? strtol(arg2, NULL, 10) : state->log_max_size;
-      if (!is_valid_int || atoi(arg1) > DEFAULT_LOG_LEVEL) {
+      if (!is_valid_int || atoi(arg1) > LOG_LEVEL_MAX) {
         irc_printf(state,
                    "PRIVMSG %s :Invalid log level. Give a mask from 0 to "
                    "%d.\r\n",
-                   nick, DEFAULT_LOG_LEVEL);
+                   nick, LOG_LEVEL_MAX);
       } else if (!size_ok || new_size < BOT_LOG_SIZE_MIN ||
                  new_size > BOT_LOG_SIZE_MAX) {
         irc_printf(state,
@@ -2346,13 +2346,13 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
     } else if (strcasecmp(command, "update") == 0) {
       /* In-place 'update' is for standalone bots only.  A hub-configured bot is
-       * upgraded by its hub (hub_admin-initiated rolling upgrade), never via an
+       * upgraded by its hub (console-initiated rolling upgrade), never via an
        * IRC/DCC command.  The hub-driven path calls updater_perform_upgrade()
        * directly and is NOT gated here. */
       if (state->hub_count > 0) {
         irc_printf(state,
                    "PRIVMSG %s :Updates are hub-managed on this bot; run "
-                   "upgrades from hub_admin. In-place 'update' is only "
+                   "upgrades from the hub console. In-place 'update' is only "
                    "available on standalone (hub-less) bots.\r\n",
                    nick);
       } else if (arg1)
@@ -2590,7 +2590,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via hub_admin)\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)\r\n", nick);
         } else {
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, join, part, status, givenick, chnick\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);

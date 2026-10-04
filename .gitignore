@@ -17,9 +17,8 @@ bot_config_gen*
 .claude
 CLAUDE.md
 docsbot_config_gen
-utils/decrypt_config
-utils/encrypt_config
 docs/*
 utils/bot-auth
 utils/keygen
 releases/
+__pycache__/

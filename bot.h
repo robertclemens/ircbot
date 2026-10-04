@@ -68,7 +68,11 @@
 /* Marker ops line capacity: channel names, space-separated. */
 #define UPGRADE_OPS_MAX 1024
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
-#define DEFAULT_LOG_LEVEL 63  // Set the default log level. 0=none
+/* The log FILE is off by default: a production bot writes nothing to disk
+ * until 'setlog' (l| in the config) turns it on.  The in-memory ring that
+ * 'getlog' reads is fed at every level. */
+#define DEFAULT_LOG_LEVEL 0   // default log mask: 0 = none
+#define LOG_LEVEL_MAX 63      // every log type (L_MSG..L_DEBUG)
 #define LOGFILE ".ircbot.log" // Log file name. Only used if log level > 0
 #define BOT_LOG_FILE_SIZE (10 * 1024 * 1024) // default cap; LOGFILE is truncated past it
 /* Bounds on the per-bot cap (L|<bytes> in the config, set by 'setlog <level>
@@ -358,7 +362,7 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_CHAN_ACTION  0x5A // Hub -> Bot: id|kind|chan|uuid|nick|hostmask
 #define CMD_CHAN_REPLY   0x5B // Bot <-> Hub: id|kind|chan|status|data
 
-/* ---- Network-wide upgrade coordination (hub_admin-initiated rolling upgrade).
+/* ---- Network-wide upgrade coordination (console-initiated rolling upgrade).
  * The bot answers PREPARE with READY/UNABLE, runs the updater on COMMIT (the
  * standalone in-place 'update' gate does NOT block this hub path), rolls back
  * to <exe>.prev on ABORT, and reports RESULT after it restarts.  Mirrors

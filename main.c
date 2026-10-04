@@ -47,6 +47,46 @@ static void harden_process(void) {
 #endif
 }
 
+/* Instance directory: .ircbot.cnf/.pass/.pid/.log/.upgrade all live beside
+ * the binary, so the bot behaves the same whatever the caller's cwd -- cron
+ * starts jobs in $HOME.  One binary per bot.  Our own path comes from
+ * /proc/self/exe (argv[0] has no directory when launched through PATH);
+ * fills `exe` with it and chdir()s to its directory.  That directory holds
+ * the binary an upgrade replaces, its .prev and the upgrade script, so refuse
+ * one another user owns or group/other can write -- they could swap any of
+ * them.  Mirrors instance_dir_enter() in irchub/hub_main.c. */
+static bool instance_dir_enter(char *exe, size_t exe_len) {
+  ssize_t n = readlink("/proc/self/exe", exe, exe_len - 1);
+  if (n <= 0 || (size_t)n >= exe_len - 1) {
+    fprintf(stderr, "Cannot resolve my own path (/proc/self/exe)\n");
+    return false;
+  }
+  exe[n] = '\0';
+  char dir[PATH_MAX];
+  snprintf(dir, sizeof(dir), "%s", exe);
+  char *slash = strrchr(dir, '/');
+  if (!slash) {
+    fprintf(stderr, "Cannot resolve my own directory from %s\n", exe);
+    return false;
+  }
+  slash[slash == dir ? 1 : 0] = '\0';
+  struct stat st;
+  if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+    fprintf(stderr, "Cannot stat my own directory %s\n", dir);
+    return false;
+  }
+  if (st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
+    fprintf(stderr, "Refusing to run from %s: it must be owned by this user "
+                    "and not writable by group or others (chmod go-w)\n", dir);
+    return false;
+  }
+  if (chdir(dir) != 0) {
+    fprintf(stderr, "Cannot change to my own directory %s\n", dir);
+    return false;
+  }
+  return true;
+}
+
 static void state_init(bot_state_t *state) {
   memset(state, 0, sizeof(bot_state_t));
   /* Lock the whole state into RAM so no part of it can reach swap or a
@@ -405,7 +445,7 @@ static void run_config_wizard(void) {
       ;
 
     /* Bot identity is generated locally up front so the operator can paste
-     * the UUID + pubkey into hub_admin's "Add Bot" prompt before continuing.
+     * the UUID + pubkey into the hub console's 'bot add' before continuing.
      * The private key never leaves this machine. */
     printf("\n--- Bot Identity (Curve25519) ---\n");
     {
@@ -451,8 +491,8 @@ static void run_config_wizard(void) {
       printf("\n  Bot UUID:        %s\n", state.bot_uuid);
       printf("  Bot public key:  %s\n", pub_b64);
       printf("  Key fingerprint: %s\n", fp);
-      printf("\n  Save these — when registering this bot in hub_admin's\n");
-      printf("  'Add Bot' menu the hub will ask for the UUID and pubkey above.\n");
+      printf("\n  Save these — when registering this bot on the hub console\n");
+      printf("  ('bot add <nick> <uuid> <pubkey>') the hub needs the UUID and pubkey above.\n");
       printf("  (Standalone bots: other bots trust this one with\n");
       printf("  '+bot <nick!user@host> <UUID> <public key>'.)\n");
       printf("\n  Press Enter to continue...");
@@ -499,7 +539,7 @@ static void run_config_wizard(void) {
      * this bot actually owns. */
     printf("\n--- Management Mode ---\n");
     printf("Hub-managed: admins, usermasks and channels live on the hub and are\n");
-    printf("  managed with hub_admin. This bot only needs hub addresses and\n");
+    printf("  managed on the hub console. This bot only needs hub addresses and\n");
     printf("  their pinned public keys.\n");
     printf("Standalone:  this bot owns its own admin list and channels.\n\n");
 
@@ -599,7 +639,7 @@ static void run_config_wizard(void) {
       printf("\n✓ Hub configuration saved (%d hub%s).\n",
              state.hub_count, state.hub_count == 1 ? "" : "s");
       printf("\n  Admins, usermasks and channels for this bot are added with\n");
-      printf("  hub_admin (IRC Admin Commands), not here. This wizard assumes\n");
+      printf("  the hub console (admin/mask/chan), not here. This wizard assumes\n");
       printf("  the hub network runs with opt 'h' (hub-only mutations), which\n");
       printf("  is the default — it cannot verify that until the first sync.\n");
       printf("  If your hub does not set opt 'h', you can also add them later\n");
@@ -800,6 +840,11 @@ int main(int argc, char *argv[]) {
     if (strcmp(argv[i], "-selftest") == 0) return run_selftest();
   }
 
+  /* -selftest (above) stays in the caller's directory: the updater runs a
+   * staged build from a scratch subdirectory, against this bot's config. */
+  static char self_exe[PATH_MAX];
+  if (!instance_dir_enter(self_exe, sizeof(self_exe))) return 1;
+
   if (do_setup) {
     if (access(CONFIG_FILE, F_OK) == 0) {
       fprintf(stderr, "Error: Config file '%s' already exists.\n", CONFIG_FILE);
@@ -890,12 +935,7 @@ int main(int argc, char *argv[]) {
   bot_state_t state;
   state_init(&state);
   state.pid_fd = pid_fd;
-  if (!realpath(argv[0], state.executable_path)) {
-    close(pid_fd);
-    remove(PID_FILE);
-    memset(startup_password, 0, sizeof(startup_password));
-    return 1;
-  }
+  snprintf(state.executable_path, sizeof(state.executable_path), "%s", self_exe);
   setup_signals();
 
   if (!config_load(&state, startup_password, CONFIG_FILE)) {

@@ -794,7 +794,7 @@ bool config_load(bot_state_t *state, const char *password,
     if (u->is_active && !u->has_pubkey)
       log_message(L_INFO, state,
                   "[CFG] %s '%s' has no public key and cannot authenticate "
-                  "until given one (chkey, or hub_admin 'Change user public "
+                  "until given one (chkey, or the hub console's 'userkey' "
                   "key').\n", u->type == 'a' ? "Admin" : "Oper", u->name);
   }
   if (legacy_user_lines > 0)

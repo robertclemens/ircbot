@@ -1541,9 +1541,13 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   fprintf(f, "sleep %d\n", UPGRADE_WATCH_SECS);
   fprintf(f, "P=$(cat \"%s\" 2>/dev/null | tr -dc 0-9)\n", PID_FILE);
   fprintf(f, "if [ -z \"$P\" ] || ! kill -0 \"$P\" 2>/dev/null; then\n");
+  /* Nothing retained (an admin put a build back by hand): the binary in
+   * place is the only one there is, so it is never moved aside. */
+  fprintf(f, "  [ -f \"%s\" ] || exit 1\n", prev_path);
   fprintf(f, "  echo \"[UPGRADE] new build did not stay up — restoring previous build\"\n");
   fprintf(f, "  mv -f \"%s\" \"%s.failed\" 2>/dev/null\n", exe, exe);
-  fprintf(f, "  mv -f \"%s\" \"%s\" || exit 1\n", prev_path, exe);
+  fprintf(f, "  mv -f \"%s\" \"%s\" || { mv -f \"%s.failed\" \"%s\"; exit 1; }\n",
+          prev_path, exe, exe, exe);
   fprintf(f, "  [ -f \"%s%s\" ] && cp -f \"%s%s\" \"%s\"\n", CONFIG_FILE,
           UPGRADE_PREV_SUFFIX, CONFIG_FILE, UPGRADE_PREV_SUFFIX, CONFIG_FILE);
   fprintf(f, "  rm -f \"%s\" ./upgrade.sh\n", PID_FILE);

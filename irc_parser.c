@@ -436,12 +436,15 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     if (target && modes && (target[0] == '#' || target[0] == '&')) {
       channel_handle_mode_change(state, target, modes, args);
-      /* Push key/invite-only changes to hub */
+      /* Push key/invite-only changes to hub, and to our own config: with no
+       * hub to echo them back, a key we learned and saved must not outlive
+       * a -k. */
       if (strchr(modes, 'k') || strchr(modes, 'i')) {
         chan_t *mc = channel_find(state, target);
         if (mc && mc->is_managed) {
           mc->timestamp = lww_next_ts(mc->timestamp);
           hub_client_push_channel(state, mc);
+          config_write_with_state_pass(state);
         }
       }
     }

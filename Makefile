@@ -52,12 +52,13 @@ TARGET = ircbot
 
 all: $(TARGET)
 
-# utils/keygen.c is byte-identical to irchub/keygen.c (self-contained,
-# OpenSSL only).  Not part of `all`: build it where users make their keys.
+# utils/keygen.c + bcrypt_pbkdf.[ch] are byte-identical to their irchub
+# copies (self-contained, OpenSSL only).  Not part of `all`: build it where
+# users make their keys.
 keygen: utils/keygen
 
-utils/keygen: utils/keygen.c
-	$(CC) $(CFLAGS) -o $@ $< -lcrypto
+utils/keygen: utils/keygen.c utils/bcrypt_pbkdf.c utils/bcrypt_pbkdf.h
+	$(CC) $(CFLAGS) -o $@ utils/keygen.c utils/bcrypt_pbkdf.c -lcrypto
 
 $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
