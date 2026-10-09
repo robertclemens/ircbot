@@ -1677,6 +1677,87 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   }
 }
 
+/* ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) ----------- */
+
+/* NULL when we could do `kind` in `channel` right now, else why not.  Only
+ * our own state: in the channel and opped (op/invite/unban), or in it and
+ * holding its key (key). */
+static const char *chan_elect_cannot(bot_state_t *state, const char *kind,
+                                     const char *channel) {
+  chan_t *c = channel_find(state, channel);
+  if (!c || c->status != C_IN) return "not in channel";
+  if (strcmp(kind, "key") == 0) return c->key[0] ? NULL : "no key";
+  if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0 ||
+      strcmp(kind, "unban") == 0)
+    return c->i_am_opped ? NULL : "not opped";
+  return "unknown request";
+}
+
+/* RFC 2812 nick characters, any length a network allows up to
+ * CHAN_DO_NICK_MAX: the nick goes straight into a MODE / INVITE line. */
+static bool chan_do_nick_ok(const char *n) {
+  size_t len = strlen(n);
+  if (len == 0 || len > CHAN_DO_NICK_MAX || isdigit((unsigned char)n[0]) || n[0] == '-')
+    return false;
+  for (size_t i = 0; i < len; i++) {
+    unsigned char ch = (unsigned char)n[i];
+    if (!isalnum(ch) && !strchr("[]\\`_^{}|-", ch)) return false;
+  }
+  return true;
+}
+
+static void chan_done_send(bot_state_t *state, const char *id, bool ok,
+                           const char *detail) {
+  char out[192];
+  int n = snprintf(out, sizeof(out), "%s|%s|%s", id, ok ? "ok" : "fail", detail);
+  if (n > 0 && n < (int)sizeof(out)) hub_send_frame(state, CMD_CHAN_DONE, out, n);
+}
+
+/* We were picked: eid|kind|channel|requester|nick|hostmask.  Re-check (the
+ * channel may have changed since the probe), act once, report. */
+static void chan_elect_do(bot_state_t *state, const char *payload) {
+  char id[64] = "", kind[16] = "", chan[MAX_CHAN] = "", req[64] = "";
+  char nick[CHAN_DO_NICK_MAX + 2] = "", mask[MAX_MASK_LEN] = "";
+  int n = sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%63[^|]|%31[^|]|%255[^|\r\n]",
+                 id, kind, chan, req, nick, mask);
+  if (n < 4) {
+    log_message(L_INFO, state, "[CHANREQ] Malformed CHAN_DO\n");
+    return;
+  }
+  const char *why = chan_elect_cannot(state, kind, chan);
+  if (why) {
+    chan_done_send(state, id, false, why);
+    return;
+  }
+  if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0) {
+    if (!chan_do_nick_ok(nick)) {
+      chan_done_send(state, id, false, "not a valid nick");
+      return;
+    }
+  }
+  if (strcmp(kind, "op") == 0) {
+    log_message(L_INFO, state, "[CHANREQ] Opping %s in %s (picked by the hub)\n",
+                nick, chan);
+    irc_printf(state, "MODE %s +o %s\r\n", chan, nick);
+    chan_done_send(state, id, true, "MODE +o sent");
+    return;
+  }
+  chan_req_kind_t k = chan_req_kind_from_token(kind);
+  if (k >= CHAN_REQ_KIND_COUNT) {
+    chan_done_send(state, id, false, "unknown request");
+    return;
+  }
+  if (k == CHAN_REQ_UNBAN && mask[0] == '\0') {
+    chan_done_send(state, id, false, "no hostmask to match");
+    return;
+  }
+  chan_access_service(state, id, k, chan, req, nick, mask, NULL);
+  chan_done_send(state, id, true,
+                 k == CHAN_REQ_INVITE  ? "INVITE sent"
+                 : k == CHAN_REQ_UNBAN ? "ban list check started"
+                                       : "key sent");
+}
+
 void hub_handle_response(bot_state_t *state, int cmd, char *payload,
                          int payload_len) {
   switch (cmd) {
@@ -1816,6 +1897,29 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         log_message(L_INFO, state, "[CHANREQ] Malformed CHAN_ACTION\n");
       }
     }
+    break;
+
+  case CMD_CHAN_PROBE:
+    /* eid|kind|channel — could we do this right now?  Answered at once from
+     * our own channel state; the hub hands the action to one bot that said
+     * yes, so a bot that cannot must say no rather than stay quiet. */
+    if (payload && payload_len > 0) {
+      char p_id[64], p_kind[16], p_chan[MAX_CHAN];
+      if (sscanf(payload, "%63[^|]|%15[^|]|%64[^|\r\n]", p_id, p_kind, p_chan) == 3) {
+        const char *why = chan_elect_cannot(state, p_kind, p_chan);
+        char ack[160];
+        int n = snprintf(ack, sizeof(ack), "%s|%d|%s", p_id, why ? 0 : 1,
+                         why ? why : "");
+        if (n > 0 && n < (int)sizeof(ack))
+          hub_send_frame(state, CMD_CHAN_PROBE_ACK, ack, n);
+      }
+    }
+    break;
+
+  case CMD_CHAN_DO:
+    /* eid|kind|channel|requester|nick|hostmask — we were picked. */
+    if (payload && payload_len > 0)
+      chan_elect_do(state, payload);
     break;
 
   case CMD_CHAN_REPLY:

@@ -40,6 +40,9 @@ void ssl_init_openssl(void) {
  * Neither defends against root.  See docs/admin_cmd_encryption.md.
  * Called before any config or key material is loaded. */
 static void harden_process(void) {
+  /* Private by default whatever the shell's umask (Ubuntu's is 002): the
+   * setup wizard, pid, log and upgrade staging all inherit it. */
+  umask(0077);
   struct rlimit rl = { 0, 0 };
   setrlimit(RLIMIT_CORE, &rl);
 #ifdef PR_SET_DUMPABLE
@@ -53,8 +56,8 @@ static void harden_process(void) {
  * /proc/self/exe (argv[0] has no directory when launched through PATH);
  * fills `exe` with it and chdir()s to its directory.  That directory holds
  * the binary an upgrade replaces, its .prev and the upgrade script, so refuse
- * one another user owns or group/other can write -- they could swap any of
- * them.  Mirrors instance_dir_enter() in irchub/hub_main.c. */
+ * one another user owns and chmod go-w one group/other can write -- they could
+ * swap any of them.  Mirrors instance_dir_enter() in irchub/hub_main.c. */
 static bool instance_dir_enter(char *exe, size_t exe_len) {
   ssize_t n = readlink("/proc/self/exe", exe, exe_len - 1);
   if (n <= 0 || (size_t)n >= exe_len - 1) {
@@ -70,20 +73,42 @@ static bool instance_dir_enter(char *exe, size_t exe_len) {
     return false;
   }
   slash[slash == dir ? 1 : 0] = '\0';
+  /* fd-based from here on: the directory inspected is the one fixed and
+   * entered. */
+  int dfd = open(dir, O_RDONLY | O_DIRECTORY | O_CLOEXEC);
   struct stat st;
-  if (stat(dir, &st) != 0 || !S_ISDIR(st.st_mode)) {
+  if (dfd < 0 || fstat(dfd, &st) != 0) {
+    if (dfd >= 0) close(dfd);
     fprintf(stderr, "Cannot stat my own directory %s\n", dir);
     return false;
   }
-  if (st.st_uid != geteuid() || (st.st_mode & (S_IWGRP | S_IWOTH))) {
-    fprintf(stderr, "Refusing to run from %s: it must be owned by this user "
-                    "and not writable by group or others (chmod go-w)\n", dir);
+  if (st.st_uid != geteuid()) {
+    close(dfd);
+    fprintf(stderr, "Refusing to run from %s: it must be owned by this "
+                    "user\n", dir);
     return false;
   }
-  if (chdir(dir) != 0) {
+  /* Group/other write (a 002 umask makes 0775 directories): we own it, so
+   * close the hole rather than refuse -- refusing turned every upgrade on
+   * such a host into a watchdog rollback and a fresh install into a dead
+   * start.  Nothing is weakened: the directory was open before we ran. */
+  if (st.st_mode & (S_IWGRP | S_IWOTH)) {
+    mode_t m = st.st_mode & 07777 & ~(mode_t)(S_IWGRP | S_IWOTH);
+    if (fchmod(dfd, m) != 0) {
+      fprintf(stderr, "Refusing to run from %s: group/other can write it "
+                      "and chmod go-w failed (%s)\n", dir, strerror(errno));
+      close(dfd);
+      return false;
+    }
+    fprintf(stderr, "Removed group/other write from %s (now %04o)\n", dir,
+            (unsigned)m);
+  }
+  if (fchdir(dfd) != 0) {
+    close(dfd);
     fprintf(stderr, "Cannot change to my own directory %s\n", dir);
     return false;
   }
+  close(dfd);
   return true;
 }
 
@@ -202,7 +227,7 @@ void daemonize(void) {
   if (pid < 0) { perror("fork"); exit(1); }
   if (pid > 0) exit(0);
 
-  umask(0027);
+  umask(0077);
 
   int devnull = open("/dev/null", O_RDWR);
   if (devnull < 0) exit(1);
@@ -788,6 +813,13 @@ static void run_config_wizard(void) {
 }
 
 static int run_selftest(void) {
+  /* The swap happens in this directory: one another user owns is refused at
+   * start (a group/other-writable one we own is tightened there). */
+  struct stat dst;
+  if (stat(".", &dst) != 0 || dst.st_uid != geteuid()) {
+    printf("selftest: FAIL this directory is not owned by this user\n");
+    return 1;
+  }
   if (access(CONFIG_FILE, R_OK) != 0) {
     printf("selftest: FAIL no readable %s\n", CONFIG_FILE);
     return 1;

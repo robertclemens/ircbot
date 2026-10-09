@@ -21,7 +21,7 @@
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.4.6"
+#define BOT_VERSION "2.4.7"
 #endif
 
 // Only edit this section
@@ -361,6 +361,22 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_CHAN_REQUEST 0x59 // Bot -> Hub: kind|channel
 #define CMD_CHAN_ACTION  0x5A // Hub -> Bot: id|kind|chan|uuid|nick|hostmask
 #define CMD_CHAN_REPLY   0x5B // Bot <-> Hub: id|kind|chan|status|data
+
+/* Channel-request election (irchub docs/plans/2026-10-07_chan_election_plan.md).
+ * The hub asks whether we could do a channel request right now (PROBE; we
+ * answer at once from our own state), then hands it to ONE bot that said yes
+ * (DO), which reports back (DONE).  A hub that predates this never sends
+ * PROBE and keeps using CMD_OP_GRANT / CMD_CHAN_ACTION.  Mirrors irchub/hub.h.
+ *   PROBE      hub->bot  eid|kind|channel
+ *   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
+ *   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
+ *   DONE       bot->hub  eid|ok|detail or eid|fail|detail
+ * kind = op / invite / unban / key. */
+#define CMD_CHAN_PROBE     0x6D
+#define CMD_CHAN_PROBE_ACK 0x6E
+#define CMD_CHAN_DO        0x6F
+#define CMD_CHAN_DONE      0x70
+#define CHAN_DO_NICK_MAX   30   /* a nick the hub hands us, any network     */
 
 /* ---- Network-wide upgrade coordination (console-initiated rolling upgrade).
  * The bot answers PREPARE with READY/UNABLE, runs the updater on COMMIT (the
