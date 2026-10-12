@@ -44,6 +44,7 @@ bool channel_remove(bot_state_t *state, const char *name) {
         prev->next = current->next;
       else
         state->chanlist = current->next;
+      channel_live_reset(current);
       free(current);
       state->chan_count--;
       return true;
@@ -66,6 +67,7 @@ void channel_list_destroy(bot_state_t *state) {
   chan_t *current = state->chanlist;
   while (current) {
     chan_t *next = current->next;
+    channel_live_reset(current);
     free(current);
     current = next;
   }
@@ -79,6 +81,7 @@ void channel_list_reset_status(bot_state_t *state) {
     c->last_join_attempt = 0;
     c->join_disabled = false;
     c->i_am_opped = false;
+    channel_live_reset(c);
     c->op_request_pending = false;
     c->op_request_retry_count = 0;
     /* A reconnect may well have given us a new hostmask, so a ban or key that

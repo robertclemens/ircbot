@@ -40,7 +40,7 @@ LDFLAGS += -lssl -lcrypto
 endif
 
 # Source files
-SRCS = main.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c
+SRCS = main.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c sendq.c chanlive.c chancfg.c glob_overlap.c chanenf.c chanflood.c botflood.c chancmd.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)

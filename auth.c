@@ -3,6 +3,7 @@
 #include <time.h> // Ensure time() is available
 
 #include "bot.h"
+#include "glob_overlap.h"
 
 /* Shared with the channel-access code, which matches a requester's hostmask
  * against the ban masks a 367 walk returns.  Case-insensitive, '*' and '?'. */
@@ -163,4 +164,67 @@ bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
   if (uuid_out && uuid_out_size > 0)
     snprintf(uuid_out, uuid_out_size, "%s", tb->uuid);
   return true;
+}
+
+/* modes.md §1: "authorised" = matches a trusted-bot mask, or an active
+ * usermask of an active admin/oper.  The user record need not hold a key:
+ * what matters is the operator's standing, not whether they can sign ~A2. */
+bool auth_is_authorised(const bot_state_t *state, const char *nuh) {
+  if (!state || !nuh || !nuh[0])
+    return false;
+  if (auth_is_trusted_bot(state, nuh, NULL, 0))
+    return true;
+  for (int i = 0; i < state->mask_record_count; i++) {
+    const mask_record_t *mr = &state->mask_records[i];
+    if (!mr->is_active || mr->mask[0] == '\0')
+      continue;
+    if (!auth_wildcard_match(mr->mask, nuh))
+      continue;
+    for (int j = 0; j < state->user_record_count; j++) {
+      const user_record_t *ur = &state->user_records[j];
+      if (ur->is_active && strcmp(ur->uuid, mr->uuid) == 0)
+        return true;
+    }
+  }
+  return false;
+}
+
+/* §6.2 step 2: refuse a ban mask that could hit a bot or an operator who is
+ * not in the channel right now.  Pattern-vs-pattern, so '*' on either side
+ * is taken at its widest. */
+bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
+                                   char *who, size_t who_size) {
+  if (who && who_size)
+    who[0] = '\0';
+  if (!state || !mask)
+    return true; /* fail closed */
+  /* matching drops a leading '~' of the ident (strip_ident_tilde), so the
+   * overlap test does too, on both sides */
+  char nmask[MAX_MASK_LEN], nother[MAX_MASK_LEN];
+  strip_ident_tilde(mask, nmask, sizeof(nmask));
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    strip_ident_tilde(state->trusted_bots[i].mask, nother, sizeof(nother));
+    if (glob_overlap(nmask, nother)) {
+      if (who && who_size)
+        snprintf(who, who_size, "bot %s", state->trusted_bots[i].mask);
+      return true;
+    }
+  }
+  for (int i = 0; i < state->mask_record_count; i++) {
+    const mask_record_t *mr = &state->mask_records[i];
+    if (!mr->is_active || mr->mask[0] == '\0')
+      continue;
+    strip_ident_tilde(mr->mask, nother, sizeof(nother));
+    if (!glob_overlap(nmask, nother))
+      continue;
+    for (int j = 0; j < state->user_record_count; j++) {
+      const user_record_t *ur = &state->user_records[j];
+      if (ur->is_active && strcmp(ur->uuid, mr->uuid) == 0) {
+        if (who && who_size)
+          snprintf(who, who_size, "user %s", ur->name);
+        return true;
+      }
+    }
+  }
+  return false;
 }

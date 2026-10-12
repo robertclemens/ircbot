@@ -147,6 +147,11 @@
 #define MAX_BUFFER                                                             \
   16384 // Size of RAW IRC message. Do not change (Matched to Hub size)
 #define MAX_NICK 10  // Max nick length 9 + NULL terminator = 10. Do not change
+#define OP_GRANT_HOLD_MAX 8   // OP_GRANTs held per channel until our own +o
+#define OP_GRANT_HOLD_SECS 15 // ...and for at most this long
+/* Other people's nicks (roster, flood tracking): the server's NICKLEN, which
+ * is 30 and more on today's networks, not this bot's own 9-character limit. */
+#define MAX_MEMBER_NICK 32
 #define MAX_PASS 128 // Max password length.
 #define MAX_KEY 31   // Max length for a channel key
 #define MAX_MASK_LEN 256    // Max usermask length
@@ -170,8 +175,28 @@
 #define CFG_MAX_GLOBALS     64    /* mirrors hub MAX_BOT_ENTRIES */
 #define CFG_BOT_SYNC_FIELDS 8
 #define CFG_PAYLOAD_SLACK   8192
+/* modes.md §2: C| (per channel), D| (one) and B| (bans) lines.  The ceiling
+ * stays derived from these macros, so the C| / D| / B| ingest caps below are
+ * what make it a hard bound. */
+#define C_MODES_MAX         64    /* modes field of C| / D| */
+#define C_SETTINGS_MAX      512   /* settings field of C| */
+#define D_SETTINGS_MAX      512   /* settings field of D| */
+#define BAN_REASON_MAX      120
+#define BAN_MASK_MAX        120
+#define BAN_SETTER_MAX      63    /* admin name or bot uuid */
+#define MAX_BANS_PER_CHAN   100
+#define MAX_GLOBAL_BANS     100   /* bans with channel "*" */
+#define CFG_MAX_CHANNELS    CFG_MAX_GLOBALS
+#define C_LINE_MAX          (2 + MAX_CHAN + 1 + C_MODES_MAX + 1 + C_SETTINGS_MAX + 24)
+#define D_LINE_MAX          (2 + C_MODES_MAX + 1 + D_SETTINGS_MAX + 24)
+#define B_LINE_MAX          (2 + MAX_CHAN + 1 + BAN_MASK_MAX + 1 + 24 + 8 + \
+                             BAN_SETTER_MAX + 1 + BAN_REASON_MAX + 40)
+#define CFG_MAX_BANS        (MAX_GLOBAL_BANS + CFG_MAX_CHANNELS * MAX_BANS_PER_CHAN)
 #define MAX_CONFIG_PAYLOAD \
   ( CFG_MAX_GLOBALS     * CFG_GLOBAL_LINE_MAX + \
+    CFG_MAX_CHANNELS    * C_LINE_MAX          + \
+    D_LINE_MAX                                + \
+    CFG_MAX_BANS        * B_LINE_MAX          + \
     MAX_USER_RECORDS    * CFG_USER_LINE_MAX   + \
     MAX_USER_MASKS      * CFG_MASK_LINE_MAX   + \
     CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE  + \
@@ -179,8 +204,10 @@
     CFG_PAYLOAD_SLACK )
 /* Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin. */
 #define MAX_HUB_FRAME (MAX_CONFIG_PAYLOAD + 64)
-#define MAX_ROSTER_SIZE                                                        \
-  50 // Max channel roster size to store. Increase if in very large channels.
+/* Members tracked per channel (heap, inside chan_t: ~270 bytes each).  Every
+ * protection acts only on tracked members, so a channel larger than this
+ * fails closed for the members beyond it (modes.md §12.1). */
+#define MAX_ROSTER_SIZE 500
 #define MAX_SEEN_HASHES                                                        \
   4096 // Stores admin request hashes to protect against anti-replay attacks
 #define NONCE_CACHE_SIZE                                                       \
@@ -410,6 +437,25 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define MAX_ACTIVITY_QUERIES   4
 #define ACTIVITY_REQ_ID_MAX    32
 
+/* ---- Channel modes / settings / bans / floods (irchub docs/modes.md).
+ * The 0x76-0x7A ops are console->hub only; a bot never sends or handles them
+ * and they are defined here so the numbers stay reserved on both sides.
+ * CMD_CHAN_EVENT is the one bot-originated frame: one enforcement action
+ * (D42), `#chan|<action>|<target>|<detail>`, rate-limited by the bot
+ * (hub_client_chan_event) and logged by the hub.  Mirrors irchub/hub.h. */
+#define CMD_ADMIN_CHAN_MODE 0x76 // console -> hub: channel mode
+#define CMD_ADMIN_CHAN_SET  0x77 // console -> hub: channel set
+#define CMD_ADMIN_BAN       0x78 // console -> hub: ban list / add / del
+#define CMD_ADMIN_NET_SET   0x79 // console -> hub: network set
+#define CMD_ADMIN_SET_SSH   0x7A // console -> hub: hub set ssh / conn
+#define CMD_CHAN_EVENT      0x7B // bot -> hub: #chan|action|target|detail
+#define CHAN_EVENT_TARGET_MAX   120
+#define CHAN_EVENT_DETAIL_MAX   160
+#define CHAN_EVENT_DEDUPE_SECS   10  /* per (chan, action, target) */
+#define CHAN_EVENT_WINDOW_SECS   60  /* total-rate window */
+#define CHAN_EVENT_WINDOW_MAX    20  /* events per window */
+#define CHAN_EVENT_TRACK         32  /* dedupe slots (oldest replaced) */
+
 /* Wire tokens for the `kind` field, and the bot-side index that tracks one
  * in-flight request per kind per channel. */
 #define CHAN_REQ_TOK_UNBAN  "unban"
@@ -525,9 +571,15 @@ typedef struct {
 } mask_record_t;
 
 typedef struct {
-  char nick[MAX_NICK];
+  char nick[MAX_MEMBER_NICK];
   char hostmask[MAX_MASK_LEN];
   bool is_op;
+  bool is_halfop;  /* PREFIX 'h' (D41); false on a server without it */
+  bool is_voice;
+  /* chanenf.c: cached "authorised" verdict for hostmask, valid while
+   * auth_gen equals state->auth_gen (0 = never computed). */
+  bool authorised;
+  unsigned auth_gen;
 } roster_entry_t;
 
 typedef struct {
@@ -543,6 +595,213 @@ typedef struct {
   char *buffer;
   size_t size;
 } http_response_t;
+
+/* ---- modes.md: settings, live modes, ban lists ------------------------- */
+
+/* Settings that live in a C| / D| `settings` field as name=value.  The first
+ * ten are flags (0/1), the rest numbers with the ranges in chancfg.c.
+ * CS_IGNORETIME is network-only (D|). */
+typedef enum {
+  CS_ENFORCEMODES = 0, CS_BITCH, CS_PROTECTOPS, CS_REVENGE, CS_STOPNETHACK,
+  CS_ENFORCEBANS, CS_DYNAMICBANS, CS_DONTKICKOPS, CS_CYCLE, CS_DYNAMICLIMIT,
+  CS_BANTIME, CS_BANTYPE, CS_BANIDLE, CS_LIMITGAP, CS_LIMITDELAY,
+  CS_IGNORETIME, CS_COUNT
+} cset_id_t;
+
+/* Flood settings: the seven channel types (`flood <type>`), then the three
+ * bot floods (`bflood cmd|msg|ctcp`, D| only), then `sendq` (D| only; n =
+ * burst 1..100, s = interval ms 0..10000, never `off`). */
+typedef enum {
+  FL_CHAN = 0, FL_CTCP, FL_JOIN, FL_NICK, FL_DEOP, FL_KICK, FL_BAN,
+  FL_BOT_CMD, FL_BOT_MSG, FL_BOT_CTCP, FL_SENDQ, FL_COUNT
+} flood_kind_t;
+#define FL_CHAN_COUNT 7  /* FL_CHAN..FL_BAN are per-channel */
+
+typedef struct {
+  bool present;  /* an override is set */
+  bool off;      /* `off` */
+  int  n, s;     /* more than n events in s seconds trips it */
+} flood_spec_t;
+
+/* A parsed settings field: only the overrides it names. */
+typedef struct {
+  unsigned present;            /* bit per cset_id_t */
+  long     val[CS_COUNT];
+  flood_spec_t fl[FL_COUNT];
+  bool     bad_sendq;          /* a sendq=... token was present but invalid */
+} chan_settings_t;
+
+/* ---- chanflood.c / botflood.c: flood counters (modes.md §8, §9.1) ------- */
+#define MAX_FLOOD_TRACK  64   /* sources tracked per channel, oldest replaced */
+#define MAX_IGNORES      64   /* bot ignore table (runtime only) */
+#define MAX_HOST_TRACK   64   /* hosts tracked for the bot msg / ctcp floods */
+#define FLOOD_HOST_MAX   128  /* a tracked host (cut, lower-cased) */
+#define IGNORE_KEY_MAX   (FLOOD_HOST_MAX + 4) /* host, or "u:<uuid>" */
+#define QUIET_FILL_MS    60000 /* a table full within this -> quiet mode */
+
+/* One counting window: the first event opens it, more than n events before
+ * s seconds have passed from its start trips it.  Checked on arrival only. */
+typedef struct {
+  long long start_ms;   /* monotonic; 0 = no window open */
+  int       count;
+} flood_window_t;
+
+/* One source host in one channel: a window per channel flood type. */
+typedef struct {
+  char           host[FLOOD_HOST_MAX]; /* lower-cased; "" = free slot */
+  long long      last_ms;              /* last counted event (oldest = out) */
+  flood_window_t w[FL_CHAN_COUNT];
+  uint8_t        victim_auth;          /* bit per kind: a victim was authorised */
+} flood_src_t;
+
+typedef struct {
+  char      key[IGNORE_KEY_MAX]; /* "" = free */
+  long long since_ms, until_ms;
+} ignore_ent_t;
+
+typedef struct {
+  char           host[FLOOD_HOST_MAX]; /* "" = free */
+  long long      last_ms;
+  flood_window_t msg, ctcp;
+} host_flood_t;
+
+typedef struct {
+  char           uuid[37];             /* "" = free */
+  long long      last_ms;
+  flood_window_t w;
+  bool           notified;             /* the "slow down" notice went out */
+} cmd_flood_t;
+
+/* One server-side ban in a channel's ban list (367 + MODE +b/-b). */
+typedef struct {
+  char  *mask;                 /* heap, NUL-terminated */
+  char   setter[MAX_MEMBER_NICK + 32]; /* setter as the server printed it, cut */
+  time_t when;                 /* server's ts, 0 if unknown */
+} live_ban_t;
+
+/* One B| record (a network ban).  chan "*" = every managed channel. */
+typedef struct {
+  char   chan[MAX_CHAN];
+  char   mask[BAN_MASK_MAX + 1];
+  char   flags[8];             /* "s" sticky, "" none */
+  char   setter[BAN_SETTER_MAX + 1];
+  char   reason[BAN_REASON_MAX + 1];
+  time_t expires;              /* absolute unix time, 0 = permanent */
+  time_t ts;
+  bool   active;               /* false = tombstone (op "del") */
+  bool   push_pending;         /* bot-written, not yet pushed to a hub */
+} cfg_ban_t;
+
+/* 005 (RPL_ISUPPORT) values this bot uses; reset on every disconnect. */
+#define ISUPPORT_MODES_DEFAULT 3
+#define ISUPPORT_MODES_MAX     12
+#define NICKLEN_DEFAULT        30
+#define MAXLIST_DEFAULT        100
+#define BAN_LIST_CAP           200   /* our own ceiling on a stored list */
+typedef struct {
+  int  modes;                  /* MODES=: changes per MODE line */
+  int  maxlist_b;              /* MAXLIST for 'b' (or MAXBANS), 0 = unknown */
+  char prefix_modes[9];        /* PREFIX=(ohv)@%+ -> "ohv" */
+  char prefix_syms[9];         /*                    "@%+" */
+  int  nicklen;                /* NICKLEN=, default 30 */
+  char cm_a[64], cm_b[64], cm_c[64], cm_d[64]; /* CHANMODES=A,B,C,D */
+} isupport_t;
+
+/* Output send queue (sendq.c): three lanes, drained by pacing. */
+#define MAX_SENDQ        256   /* lines held, all lanes together */
+#define SENDQ_LANES      3
+#define SENDQ_LANE_PROTO 0     /* PONG, registration */
+#define SENDQ_LANE_PROT  1     /* MODE / KICK */
+#define SENDQ_LANE_REST  2     /* everything else (dropped first) */
+#define SENDQ_DEF_BURST  10    /* lines sent back to back (D| sendq B) */
+#define SENDQ_DEF_INTERVAL_MS 100 /* then one line per this (D| sendq I) */
+#define SENDQ_MIN_BURST  1
+#define SENDQ_MAX_BURST  100
+#define SENDQ_MIN_INTERVAL_MS 0     /* 0 = unpaced */
+#define SENDQ_MAX_INTERVAL_MS 10000
+#define SENDQ_LINE_MAX   510   /* IRC line body; CR LF is added after */
+typedef struct {
+  char *q[SENDQ_LANES][MAX_SENDQ]; /* ring per lane, heap lines w/ CRLF */
+  int   head[SENDQ_LANES];
+  int   count[SENDQ_LANES];
+  int   total;
+  int   burst;                 /* live D| sendq burst (lines) */
+  int   interval_ms;           /* live D| sendq interval; 0 = unpaced */
+  long long credit_ms;         /* send credit, capped at burst * interval */
+  long long last_ms;           /* monotonic ms of the last refill */
+  unsigned long dropped;       /* lines dropped because the queue was full */
+} sendq_t;
+
+/* Rate-limit memory for CMD_CHAN_EVENT (hub_client_chan_event). */
+typedef struct {
+  char   key[MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + 4];
+  time_t when;
+} chan_event_seen_t;
+typedef struct {
+  chan_event_seen_t seen[CHAN_EVENT_TRACK];
+  time_t window[CHAN_EVENT_WINDOW_MAX]; /* send times, ring */
+  int    widx;
+  unsigned suppressed;         /* dropped since the last summary */
+  char   sup_chan[MAX_CHAN];   /* channel of the latest suppressed event */
+  char   sup_action[16];
+} chan_event_lim_t;
+
+/* ---- chanenf.c: in-channel elections and set-option enforcement ------- */
+#define JOB_KICK   0   /* the five jobs, in deal order (modes.md §7.1) */
+#define JOB_BAN    1
+#define JOB_OP     2
+#define JOB_MODE   3
+#define JOB_LIMIT  4
+#define JOB_COUNT  5
+#define JOB_STEP_MS        1500   /* backup delay = backup index x this */
+#define MAX_PENDING_JOBS   32
+#define JOB_MIN_VERSION    "2.4.7" /* older bots are left out of the deal */
+#define JOB_MAX_AGE_MS     30000   /* a pending job older than this is dropped */
+#define ENF_SWEEP_SECS     5       /* per-channel state sweep when nothing happened */
+/* Idle clocks (ban_track, heap): one per channel x listed ban, so a network
+ * ban on "*" costs one per channel.  The ceiling covers every channel's own
+ * bans plus every global ban in every channel; the table is pruned by
+ * minute_sweep and only the oldest-matched clock goes if it is ever full. */
+#define MAX_BAN_TRACK      (CFG_MAX_BANS + MAX_GLOBAL_BANS * CFG_MAX_CHANNELS)
+#define ENF_RESWEEP_MS     2000    /* a dirty channel is swept at most this often */
+#define ENF_KICKS_PER_SWEEP 4      /* kicks queued per channel per ban sweep */
+#define MAX_OFFENCES       64
+#define ENF_RECENT         32
+#define ENF_CYCLE_MIN_SECS 600     /* +cycle: at most one part/rejoin per this */
+
+/* What a pending job does when it falls due (each is re-checked first). */
+typedef enum {
+  JA_DEOP = 0, JA_DEHALF, JA_REOP, JA_KICK, JA_BAN_NUH, JA_BAN_MASK,
+  JA_UNBAN, JA_MODE, JA_LIMIT, JA_COUNT
+} job_act_t;
+
+typedef struct {
+  bool      used;
+  uint8_t   act;                       /* job_act_t */
+  char      chan[MAX_CHAN];
+  char      target[MAX_MASK_LEN];      /* nick, nick!user@host or ban mask */
+  char      reason[BAN_REASON_MAX + 1];
+  long long created_ms;                /* monotonic */
+} pending_job_t;
+
+/* Idle clock of a listed ban on a channel (+dynamicbans / banidle). */
+typedef struct {
+  char   chan[MAX_CHAN];
+  char   mask[BAN_MASK_MAX + 1];
+  time_t last_match;                   /* last time an unauthorised member matched */
+  time_t set_at;                       /* when this bot last sent +b for it */
+  time_t checked_at;                   /* last §6.2 overlap check (cached 60 s) */
+  bool   overlap_ok;                   /* its result */
+} ban_track_t;
+
+/* Repeat-offence memory for +revenge and the flood ladder (runtime only). */
+typedef struct {
+  char   key[MAX_CHAN + 128];          /* lower(chan) '|' lower(host) */
+  time_t when;
+  unsigned count;
+} offence_t;
+
+typedef struct { char key[MAX_CHAN + 8 + MAX_MASK_LEN]; long long when_ms; } enf_recent_t;
 
 struct chan_t {
   char name[MAX_CHAN];
@@ -560,10 +819,51 @@ struct chan_t {
   bool op_request_pending;
   time_t last_op_request_time;
   int op_request_retry_count;
+  /* OP_GRANTs that came in before our own +o (a channel just created, every
+   * bot joining at once): granted when the +o lands, dropped after
+   * OP_GRANT_HOLD_SECS.  Without it the asker waits out its 60 s timeout. */
+  struct {
+    char nick[MAX_NICK];
+    time_t at;
+  } op_grant_held[OP_GRANT_HOLD_MAX];
+  int op_grant_held_count;
   /* Channel-access chasing, one slot per chan_req_kind_t: a channel we are
    * both banned from and that is +i is chased on both counts independently. */
   time_t last_access_request[CHAN_REQ_KIND_COUNT];
   int access_retry_count[CHAN_REQ_KIND_COUNT];
+  /* C| record (modes.md §2): the stored modes string, the raw settings field
+   * (unknown names kept verbatim) and its parse.  Written only by the
+   * console; cfg_ts 0 = never seen. */
+  char cfg_modes[C_MODES_MAX + 1];
+  char cfg_settings[C_SETTINGS_MAX + 1];
+  chan_settings_t cfg_set;
+  time_t cfg_ts;
+  bool cfg_active;
+  /* Live state (never persisted, §5.4): modes from 324 + MODE, the ban list
+   * from 367 + MODE.  live_flags has a bit per mode letter (chan_live_bit). */
+  uint64_t live_flags;
+  char   live_key[MAX_KEY];
+  long   live_limit;           /* 0 = none */
+  bool   live_known;           /* a 324 (or our own MODE echo) was seen */
+  time_t live_created;         /* 329 */
+  live_ban_t *bans;
+  int    ban_count, ban_cap;
+  bool   ban_list_open;        /* between the first 367 and the 368 */
+  bool   ban_list_known;       /* a full list was received */
+  bool   ban_overflow_logged;
+  bool   who_done;             /* the channel WHO finished (315) this stay */
+  /* A key / mode this bot learned and has not yet got to a hub: pushed in a
+   * full config push even under opt 'h' (D43). */
+  bool   enf_pending;
+  /* chanflood.c: per-source flood windows, heap, MAX_FLOOD_TRACK slots,
+   * allocated on the first counted event and freed by channel_live_reset. */
+  flood_src_t *flood;
+  /* chanenf.c runtime */
+  bool   enf_dirty;            /* sweep at the next tick */
+  bool   enf_ops_check;        /* gained ops / settings changed: +bitch sweep */
+  bool   ban_cap_warned;       /* -dynamicbans overflow warning logged */
+  long long enf_last_sweep_ms; /* monotonic */
+  time_t enf_last_limit, enf_last_cycle;
   chan_t *next;
 };
 
@@ -864,6 +1164,39 @@ struct bot_state {
   char   upgrade_report_id[64];
   char   upgrade_report_ops[UPGRADE_OPS_MAX];
   time_t upgrade_report_since;
+
+  /* ---- modes.md ---- */
+  sendq_t sendq;                /* output queue (sendq.c) */
+  isupport_t isup;              /* this server's 005 (chanlive.c) */
+  /* D| network defaults: stored modes, raw settings, parse. */
+  char   net_modes[C_MODES_MAX + 1];
+  char   net_settings[D_SETTINGS_MAX + 1];
+  chan_settings_t net_set;
+  time_t net_ts;
+  /* B| records, heap, grown on demand up to CFG_MAX_BANS. */
+  cfg_ban_t *cfg_bans;
+  int    cfg_ban_count, cfg_ban_cap;
+  chan_event_lim_t chan_event;
+  /* chanenf.c: pending in-channel jobs, ban idle clocks, offences. */
+  unsigned cfg_gen;            /* bumped when a C| / D| / B| record changes */
+  unsigned enf_seen_gen;
+  pending_job_t jobs[MAX_PENDING_JOBS];
+  ban_track_t *ban_track;      /* heap, ban_track_count of ban_track_cap */
+  int    ban_track_count, ban_track_cap;
+  unsigned auth_gen;           /* bumped when cfg_gen or the auth records change */
+  unsigned auth_seen_cfg_gen;
+  uint64_t auth_fp;            /* fingerprint of trusted bots / users / masks */
+  long long auth_fp_ms;        /* monotonic time of the last fingerprint */
+  offence_t offences[MAX_OFFENCES];
+  enf_recent_t enf_recent[ENF_RECENT];
+  int    enf_recent_idx;
+  time_t enf_last_minute;
+  /* botflood.c: ignore table, quiet mode, host and per-user windows. */
+  ignore_ent_t ignores[MAX_IGNORES];
+  long long    quiet_until_ms;    /* 0 / past = not quiet */
+  bool         quiet_logged;      /* the episode's one log line went out */
+  host_flood_t host_flood[MAX_HOST_TRACK];
+  cmd_flood_t  cmd_flood[MAX_USER_RECORDS];
 };
 
 // ... [Function Prototypes same as before] ...
@@ -886,6 +1219,15 @@ void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]);
 /* Case-insensitive IRC-style glob ('*', '?').  Used for usermasks and for
  * matching a requester's hostmask against channel ban masks. */
 bool auth_wildcard_match(const char *pattern, const char *text);
+/* modes.md §1: true when nick!user@host matches a trusted-bot mask or an
+ * active usermask of an active admin/oper -- "authorised".  Everyone else is
+ * unauthorised.  The one test all channel protection is built on. */
+bool auth_is_authorised(const bot_state_t *state, const char *nuh);
+/* modes.md §6.2 step 2: true when ban mask `mask` could also match a
+ * trusted-bot mask or an active usermask (glob overlap).  `who`, if given,
+ * receives a label for the first conflict. */
+bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
+                                   char *who, size_t who_size);
 /* a|/o| and b| record codec shared by config.c and hub_client.c. */
 bool config_parse_user_line(const char *data, user_line_t *out);
 int config_format_user_line(const user_record_t *u, char *buf, size_t len);
@@ -907,9 +1249,229 @@ chan_t *channel_find(const bot_state_t *state, const char *name);
 void channel_list_destroy(bot_state_t *state);
 void channel_list_reset_status(bot_state_t *state);
 void channel_manager_check_joins(bot_state_t *state);
+void channel_manager_check_joins(bot_state_t *state);
+/* channel.c: free a channel's live ban list and reset its live state. */
+void channel_live_reset(chan_t *c);
+
+/* ---- chanlive.c: 005, live modes, ban lists (modes.md §5.4) ---- */
+void isupport_reset(bot_state_t *state);
+/* 005 parameters: "<me> TOKEN[=v] ... :are supported by this server". */
+void isupport_parse(bot_state_t *state, char *params);
+/* Does MODE letter `m` take an argument when set (adding) / cleared? */
+bool isupport_mode_has_arg(const bot_state_t *state, char m, bool adding);
+bool isupport_is_prefix_mode(const bot_state_t *state, char m);
+int  isupport_ban_cap(const bot_state_t *state);   /* min(MAXLIST, 200) */
+int  isupport_nicklen(const bot_state_t *state);   /* NICKLEN, <= MAX_MEMBER_NICK-1 */
+uint64_t chan_live_bit(char letter);               /* 0 if not a letter */
+bool chan_live_has(const chan_t *c, char letter);
+/* Apply "<modes> [args...]" (a 324 or a MODE) to c's live state; args is
+ * modified.  from_324 resets the live modes first. */
+void chanlive_apply(bot_state_t *state, chan_t *c, const char *modes,
+                    char *args, bool from_324);
+void chanlive_ban_add(bot_state_t *state, chan_t *c, const char *mask,
+                      const char *setter, time_t when);
+void chanlive_ban_del(chan_t *c, const char *mask);
+void chanlive_ban_list_end(chan_t *c);
+/* 324 / 329 / 367 / 368 numerics: params after the command word. */
+void chanlive_numeric(bot_state_t *state, const char *command, char *params);
+/* Ask the server for a channel's modes and ban list (own JOIN). */
+void chanlive_request(bot_state_t *state, chan_t *c);
+/* Election kind `mode` (CMD_CHAN_DO): queue the MODE lines that move the live
+ * modes to the stored C| modes + c| key.  Returns lines queued, -1 = no
+ * stored/known state to act on.  *summary gets a short note. */
+int  chanmode_apply_stored(bot_state_t *state, chan_t *c, char *summary,
+                           size_t summary_size);
+/* The same diff for the mode job: skip_limit leaves +l to the dynamic limit,
+ * dry only counts, require_known refuses to act without a received 324. */
+int  chanmode_sync(bot_state_t *state, chan_t *c, bool skip_limit, bool dry,
+                   bool require_known, char *summary, size_t summary_size);
+/* True when `nick` is in c's roster and authorised; *found says whether the
+ * nick was in the roster at all. */
+bool chan_member_authorised(const bot_state_t *state, const chan_t *c,
+                            const char *nick, bool *found);
+
+/* ---- chancfg.c: C| / D| / B| records and effective settings ---- */
+bool chancfg_parse_settings(const char *s, bool net, chan_settings_t *out);
+/* Each takes the line body after "X|" and applies it under LWW.  True when
+ * the stored record changed. */
+bool chancfg_apply_c_line(bot_state_t *state, const char *data);
+bool chancfg_apply_d_line(bot_state_t *state, const char *data);
+bool chancfg_apply_b_line(bot_state_t *state, const char *data);
+/* Line writers ("C|...\n" with the newline).  Return length, <0 on overflow. */
+int  chancfg_format_c_line(const chan_t *c, char *buf, size_t len);
+int  chancfg_format_d_line(const bot_state_t *state, char *buf, size_t len);
+int  chancfg_format_b_line(const cfg_ban_t *b, char *buf, size_t len);
+/* Effective values: channel override -> D| -> built-in.  c may be NULL (net
+ * level only).  Flags return 0/1. */
+long chancfg_get(const bot_state_t *state, const chan_t *c, cset_id_t id);
+/* Flood limits; false when the flood is off.  FL_BOT_* ignore c. */
+bool chancfg_get_flood(const bot_state_t *state, const chan_t *c,
+                       flood_kind_t kind, int *n, int *s);
+/* Stored modes string: C| -> D| -> "+nt". */
+const char *chancfg_get_modes(const bot_state_t *state, const chan_t *c);
+/* Drop B| tombstones stamped before cutoff (0 = all); returns count. */
+int  chancfg_purge_bans(bot_state_t *state, time_t cutoff);
+/* Active bans for `chan` (its own and "*"), at most max; returns count. */
+int  chancfg_bans_for(const bot_state_t *state, const char *chan,
+                      const cfg_ban_t **out, int max);
+/* Bot-written B| (an automatic ban): stored here, pushed to the hub; a
+ * timed ban only (expires > now).  del=true writes the "del" for a ban this
+ * bot wrote.  Pushed regardless of opt 'h' (D43). */
+bool chancfg_bot_ban(bot_state_t *state, const char *chan, const char *mask,
+                     time_t expires, const char *flags, const char *reason,
+                     bool del);
+/* Local (bot command) writes, same line formats as the hub, LWW-stamped past
+ * the stored record, applied at once, pushed to a connected hub and saved.
+ * Not gated here: the caller checks admin_change_refused. */
+bool chancfg_local_c(bot_state_t *state, chan_t *c, const char *modes,
+                     const char *settings);
+bool chancfg_local_d(bot_state_t *state, const char *modes,
+                     const char *settings);
+bool chancfg_local_ban(bot_state_t *state, const char *chan, const char *mask,
+                       time_t expires, const char *flags, const char *setter,
+                       const char *reason, bool del);
+/* Active network ban for chan+mask, or NULL. */
+const cfg_ban_t *chancfg_ban_get(const bot_state_t *state, const char *chan,
+                                 const char *mask);
+/* Edit a settings field in place: set name=value or (value "default") drop it.
+ * name is "bitch", "bantime", "flood join", "bflood cmd", ...  net allows the
+ * D|-only names.  False with `why` filled when the name or value is bad. */
+bool chancfg_settings_edit(char *settings, size_t cap, bool net,
+                           const char *name, const char *value, char *why,
+                           size_t why_size);
+bool chancfg_setting_is_flag(const char *name);
+/* Listing support: index 0..CS_COUNT-1 are the cset_id_t settings, then the
+ * FL_COUNT floods.  name is NULL past the end or for a hidden one. */
+const char *chancfg_item_name(int idx, bool net);
+/* 2 = channel override, 1 = network default, 0 = built-in. */
+int  chancfg_item_source(const bot_state_t *state, const chan_t *c, int idx);
+void chancfg_free(bot_state_t *state);
+/* Opt 'h' (D43): true when an ADMIN-initiated change to hub records must be
+ * refused.  Enforcement writes (learned keys, modes, auto bans) never ask. */
+bool admin_change_refused(const bot_state_t *state);
+/* ---- chanenf.c: in-channel elections + set options (modes.md §4, §6, §7) -- */
+/* Parser hooks, called after the live state is updated.  `prefix` is the
+ * message source ("nick!user@host", or a server name with no '!'). */
+void chanenf_on_join(bot_state_t *state, const char *chan, const char *nuh);
+void chanenf_on_part(bot_state_t *state, const char *chan, const char *nick);
+void chanenf_on_quit(bot_state_t *state, const char *nick);
+void chanenf_on_kick(bot_state_t *state, const char *chan, const char *prefix,
+                     const char *victim);
+void chanenf_on_nick(bot_state_t *state, const char *old_nick,
+                     const char *new_nick);
+void chanenf_on_mode(bot_state_t *state, const char *chan, const char *prefix,
+                     const char *modes, char *args);
+/* Add or replace a roster entry (WHO reply, JOIN); false when full. */
+bool chanenf_roster_set(chan_t *c, const char *nick, const char *hostmask,
+                        bool op, bool halfop, bool voice);
+/* Main-loop tick (<= 1 s): sweeps, pending jobs, 60 s ban expiry. */
+void chanenf_tick(bot_state_t *state);
+/* The deal: this bot's backup index (0 = holds the job now) for job JOB_*
+ * in channel c, or -1 when it takes no part (not opped, not in the deal). */
+int  chanenf_deal_rank(bot_state_t *state, const chan_t *c, int job);
+/* Pure helpers (also what bot commands / the console path will use). */
+bool chanenf_ban_mask(int type, const char *nuh, char *out, size_t out_size);
+bool chanenf_ban_allowed(bot_state_t *state, const chan_t *c, const char *mask,
+                         char *who, size_t who_size);
+bool chanenf_auto_ban_mask(bot_state_t *state, const chan_t *c, const char *nuh,
+                           char *out, size_t out_size);
+/* Hooks for the flood / ladder lane.  Each queues a job in the channel
+ * election (executed at once by the job holder, after backup delay by the
+ * others, re-checked first).  true = queued/ran, false = not eligible. */
+bool chanenf_request_kick(bot_state_t *state, const char *chan,
+                          const char *nick, const char *reason);
+bool chanenf_request_deop(bot_state_t *state, const char *chan,
+                          const char *nick, const char *reason);
+/* Automatic ban of the host in `nuh` (bantype, bantime, §6.2 narrowing
+ * retry, bot-written B|); kick_too also requests the kick for that nick. */
+bool chanenf_request_ban(bot_state_t *state, const char *chan, const char *nuh,
+                         const char *reason, bool kick_too);
+/* Repeat-offence memory keyed by channel + host: counts this one, forgets
+ * after bantime; returns the count (1 = first offence). */
+unsigned chanenf_offence(bot_state_t *state, const char *chan, const char *nuh);
+/* True for this bot itself or an authorised user/bot (nick!user@host). */
+bool chanenf_nuh_authorised(const bot_state_t *state, const char *nuh);
+/* Same, using the roster's cached verdict when nuh is a member of c. */
+bool chanenf_chan_nuh_authorised(bot_state_t *state, const chan_t *c,
+                                 const char *nuh);
+/* ---- chanflood.c: channel floods (modes.md §8) ---- */
+/* Pure window step: true when this event is the N+1th inside the window (the
+ * window is then reset, so one trip is reported once).  n/s from the setting. */
+bool flood_window_hit(flood_window_t *w, int n, int s, long long now_ms);
+/* Count one event of `kind` from nick!user@host in `chan`; trips run the §8.3
+ * ladder.  victim_auth: the event hurt an authorised member (+revenge). */
+void chanflood_event(bot_state_t *state, const char *chan, const char *nuh,
+                     flood_kind_t kind, bool victim_auth);
+/* Testable core: true when the event tripped its flood (no ladder run). */
+bool chanflood_count_at(bot_state_t *state, chan_t *c, const char *nuh,
+                        flood_kind_t kind, bool victim_auth, long long now_ms,
+                        bool *auth_victim_out);
+long long flood_now_ms(void);
+/* PRIVMSG / NOTICE to a channel: counts as chan, or ctcp for a non-ACTION CTCP. */
+void chanflood_on_text(bot_state_t *state, const char *chan, const char *nick,
+                       const char *user, const char *host, const char *msg);
+
+/* ---- botflood.c: bot floods, ignore table, quiet mode (modes.md §9.1) ---- */
+#define BF_OK     0   /* carry on */
+#define BF_DROP   1   /* drop this one (a command over its limit) */
+#define BF_IGNORE 2   /* source ignored: drop silently */
+#define BF_IGNORE_NEW 3 /* cmd: ignored from now on (also an ignore) */
+/* Per-host floods for non-command PRIVMSG / NOTICE (msg) and CTCP (ctcp) to
+ * the bot.  Authorised sources are never counted.  BF_IGNORE = answer nothing. */
+int  botflood_msg(bot_state_t *state, const char *nuh);
+int  botflood_ctcp(bot_state_t *state, const char *nuh);
+/* Is this source host ignored right now (no count)? */
+bool botflood_host_ignored(bot_state_t *state, const char *nuh);
+/* `flood cmd` for one user record, called for every sealed command about to
+ * run.  BF_DROP also sends the one "slow down" notice per window to `nick`. */
+int  botflood_cmd(bot_state_t *state, const user_record_t *who, const char *nick);
+/* Quiet mode: unauthorised sources get no reply at all. */
+bool botflood_quiet(bot_state_t *state);
+/* Testable cores (now_ms injected). */
+int  botflood_msg_at(bot_state_t *state, const char *nuh, bool authorised,
+                     long long now_ms);
+int  botflood_ctcp_at(bot_state_t *state, const char *nuh, bool authorised,
+                      long long now_ms);
+int  botflood_cmd_at(bot_state_t *state, const user_record_t *who,
+                     long long now_ms, bool *notice);
+
+/* ---- chancmd.c: bot commands for hubless networks (modes.md §5.2) ---- */
+void chancmd_chanmode(bot_state_t *state, const char *nick,
+                      const user_record_t *who, char *args);
+void chancmd_chanset(bot_state_t *state, const char *nick,
+                     const user_record_t *who, char *args);
+void chancmd_ban_add(bot_state_t *state, const char *nick,
+                     const user_record_t *who, char *args);
+void chancmd_ban_del(bot_state_t *state, const char *nick,
+                     const user_record_t *who, char *args);
+void chancmd_bans(bot_state_t *state, const char *nick, char *args);
+
+/* enforcemodes with a k in the stored modes: the key is the bots', so a key
+ * someone else sets or clears is not learned (§3.3). */
+bool chanenf_key_managed(const bot_state_t *state, const chan_t *c);
+
 void irc_connect(bot_state_t *state);
 void irc_disconnect(bot_state_t *state);
 int irc_printf(bot_state_t *state, const char *format, ...);
+/* The actual write of one finished line to the server socket (the send
+ * queue calls it when pacing allows).  A write error disconnects. */
+int irc_write_raw(bot_state_t *state, const char *buffer, int len);
+
+/* ---- sendq.c: paced output queue (modes.md §10) ---- */
+void sendq_init(bot_state_t *state);
+void sendq_set_limits(bot_state_t *state, int burst, int interval_ms);
+int  sendq_next_ms(bot_state_t *state);          /* ms to next line, -1 none */
+void sendq_clear(bot_state_t *state);            /* link gone: drop it all */
+/* Queue one finished line (ends in CRLF).  Lane by verb: PONG / registration
+ * -> proto, MODE changes / KICK -> protection, the rest -> other.  Drains at
+ * once while credit lasts.  Returns len, or -1 when it had to be dropped. */
+int  sendq_enqueue(bot_state_t *state, const char *line, int len);
+int  sendq_drain(bot_state_t *state);            /* lines written now */
+bool sendq_pending(const bot_state_t *state);
+/* True when lines wait AND credit allows one now (select write-set hint). */
+bool sendq_ready(bot_state_t *state);
+int  sendq_lane_of(const char *line);            /* SENDQ_LANE_* for a line */
+
 void irc_handle_read(bot_state_t *state);
 void irc_check_status(bot_state_t *state);
 void irc_attempt_nick_change(bot_state_t *state, const char *new_nick);
@@ -1070,6 +1632,15 @@ void hub_client_push_admin_delta(bot_state_t *state);
 bool hub_client_push_delta(bot_state_t *state, const char *key,
                            const char *value, time_t ts);
 void hub_client_push_channel(bot_state_t *state, chan_t *chan);
+/* Send complete record lines ("B|...\n", "c|...\n") to the hub as one
+ * CMD_CONFIG_PUSH, whatever opt 'h' says (D43).  False when no hub link. */
+bool hub_client_push_lines(bot_state_t *state, const char *lines, size_t len);
+/* CMD_CHAN_EVENT (D42): one enforcement action, bot-side rate limited
+ * (CHAN_EVENT_*).  action: deop reop kick ban unban moderevert limit
+ * floodtrip ignore.  True when a frame was sent. */
+bool hub_client_chan_event(bot_state_t *state, const char *chan,
+                           const char *action, const char *target,
+                           const char *detail);
 void hub_client_sync_hostmask(bot_state_t *state);
 void hub_client_heartbeat(bot_state_t *state);
 /* Report version / IRC server / start time to the hub for the 'bots' tree.
@@ -1090,6 +1661,7 @@ bool hub_client_send_activity_query(bot_state_t *state, const char *payload);
 void commands_activity_reply(bot_state_t *state, char *payload);
 void commands_activity_tick(bot_state_t *state, time_t now);
 void hub_client_on_connect(bot_state_t *state);
+void hub_client_grant_held_ops(bot_state_t *state, chan_t *c);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 bool hub_client_send_invite_request(bot_state_t *state, const char *nick,

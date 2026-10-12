@@ -82,16 +82,8 @@ static void tree_prefix(char *out, size_t cap, int depth, const bool *last_at,
   if (n < 0 || (size_t)n >= cap - o) out[o] = '\0';
 }
 
-/* Anti-flood pause between reply lines on IRC.  A DCC chat is a direct
- * connection with no server flood limit, so its replies are not paced. */
-static void reply_pace(const bot_state_t *state, const struct timespec *d) {
-  if (!state->dcc_reply)
-    nanosleep(d, NULL);
-}
-
-/* Rows a list reply may print before it stops.  On IRC every row is paced and
- * the dispatch blocks while it runs, so lists stop at BOT_STATUS_MAX_LINES
- * (anti-flood); a DCC chat has neither problem, so it gets everything. */
+/* Rows a list reply may print before it stops.  On IRC every row goes through
+ * the paced send queue, so lists stop at BOT_STATUS_MAX_LINES (anti-flood); a DCC chat has no such limit, so it gets everything. */
 static int reply_row_cap(const bot_state_t *state) {
   return state->dcc_reply ? INT_MAX : BOT_STATUS_MAX_LINES;
 }
@@ -267,6 +259,8 @@ static const cmd_log_rule_t LOGGABLE_CMDS[] = {
   {"-usermask", 0}, {"+server", 0}, {"-server", 0},   {"update", 0},
   {"+hub", 0},     {"-hub", 0},     {"rekey", 0},     {"help", 0},
   {"dcc", 0},      {"servers", 0},  {"bots", 0},
+  {"chanmode", 0}, {"chanset", 0},  {"+ban", 0},      {"-ban", 0},
+  {"bans", 0},
   {NULL, 0}
 };
 
@@ -580,7 +574,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                                   const char *user_host,
                                   user_record_t *auth_user, bool is_admin,
                                   bool is_op, char *command, char *arg1,
-                                  char *arg2, char *arg3);
+                                  char *arg2, char *arg3, char *argline);
 
 /* Split, screen and dispatch one opened command line, from PRIVMSG or a DCC
  * chat.  nick is the reply target; cmd_line points into the caller's
@@ -589,6 +583,30 @@ static void run_user_command(bot_state_t *state, const char *nick,
                              const char *user_host, user_record_t *auth_user,
                              char *cmd_line) {
   char *sp_cmd;
+  /* The commands that take a free-form tail (chanmode, chanset, +ban, -ban,
+   * bans) get the whole argument line, copied before strtok_r cuts it up. */
+  char argbuf[SEAL_MAX_PLAINTEXT + 1];
+  char *argline = NULL;
+  {
+    const char *cl = cmd_line;
+    while (*cl == ' ')
+      cl++;
+    size_t vl = strcspn(cl, " ");
+    static const char *const TAILED[] = {"chanmode", "chanset", "+ban", "-ban",
+                                         "bans", NULL};
+    for (int i = 0; TAILED[i]; i++) {
+      if (strlen(TAILED[i]) == vl && strncasecmp(cl, TAILED[i], vl) == 0) {
+        const char *a = cl + vl;
+        while (*a == ' ')
+          a++;
+        if (strlen(a) < sizeof(argbuf)) {
+          memcpy(argbuf, a, strlen(a) + 1);
+          argline = argbuf;
+        }
+        break;
+      }
+    }
+  }
   char *command = strtok_r(cmd_line, " ", &sp_cmd);
   char *arg1    = strtok_r(NULL,     " ", &sp_cmd);
   char *arg2    = strtok_r(NULL,     " ", &sp_cmd);
@@ -597,6 +615,14 @@ static void run_user_command(bot_state_t *state, const char *nick,
   bool is_op    = command && auth_user->type == 'o';
   if (!is_admin && !is_op) {
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
+    secure_wipe(argbuf, sizeof(argbuf));
+    return;
+  }
+  /* flood cmd (§9.1): per user record, PRIVMSG and DCC together */
+  if (botflood_cmd(state, auth_user, nick) != BF_OK) {
+    log_message(L_CMD, state, "[CMD] Command from %s (%s) dropped: flood "
+                              "limit\n", auth_user->name, user_host);
+    secure_wipe(argbuf, sizeof(argbuf));
     return;
   }
 
@@ -609,6 +635,8 @@ static void run_user_command(bot_state_t *state, const char *nick,
   for (size_t i = 0; i < sizeof(toks) / sizeof(toks[0]); i++)
     if (toks[i] && strchr(toks[i], '|'))
       has_delim = true;
+  if (argline && strchr(argline, '|'))
+    has_delim = true;
 
   if (has_delim) {
     log_message(L_CMD, state, "[CMD] '|' in command from %s (%s); dropped\n",
@@ -619,8 +647,9 @@ static void run_user_command(bot_state_t *state, const char *nick,
     log_user_command(state, is_admin ? "CMD_ADMIN" : "CMD_OP", auth_user,
                      user_host, command, arg1, arg2, arg3);
     dispatch_user_command(state, nick, user_host, auth_user, is_admin, is_op,
-                          command, arg1, arg2, arg3);
+                          command, arg1, arg2, arg3, argline);
   }
+  secure_wipe(argbuf, sizeof(argbuf));
 }
 
 /* Run an opened command.  For ~A2S (rk set) its replies to nick are sealed
@@ -670,7 +699,14 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
    * ~A2 / ~A2S carry a sealed command (~A2S: sealed replies).  Anything else
    * — including the retired password formats ~A1 / ~A1c — is
    * unauthenticated and dropped below. */
+  /* §9.1: a host the msg / ctcp flood ignores (or quiet mode) gets nothing
+   * from here on -- no auth reply, no command.  Authorised hosts never are. */
+  if (botflood_host_ignored(state, user_host))
+    return;
   if (strncmp(message, "~A2A ", 5) == 0) {
+    /* not a command: counts against the host's msg flood */
+    if (botflood_msg(state, user_host) != BF_OK)
+      return;
     a2_handle_auth(state, nick, user_host, dest, message + 5);
     return;
   }
@@ -695,8 +731,12 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   if (auth_user && cmd_line)
     a2_dispatch(state, nick, user_host, dest, auth_user, cmd_line,
                 sealed ? rk : NULL);
-  else
+  else {
+    /* plain text, a retired frame, or a ~A2/~A2S that did not open: all
+     * count against the host's msg flood */
+    botflood_msg(state, user_host);
     log_message(L_CMD, state, "[CMD_DEBUG] Auth failed for %s.\n", user_host);
+  }
   /* The decrypted command (channel keys, masks, hub addresses) never outlives
    * its processing; nothing points into it once dispatch has returned. */
   secure_wipe(cmd_plaintext, sizeof(cmd_plaintext));
@@ -803,10 +843,8 @@ static void help_keypair(bot_state_t *state, const char *nick) {
     "  shred -u ed.pem x.pem    (or rm -f; the .pem files hold the private key)",
     NULL
   };
-  struct timespec d = {0, 100000000};
   for (int i = 0; lines[i]; i++) {
     irc_printf(state, "PRIVMSG %s :%s\r\n", nick, lines[i]);
-    reply_pace(state, &d);
   }
 }
 
@@ -826,10 +864,8 @@ static void help_auth(bot_state_t *state, const char *nick) {
     "fetches the new key.",
     NULL
   };
-  struct timespec d = {0, 100000000};
   for (int i = 0; lines[i]; i++) {
     irc_printf(state, "PRIVMSG %s :%s\r\n", nick, lines[i]);
-    reply_pace(state, &d);
   }
 }
 
@@ -837,7 +873,6 @@ static void help_auth(bot_state_t *state, const char *nick) {
  * key fingerprint and last-seen time. */
 static void list_users(bot_state_t *state, const char *nick, char type) {
   const char *what = type == 'a' ? "admins" : "opers";
-  struct timespec delay = {0, 100000000};
   /* Find max name width for alignment (min 8) */
   int name_w = 8;
   for (int i = 0; i < state->user_record_count; i++) {
@@ -868,7 +903,6 @@ static void list_users(bot_state_t *state, const char *nick, char type) {
     irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
                nick, name_w, u->name, kfp, ts_buf, del_tag);
     shown++;
-    reply_pace(state, &delay);
   }
   if (shown == 0)
     irc_printf(state, "PRIVMSG %s :| (no %s)\r\n", nick, what);
@@ -883,7 +917,6 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
   irc_printf(state, "PRIVMSG %s :| ircbot %s match%s\r\n", nick, BOT_VERSION,
              match_all ? " *" : "");
   irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
-  struct timespec delay = {0, 100000000};
   /* shown counts printed rows (a user line and each of its masks); once
    * the cap is reached the rest are only counted, for the closing note. */
   int shown = 0, omitted = 0;
@@ -912,7 +945,6 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
     user_key_fp(u, kfp);
     irc_printf(state, "PRIVMSG %s :| [%c] %-20s  key %s  (last seen: %s)\r\n",
                nick, u->type, u->name, kfp, ts_buf);
-    reply_pace(state, &delay);
     shown++;
     for (int j = 0; j < state->mask_record_count; j++) {
       mask_record_t *m = &state->mask_records[j];
@@ -929,7 +961,6 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
       }
       irc_printf(state, "PRIVMSG %s :|   %s  (last used: %s)\r\n",
                  nick, m->mask, used_buf);
-      reply_pace(state, &delay);
       shown++;
     }
   }
@@ -954,7 +985,6 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
       }
       irc_printf(state, "PRIVMSG %s :| [b] %-20s  (last seen: %s)\r\n",
                  nick, bot_nick, ts_buf);
-      reply_pace(state, &delay);
       if (bot_mask[0])
         irc_printf(state, "PRIVMSG %s :|   mask: %s\r\n", nick, bot_mask);
       if (bot_uuid[0])
@@ -970,7 +1000,6 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
                             ? state->current_hub : "none";
       irc_printf(state, "PRIVMSG %s :|   hub : %s\r\n", nick, hub_str);
       shown++;
-      reply_pace(state, &delay);
       break;
     }
   }
@@ -1139,7 +1168,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                                   const char *user_host,
                                   user_record_t *auth_user, bool is_admin,
                                   bool is_op, char *command, char *arg1,
-                                  char *arg2, char *arg3) {
+                                  char *arg2, char *arg3, char *argline) {
   if (is_admin) {
     /* opt 'h' (OPT_HUB_ONLY_MUTATIONS): when set by the network, the bot
      * refuses local mutation of hub-authoritative records.  These commands
@@ -1151,6 +1180,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         "+bot", "-bot",
         "join", "part",
         "chkey",
+        "chanmode", "chanset", "+ban", "-ban", /* modes.md §5.2 */
         /* +hub / -hub are intentionally NOT here: hub membership is a
          * bot-local connection concern (the hub-only-mutation boundary
          * covers mesh-replicated records, not which hubs this bot dials),
@@ -1464,7 +1494,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         else if (state->user_records[i].type == 'o') oper_count++;
       }
 
-      struct timespec st_delay = {0, 80000000}; /* 80ms anti-flood */
 
       irc_printf(state, "PRIVMSG %s :| ircbot %s status\r\n", nick, BOT_VERSION);
       irc_printf(state, "PRIVMSG %s :%s\r\n", nick, ST_SEP);
@@ -1485,7 +1514,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :| Uptime   : %s\r\n", nick, uptime_str);
       irc_printf(state, "PRIVMSG %s :| Network  : %s (%s, TLS: %s)\r\n",
                  nick, srv, conn_str, state->is_ssl ? "YES" : "NO");
-      reply_pace(state, &st_delay);
 
       /* Servers section — only shown when multiple servers configured */
       if (state->server_count > 1) {
@@ -1511,7 +1539,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           }
         }
         irc_printf(state, "PRIVMSG %s :| %s\r\n", nick, srv_line);
-        reply_pace(state, &st_delay);
       }
 
       /* Channels section — collect IN and OUT into comma-wrapped lines */
@@ -1570,13 +1597,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         if (out_buf[0])
           irc_printf(state, "PRIVMSG %s :| (OUT) %s\r\n", nick, out_buf);
       }
-      reply_pace(state, &st_delay);
 
       /* Access Control — counts only */
       irc_printf(state, "PRIVMSG %s :+-[ Access Control ]---------------------------------------------------------\r\n", nick);
       irc_printf(state, "PRIVMSG %s :| Admins : %-4d  Ops: %d\r\n",
                  nick, admin_count, oper_count);
-      reply_pace(state, &st_delay);
 
       /* Hub Config or standalone Bots section */
 #define HUB_TRUST_MAX 100
@@ -1893,10 +1918,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                  "lines --- \r\n",
                  nick, arg1, lines_to_print, matches_found);
 
-      struct timespec delay = {0, 250000000};
       for (int i = matches_found - 1; i >= start_index; i--) {
         irc_printf(state, "PRIVMSG %s :%s\r\n", nick, matches[i]->line);
-        reply_pace(state, &delay);
       }
       irc_printf(state, "PRIVMSG %s :--- End of Log (%s) --- \r\n", nick, arg1);
     } else if (strcasecmp(command, "admins") == 0) {
@@ -2123,7 +2146,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         return;
       }
 
-      struct timespec delay = {0, 100000000};
       const bool have_tree = (state->bot_tree_ts != 0 &&
                               state->bot_tree_count > 0);
       irc_printf(state,
@@ -2153,7 +2175,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               bots_widen(&row, &name_col, &ver_col, &up_col);
             } else {
               bots_emit(state, nick, &row, name_col, ver_col, up_col);
-              reply_pace(state, &delay);
             }
             shown++;
           }
@@ -2174,7 +2195,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
             bots_widen(&row, &name_col, &ver_col, &up_col);
           } else {
             bots_emit(state, nick, &row, name_col, ver_col, up_col);
-            reply_pace(state, &delay);
           }
           shown++;
         }
@@ -2237,7 +2257,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
     } else if (strcasecmp(command, "servers") == 0) {
       /* Every configured IRC server and its port.  A slot with no ':' uses
        * the bot's default port, so say so rather than printing a blank. */
-      struct timespec delay = {0, 100000000};
       int host_w = 8;
       for (int i = 0; i < state->server_count; i++) {
         const char *s = state->server_list[i];
@@ -2288,7 +2307,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :| %s %-*s  port %-7s%s\r\n", nick,
                    marker, host_w, host, port, note);
         shown++;
-        reply_pace(state, &delay);
       }
       if (shown == 0)
         irc_printf(state, "PRIVMSG %s :| (no servers configured)\r\n", nick);
@@ -2558,6 +2576,25 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       hub_client_disconnect(state);
       state->last_hub_connect_attempt = 0;
       hub_client_connect(state);
+    } else if (strcasecmp(command, "chanmode") == 0) {
+      chancmd_chanmode(state, nick, auth_user, argline);
+    } else if (strcasecmp(command, "chanset") == 0) {
+      chancmd_chanset(state, nick, auth_user, argline);
+    } else if (strcasecmp(command, "+ban") == 0) {
+      chancmd_ban_add(state, nick, auth_user, argline);
+    } else if (strcasecmp(command, "-ban") == 0) {
+      chancmd_ban_del(state, nick, auth_user, argline);
+    } else if (strcasecmp(command, "bans") == 0) {
+      chancmd_bans(state, nick, argline);
+    } else if (strcasecmp(command, "chkey") == 0 && arg1 && arg1[0] == '#') {
+      /* chkey #chan <key>: kept as chanmode #chan +k <key> (modes.md §5.2) */
+      char kargs[MAX_CHAN + MAX_KEY + 8];
+      if (!arg2 || snprintf(kargs, sizeof(kargs), "%s +k %s", arg1, arg2) >=
+                       (int)sizeof(kargs))
+        irc_printf(state, "PRIVMSG %s :Syntax: chkey <#channel> <key>\r\n", nick);
+      else
+        chancmd_chanmode(state, nick, auth_user, kargs);
+      secure_wipe(kargs, sizeof(kargs));
     } else if (strcasecmp(command, "chkey") == 0) {
       /* chkey <name> <pubkey> — admins change anyone's key (opers: own only,
        * handled in the oper branch).  UUID, masks and history are kept. */
@@ -2589,13 +2626,14 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help, bans\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)\r\n", nick);
         } else {
           irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, join, part, status, givenick, chnick\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   +bot, -bot, +hub, -hub, rekey\r\n", nick);
+          irc_printf(state, "PRIVMSG %s : |   chanmode, chanset, +ban, -ban, bans\r\n", nick);
           irc_printf(state, "PRIVMSG %s : |   saveconf, setlog, getlog, update, help\r\n", nick);
         }
         irc_printf(state, "PRIVMSG %s : |   'help auth' explains how clients sign in with their key\r\n", nick);
@@ -2696,6 +2734,34 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: chkey <name> <pubkey> - Replace the public key of a named admin or oper "
                      "(UUID and usermasks are kept). Opers may only change their own key.\r\n", nick);
           help_keypair(state, nick);
+        } else if (strcasecmp(arg1, "chanmode") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: chanmode <#channel> [<modes> [args]|-] - Show, set or reset "
+                     "the channel's stored modes (i m n p s t k l). +k takes a key and +l a limit "
+                     "(1..99999) as arguments, left to right; '-' goes back to the network default. "
+                     "The modes are applied once if this bot is opped; with +enforcemodes the bots "
+                     "keep them. chkey <#channel> <key> is chanmode <#channel> +k <key>.\r\n", nick);
+        } else if (strcasecmp(arg1, "chanset") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: chanset <#channel|default> [+opt -opt ...] [<name> <value|default>] "
+                     "[flood <type> <N:S|off|default>] - Show or change channel settings.\r\n", nick);
+          irc_printf(state,
+                     "PRIVMSG %s :  Options: enforcemodes bitch protectops revenge stopnethack enforcebans "
+                     "dynamicbans dontkickops cycle dynamiclimit. Values: bantime bantype banidle limitgap "
+                     "limitdelay. Floods: chan ctcp join nick deop kick ban. 'default' also takes "
+                     "'flood cmd|msg|ctcp' (bot floods), 'ignoretime <min>' and 'sendq B:I' (burst 1..100, interval 0..10000 ms).\r\n", nick);
+        } else if (strcasecmp(arg1, "+ban") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: +ban <#channel|*> <nick!user@host> [<minutes>|perm] [sticky] [reason] - "
+                     "Add a network ban (permanent unless a time is given; '*' = every channel). Refused "
+                     "if the mask would hit a bot or an authorised user.\r\n", nick);
+        } else if (strcasecmp(arg1, "-ban") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: -ban <#channel|*> <nick!user@host> - Remove a network ban.\r\n", nick);
+        } else if (strcasecmp(arg1, "bans") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: bans [#channel|*] - List the network bans (all, or one channel's "
+                     "plus the '*' ones).\r\n", nick);
         } else if (strcasecmp(arg1, "invite") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a "

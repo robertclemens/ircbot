@@ -810,8 +810,11 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
  * Includes: c| (channels), h| (hostmask), n| (nick), v| (protocol version)
  * Excludes: a|, o|, m| (hub-authoritative; pushed separately by
  * hub_client_push_admin_delta) and the local-only s|, u|, g|, l|, i|, k|
- * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted as well: the bot
- * refuses join/part locally, so those records can only be the hub's own copy,
+ * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted as well, except a
+ * channel with enf_pending (a key/mode this bot learned and has not yet got
+ * to a hub: enforcement is never gated, D43) and pending bot-written B|
+ * lines: the bot refuses join/part locally, so other c| records can only be
+ * the hub's own copy,
  * and irchub's process_bot_config_push rejects them by type before any
  * timestamp compare — pushing them would just log one REJECTED line per
  * record on every connect.  (The retired bot password p| is never sent.)
@@ -822,9 +825,14 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   int written;
   const bool hub_only = is_opt_set(state, OPT_HUB_ONLY_MUTATIONS);
 
-  // Channels
-  if (!hub_only) {
+  // Channels.  Under opt 'h' only a key / mode this bot learned and could
+  // not yet hand to a hub goes out (enforcement writes are never gated, D43).
+  {
     for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+      if (hub_only && !c->enf_pending)
+        continue;
+      if (c->timestamp == 0 && !c->is_managed)
+        continue; /* known only from its C| line: no c| of its own yet */
       const char *op = c->is_managed ? "add" : "del";
       log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
                   c->name, c->is_managed, op, (long)c->timestamp);
@@ -843,6 +851,22 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
         break;
       offset += written;
     }
+  }
+
+  /* Bot-written bans (automatic bans) the hub has not got yet -- written
+   * while the link was down.  Always pushed, whatever opt 'h' says (D43). */
+  for (int i = 0; i < state->cfg_ban_count; i++) {
+    const cfg_ban_t *b = &state->cfg_bans[i];
+    if (!b->push_pending || !state->bot_uuid[0] ||
+        strcmp(b->setter, state->bot_uuid) != 0)
+      continue;
+    char bl[B_LINE_MAX + 2];
+    int n = chancfg_format_b_line(b, bl, sizeof(bl));
+    if (n <= 0 || n >= max_len - offset)
+      break;
+    memcpy(buffer + offset, bl, (size_t)n);
+    offset += n;
+    buffer[offset] = '\0';
   }
 
   /* Admin/oper/mask records are hub-authoritative — bots receive them from hub,
@@ -884,6 +908,31 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   }
 
   buffer[offset] = '\0';
+}
+
+/**
+ * Our own +o landed: grant the OP_GRANTs held while we had none, for nicks
+ * still in the channel and not opped.  Older than OP_GRANT_HOLD_SECS: dropped.
+ */
+void hub_client_grant_held_ops(bot_state_t *state, chan_t *c) {
+  time_t now = time(NULL);
+  for (int i = 0; i < c->op_grant_held_count; i++) {
+    if (now - c->op_grant_held[i].at > OP_GRANT_HOLD_SECS)
+      continue;
+    for (int k = 0; k < c->roster_count; k++) {
+      if (strcasecmp(c->roster[k].nick, c->op_grant_held[i].nick) == 0) {
+        if (!c->roster[k].is_op) {
+          log_message(L_INFO, state,
+                      "[HUB] Granting ops to %s in %s (held hub request)\n",
+                      c->op_grant_held[i].nick, c->name);
+          irc_printf(state, "MODE %s +o %s\r\n", c->name,
+                     c->op_grant_held[i].nick);
+        }
+        break;
+      }
+    }
+  }
+  c->op_grant_held_count = 0;
 }
 
 /**
@@ -1145,6 +1194,8 @@ void hub_client_push_config(bot_state_t *state) {
 
     int total = 4 + cipher_len + GCM_TAG_LEN;
     if (send(state->hub_fd, cipher, total, 0) == total) {
+      for (int i = 0; i < state->cfg_ban_count; i++)
+        state->cfg_bans[i].push_pending = false;
       log_message(L_INFO, state, "[HUB] Config pushed to hub\n");
     } else {
       log_message(L_INFO, state, "[HUB] Failed to push config\n");
@@ -1192,6 +1243,7 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
     memcpy(cipher, &net_len, 4);
     int total = 4 + cipher_len + GCM_TAG_LEN;
     if (send(state->hub_fd, cipher, total, 0) == total) {
+      chan->enf_pending = false;
       log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
                   chan->name, (int)chan->modes);
     } else {
@@ -1199,6 +1251,116 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
       hub_client_disconnect(state);
     }
   }
+}
+
+/* Complete record lines ("B|...\n") to the hub as one CMD_CONFIG_PUSH.  The
+ * path a bot's own enforcement writes take: never gated by opt 'h' (D43). */
+bool hub_client_push_lines(bot_state_t *state, const char *lines, size_t len) {
+  if (state->hub_count == 0 || state->hub_fd == -1 ||
+      !state->hub_authenticated || !lines || len == 0)
+    return false;
+  return hub_send_frame(state, CMD_CONFIG_PUSH, lines, (int)len);
+}
+
+/* ---- CMD_CHAN_EVENT emitter (D42) ---------------------------------------
+ * One frame per enforcement action: "#chan|action|target|detail".  Limits,
+ * all bot-side so a flood of events cannot become a flood to the hub:
+ *   - the same (chan, action, target) at most once per CHAN_EVENT_DEDUPE_SECS;
+ *   - at most CHAN_EVENT_WINDOW_MAX events per CHAN_EVENT_WINDOW_SECS;
+ * excess is counted, and the count goes out once as "N events suppressed"
+ * (target "*") as soon as an event is allowed again. */
+static const char *const CHAN_EVENT_ACTIONS[] = {
+  "deop", "reop", "kick", "ban", "unban", "moderevert", "limit", "floodtrip",
+  "ignore", NULL
+};
+
+/* Copy src into dst (cap bytes incl. NUL) with control bytes and the record
+ * delimiter flattened to spaces. */
+static void event_clean(char *dst, size_t cap, const char *src) {
+  size_t k = 0;
+  for (; src && *src && k + 1 < cap; src++)
+    dst[k++] = ((unsigned char)*src < 0x20 || *src == 0x7f || *src == '|')
+                   ? ' ' : *src;
+  dst[k] = '\0';
+}
+
+bool hub_client_chan_event(bot_state_t *state, const char *chan,
+                           const char *action, const char *target,
+                           const char *detail) {
+  if (!chan || !action || !target)
+    return false;
+  if (chan[0] != '#' && chan[0] != '&')
+    return false;
+  bool known = false;
+  for (int i = 0; CHAN_EVENT_ACTIONS[i]; i++)
+    if (strcmp(action, CHAN_EVENT_ACTIONS[i]) == 0) { known = true; break; }
+  if (!known || strlen(chan) >= MAX_CHAN)
+    return false;
+  if (state->hub_count == 0 || state->hub_fd == -1 || !state->hub_authenticated)
+    return false;
+
+  chan_event_lim_t *lim = &state->chan_event;
+  time_t now = time(NULL);
+  char tgt[CHAN_EVENT_TARGET_MAX + 1], det[CHAN_EVENT_DETAIL_MAX + 1];
+  event_clean(tgt, sizeof(tgt), target);
+  event_clean(det, sizeof(det), detail ? detail : "");
+  if (tgt[0] == '\0')
+    return false;
+
+  /* Dedupe key: lower-cased "chan|action|target". */
+  chan_event_seen_t *slot = NULL, *oldest = &lim->seen[0];
+  char key[sizeof(lim->seen[0].key)];
+  int kl = snprintf(key, sizeof(key), "%s|%s|%s", chan, action, tgt);
+  if (kl <= 0 || kl >= (int)sizeof(key))
+    return false;
+  for (char *p = key; *p; p++)
+    *p = (char)tolower((unsigned char)*p);
+  for (int i = 0; i < CHAN_EVENT_TRACK; i++) {
+    chan_event_seen_t *e = &lim->seen[i];
+    if (e->when != 0 && strcmp(e->key, key) == 0) { slot = e; break; }
+    if (e->when < oldest->when) oldest = e;
+  }
+  bool limited = slot && now - slot->when < CHAN_EVENT_DEDUPE_SECS;
+  if (!limited) {
+    time_t first = lim->window[lim->widx]; /* the oldest of the last N sends */
+    limited = (first != 0 && now - first < CHAN_EVENT_WINDOW_SECS);
+  }
+  if (limited) {
+    lim->suppressed++;
+    snprintf(lim->sup_chan, sizeof(lim->sup_chan), "%s", chan);
+    snprintf(lim->sup_action, sizeof(lim->sup_action), "%s", action);
+    return false;
+  }
+  if (!slot) slot = oldest;
+  snprintf(slot->key, sizeof(slot->key), "%s", key);
+  slot->when = now;
+
+  char out[MAX_CHAN + 16 + CHAN_EVENT_TARGET_MAX + CHAN_EVENT_DETAIL_MAX + 8];
+  int n = snprintf(out, sizeof(out), "%s|%s|%s|%s", chan, action, tgt, det);
+  if (n <= 0 || n >= (int)sizeof(out))
+    return false;
+  lim->window[lim->widx] = now;
+  lim->widx = (lim->widx + 1) % CHAN_EVENT_WINDOW_MAX;
+  bool sent = hub_send_frame(state, CMD_CHAN_EVENT, out, n);
+
+  /* The summary of what the limiter held back, once, in its own slot of the
+   * window (so a summary can never itself start a flood). */
+  if (sent && lim->suppressed > 0) {
+    time_t first = lim->window[lim->widx];
+    if (first == 0 || now - first >= CHAN_EVENT_WINDOW_SECS) {
+      char sd[48];
+      snprintf(sd, sizeof(sd), "%u events suppressed", lim->suppressed);
+      n = snprintf(out, sizeof(out), "%s|%s|*|%s", lim->sup_chan,
+                   lim->sup_action, sd);
+      if (n > 0 && n < (int)sizeof(out)) {
+        lim->window[lim->widx] = now;
+        lim->widx = (lim->widx + 1) % CHAN_EVENT_WINDOW_MAX;
+        if (hub_send_frame(state, CMD_CHAN_EVENT, out, n))
+          lim->suppressed = 0;
+      }
+    }
+  }
+  return sent;
 }
 
 /* PURGE|<cutoff>: drop tombstones (unmanaged channels, inactive user and
@@ -1248,6 +1410,8 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
       i--;
     }
   }
+
+  purged += chancfg_purge_bans(state, cutoff);
 
   if (purged > 0) {
     log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
@@ -1538,6 +1702,27 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
       }
     } break;
 
+    /* modes.md records.  Each is bounded and validated in chancfg.c; a line
+     * that does not parse is dropped, one this build cannot use is kept. */
+    case 'C':
+      if (chancfg_apply_c_line(state, data)) {
+        updates++;
+        log_message(L_DEBUG, state, "[HUB-SYNC] Channel settings updated\n");
+      }
+      break;
+    case 'D':
+      if (chancfg_apply_d_line(state, data)) {
+        updates++;
+        log_message(L_DEBUG, state, "[HUB-SYNC] Network defaults updated\n");
+      }
+      break;
+    case 'B':
+      if (chancfg_apply_b_line(state, data)) {
+        updates++;
+        log_message(L_DEBUG, state, "[HUB-SYNC] Ban record updated\n");
+      }
+      break;
+
     case 'p': // Retired bot password (pre-passwordless hub): ignored
       log_message(L_DEBUG, state, "[HUB-SYNC] Ignored retired p| line\n");
       break;
@@ -1688,7 +1873,7 @@ static const char *chan_elect_cannot(bot_state_t *state, const char *kind,
   if (!c || c->status != C_IN) return "not in channel";
   if (strcmp(kind, "key") == 0) return c->key[0] ? NULL : "no key";
   if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0 ||
-      strcmp(kind, "unban") == 0)
+      strcmp(kind, "unban") == 0 || strcmp(kind, "mode") == 0)
     return c->i_am_opped ? NULL : "not opped";
   return "unknown request";
 }
@@ -1720,7 +1905,8 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
   char nick[CHAN_DO_NICK_MAX + 2] = "", mask[MAX_MASK_LEN] = "";
   int n = sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%63[^|]|%31[^|]|%255[^|\r\n]",
                  id, kind, chan, req, nick, mask);
-  if (n < 4) {
+  /* A `mode` job carries no requester / nick: eid|mode|channel is enough. */
+  if (n < 3 || (n < 4 && strcmp(kind, "mode") != 0)) {
     log_message(L_INFO, state, "[CHANREQ] Malformed CHAN_DO\n");
     return;
   }
@@ -1735,7 +1921,36 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
       return;
     }
   }
+  if (strcmp(kind, "mode") == 0) {
+    /* `channel mode`: move the live modes to the stored C| modes + c| key,
+     * once.  The MODE lines go through the send queue (packed, paced). */
+    chan_t *mc = channel_find(state, chan);
+    char note[64];
+    if (!mc || chanmode_apply_stored(state, mc, note, sizeof(note)) < 0) {
+      chan_done_send(state, id, false, mc ? note : "not in channel");
+      return;
+    }
+    log_message(L_INFO, state, "[CHANREQ] Applied stored modes in %s: %s\n",
+                chan, note);
+    chan_done_send(state, id, true, state->current_nick);
+    return;
+  }
   if (strcmp(kind, "op") == 0) {
+    /* +bitch (D12): only an authorised member may hold ops.  The hub knows
+     * the users but not the nick's hostmask -- this bot does.  A nick we
+     * cannot find is not vouched for either (fail closed). */
+    chan_t *bc = channel_find(state, chan);
+    if (bc && chancfg_get(state, bc, CS_BITCH)) {
+      bool found = false;
+      bool auth = chan_member_authorised(state, bc, nick, &found);
+      if (!found || !auth) {
+        log_message(L_INFO, state,
+                    "[CHANREQ] Not opping %s in %s: +bitch and %s\n", nick,
+                    chan, found ? "not authorised" : "not in my roster");
+        chan_done_send(state, id, false, "bitch");
+        return;
+      }
+    }
     log_message(L_INFO, state, "[CHANREQ] Opping %s in %s (picked by the hub)\n",
                 nick, chan);
     irc_printf(state, "MODE %s +o %s\r\n", chan, nick);
@@ -1835,9 +2050,27 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
                       channel);
           irc_printf(state, "MODE %s +o %s\r\n", channel, nick);
         } else {
-          log_message(L_INFO, state,
-                      "[HUB] Cannot grant ops to %s in %s - I'm not opped\n",
-                      nick, channel);
+          /* Asked before our own +o arrived: hold it for that +o. */
+          time_t now = time(NULL);
+          int k = 0;
+          for (int i = 0; i < c->op_grant_held_count; i++)
+            if (now - c->op_grant_held[i].at <= OP_GRANT_HOLD_SECS &&
+                strcasecmp(c->op_grant_held[i].nick, nick) != 0)
+              c->op_grant_held[k++] = c->op_grant_held[i];
+          c->op_grant_held_count = k;
+          if (k < OP_GRANT_HOLD_MAX) {
+            snprintf(c->op_grant_held[k].nick, MAX_NICK, "%s", nick);
+            c->op_grant_held[k].at = now;
+            c->op_grant_held_count++;
+            log_message(L_INFO, state,
+                        "[HUB] Not opped in %s yet; holding the op for %s "
+                        "until I am\n",
+                        channel, nick);
+          } else {
+            log_message(L_INFO, state,
+                        "[HUB] Cannot grant ops to %s in %s - I'm not opped\n",
+                        nick, channel);
+          }
         }
       } else {
         log_message(L_INFO, state,

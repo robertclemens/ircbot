@@ -24,7 +24,7 @@ static bool find_uuid_for_helper(const bot_state_t *state,
     }
 
     // 2. Nick-prefix match: stored entry starts with "helper_nick!"
-    char pfx[MAX_NICK + 1];
+    char pfx[MAX_MEMBER_NICK + 1];
     snprintf(pfx, sizeof(pfx), "%s!", helper->nick);
     if (strncasecmp(mask, pfx, strlen(pfx)) == 0) {
       snprintf(uuid_out, uuid_len, "%s", uuid);
@@ -42,7 +42,7 @@ static bool find_uuid_for_helper(const bot_state_t *state,
       stored_nick[n] = '\0';
     }
     // Strip trailing underscores
-    char base_stored[MAX_NICK], base_helper[MAX_NICK];
+    char base_stored[MAX_NICK], base_helper[MAX_MEMBER_NICK];
     snprintf(base_stored, sizeof(base_stored), "%s", stored_nick);
     snprintf(base_helper, sizeof(base_helper), "%s", helper->nick);
     size_t ls = strlen(base_stored), lh = strlen(base_helper);
@@ -64,7 +64,18 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
   if (!c)
     return;
 
+  /* Live modes, key, limit, ban list and halfop/voice flags (chanlive.c) on
+   * their own copy of the arguments: this function tokenises args in place. */
+  if (!args || strlen(args) < 1024) {
+    char live_args[1024];
+    snprintf(live_args, sizeof(live_args), "%s", args ? args : "");
+    chanlive_apply(state, c, modes, live_args, false);
+  }
+
   bool adding = true; // Default direction
+  /* modes.md §3.3: under +enforcemodes with a k in the stored modes the key
+   * is the bots', so a key someone sets or clears is not learned. */
+  const bool key_managed = chanenf_key_managed(state, c);
   char *saveptr;
   char no_args[1] = "";
   /* args is NULL when the MODE line carries no trailing parameters at all
@@ -100,9 +111,11 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
               }
             }
             if (adding) {
+              c->enf_dirty = c->enf_ops_check = true; /* chanenf.c sweep */
               c->op_request_pending = false;
               c->op_request_retry_count = 0;
               log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
+              hub_client_grant_held_ops(state, c);
             } else {
               /* Deopped: re-read the channel before choosing a helper.  While
                * we held ops the roster was never refreshed, so peers that left
@@ -141,7 +154,9 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
     }
     // --- Modes that CONDITIONALLY take an argument ---
     else if (mode == 'k') {
-      if (adding && current_arg) {
+      if (key_managed) {
+        /* the mode job puts the stored key back; learn nothing */
+      } else if (adding && current_arg) {
         /* Store key and set M_K flag */
         size_t klen = strlen(current_arg);
         if (klen >= MAX_KEY) klen = MAX_KEY - 1;
@@ -384,7 +399,19 @@ void parser_handle_line(bot_state_t *state, char *line) {
         }
       }
     }
+  } else if (strcmp(command, "005") == 0) {
+    /* RPL_ISUPPORT: MODES, MAXLIST, PREFIX, CHANMODES for the send queue and
+     * the mode parser.  Parsed on a copy; strtok_r works in place. */
+    char isup[1024];
+    if (strlen(params) < sizeof(isup)) {
+      memcpy(isup, params, strlen(params) + 1);
+      isupport_parse(state, isup);
+    }
+  } else if (strcmp(command, "324") == 0 || strcmp(command, "329") == 0) {
+    /* RPL_CHANNELMODEIS / RPL_CREATIONTIME: live state only. */
+    chanlive_numeric(state, command, params);
   } else if (strcmp(command, "367") == 0) {
+    chanlive_numeric(state, command, params); /* our own ban list copy */
     /* RPL_BANLIST: "<me> <channel> <mask> [setter ts]" -- only of interest
      * while we are walking a list on another bot's behalf. */
     strtok_r(params, " ", &saveptr_irc);
@@ -393,6 +420,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (chan_name && ban_mask)
       chan_unban_note_ban(state, chan_name, ban_mask);
   } else if (strcmp(command, "368") == 0) {
+    chanlive_numeric(state, command, params);
     /* RPL_ENDOFBANLIST: closes the walk. */
     strtok_r(params, " ", &saveptr_irc);
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
@@ -435,14 +463,23 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *args = strtok_r(NULL, "", &saveptr_irc);
 
     if (target && modes && (target[0] == '#' || target[0] == '&')) {
+      /* channel_handle_mode_change tokenises args in place; the enforcement
+       * pass gets its own copy.  An oversized one is skipped (fail closed). */
+      char enf_args[1024];
+      bool enf_ok = !args || strlen(args) < sizeof(enf_args);
+      snprintf(enf_args, sizeof(enf_args), "%s", args ? args : "");
       channel_handle_mode_change(state, target, modes, args);
+      if (enf_ok)
+        chanenf_on_mode(state, target, prefix, modes, enf_args);
       /* Push key/invite-only changes to hub, and to our own config: with no
        * hub to echo them back, a key we learned and saved must not outlive
        * a -k. */
       if (strchr(modes, 'k') || strchr(modes, 'i')) {
         chan_t *mc = channel_find(state, target);
-        if (mc && mc->is_managed) {
+        if (mc && mc->is_managed &&
+            (strchr(modes, 'i') || !chanenf_key_managed(state, mc))) {
           mc->timestamp = lww_next_ts(mc->timestamp);
+          mc->enf_pending = true; /* cleared once a hub has it (D43) */
           hub_client_push_channel(state, mc);
           config_write_with_state_pass(state);
         }
@@ -461,6 +498,16 @@ void parser_handle_line(bot_state_t *state, char *line) {
       return;
 
     bool is_op = (strstr(modes, "@") != NULL);
+    /* PREFIX (005) names the halfop / voice symbols this server uses. */
+    bool is_halfop = false, is_voice = false;
+    {
+      const char *hp = strchr(state->isup.prefix_modes, 'h');
+      const char *vp = strchr(state->isup.prefix_modes, 'v');
+      if (hp)
+        is_halfop = strchr(modes, state->isup.prefix_syms[hp - state->isup.prefix_modes]) != NULL;
+      if (vp)
+        is_voice = strchr(modes, state->isup.prefix_syms[vp - state->isup.prefix_modes]) != NULL;
+    }
 
     /* Self-mask capture, ahead of the channel lookup on purpose: the reply to
      * `WHO <nick>` (request_own_hostmask) carries "*" as the channel, so
@@ -484,12 +531,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (strcasecmp(nick, state->current_nick) == 0)
       c->i_am_opped = is_op;
 
-    if (c->roster_count < MAX_ROSTER_SIZE) {
-      roster_entry_t *entry = &c->roster[c->roster_count];
-      snprintf(entry->nick, sizeof(entry->nick), "%s", nick);
-      snprintf(entry->hostmask, sizeof(entry->hostmask), "%s!%s@%s", nick, ident, host);
-      entry->is_op = is_op;
-      c->roster_count++;
+    {
+      /* add, or replace the entry a JOIN already made (chanenf.c keeps the
+       * roster current between WHOs) */
+      char who[MAX_MASK_LEN];
+      if (snprintf(who, sizeof(who), "%s!%s@%s", nick, ident, host) <
+          (int)sizeof(who))
+        chanenf_roster_set(c, nick, who, is_op, is_halfop, is_voice);
     }
   } else if (strcmp(command, "396") == 0) {
     char *hostname = strtok_r(params, " ", &saveptr_irc); // Nick
@@ -516,6 +564,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     log_message(L_INFO, state, "[INFO] Roster for %s updated with %d users.\n",
                 c->name, c->roster_count);
+    c->enf_dirty = c->enf_ops_check = true; /* chanenf.c sweep */
+    c->who_done = true;                     /* the member list is complete */
 
     if (c->i_am_opped) {
       c->op_request_pending = false;
@@ -632,22 +682,31 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (message && *message == ':')
       message++;
 
-    if (nick && dest && message) {
+    if (nick && dest && message && (dest[0] == '#' || dest[0] == '&')) {
+      /* text to a channel: only the flood counters look at it */
+      if (user && host)
+        chanflood_on_text(state, dest, nick, user, host, message);
+    } else if (nick && dest && message) {
       size_t msg_len = strlen(message);
+      char src_nuh[MAX_MASK_LEN];
+      src_nuh[0] = '\0';
+      if (user && host &&
+          snprintf(src_nuh, sizeof(src_nuh), "%s!%s@%s", nick, user, host) >=
+              (int)sizeof(src_nuh))
+        src_nuh[0] = '\0';
       if (msg_len >= 2 && message[0] == '\001' && message[msg_len - 1] == '\001') {
         log_message(L_CTCP, state, "[CTCP] (%s) %s\n", nick, message);
+        /* ctcp flood (§9.1): an ignored host, or quiet mode, gets no answer */
+        if (src_nuh[0] && botflood_ctcp(state, src_nuh) != BF_OK)
+          return;
 
         message[msg_len - 1] = '\0';
         char *ctcp_command = message + 1;
 
         if (strncasecmp(ctcp_command, "DCC ", 4) == 0) {
           /* Only ever the reply to this bot's own passive offer (dcc.c). */
-          if (user && host && strcasecmp(dest, state->current_nick) == 0) {
-            char user_host[256];
-            snprintf(user_host, sizeof(user_host), "%s!%s@%s", nick, user,
-                     host);
-            dcc_handle_ctcp(state, user_host, ctcp_command);
-          }
+          if (user && host && strcasecmp(dest, state->current_nick) == 0)
+            dcc_handle_ctcp(state, src_nuh, ctcp_command);
         } else if (strcasecmp(ctcp_command, "VERSION") == 0) {
           irc_printf(state, "NOTICE %s :\001VERSION %s\001\r\n", nick,
                      VERSION_RESPONSE);
@@ -656,6 +715,31 @@ void parser_handle_line(bot_state_t *state, char *line) {
         }
       } else {
         commands_handle_private_message(state, nick, user, host, dest, message);
+      }
+    }
+  } else if (strcmp(command, "NOTICE") == 0 && prefix && strchr(prefix, '!')) {
+    /* NOTICEs were never read; now they only feed the flood counters. */
+    char *nick = strtok_r(prefix, "!", &saveptr_irc);
+    char *user = strtok_r(NULL, "@", &saveptr_irc);
+    char *host = strtok_r(NULL, "", &saveptr_irc);
+    char *dest = strtok_r(params, " ", &saveptr_irc);
+    char *message = strtok_r(NULL, "", &saveptr_irc);
+    if (message && *message == ':')
+      message++;
+    if (nick && user && host && dest && message) {
+      if (dest[0] == '#' || dest[0] == '&') {
+        chanflood_on_text(state, dest, nick, user, host, message);
+      } else if (strcasecmp(dest, state->current_nick) == 0 &&
+                 message[0] != '\001') {
+        char src_nuh[MAX_MASK_LEN];
+        /* services (NickServ, ChanServ, ...) answer every command with a
+         * NOTICE: that is not a flood from a host (servers carry no '!') */
+        size_t nl = strlen(nick);
+        bool services = nl >= 4 && strcasecmp(nick + nl - 4, "Serv") == 0;
+        if (!services &&
+            snprintf(src_nuh, sizeof(src_nuh), "%s!%s@%s", nick, user, host) <
+                (int)sizeof(src_nuh))
+          botflood_msg(state, src_nuh);
       }
     }
   } else if (strcmp(command, "JOIN") == 0 && prefix) {
@@ -697,14 +781,37 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_IN;
         c->roster_count = 0;
         c->i_am_opped = false;
+        channel_live_reset(c);
         snprintf(state->who_request_channel, sizeof(state->who_request_channel),
                  "%s", c->name);
         c->last_who_request = time(NULL);
         irc_printf(state, "WHO %s\r\n", c->name);
+        chanlive_request(state, c); /* 324 modes and the 367 ban list */
+      }
+    } else if (nick && join_mask_ok) {
+      /* someone else joined: keep the roster (and the enforcement) current */
+      char jchan[MAX_CHAN];
+      const char *jc = (*params == ':') ? params + 1 : params;
+      size_t jl = strcspn(jc, " ");
+      if (jl > 0 && jl < sizeof(jchan)) {
+        memcpy(jchan, jc, jl);
+        jchan[jl] = '\0';
+        chanenf_on_join(state, jchan, join_mask);
       }
     }
   } else if (strcmp(command, "PART") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
+    if (nick && strcasecmp(nick, state->current_nick) != 0 &&
+        strcasecmp(nick, state->target_nick) != 0) {
+      char pchan[MAX_CHAN];
+      const char *pc = (*params == ':') ? params + 1 : params;
+      size_t pl = strcspn(pc, " ");
+      if (pl > 0 && pl < sizeof(pchan)) {
+        memcpy(pchan, pc, pl);
+        pchan[pl] = '\0';
+        chanenf_on_part(state, pchan, nick);
+      }
+    }
     if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
                  strcasecmp(nick, state->target_nick) == 0)) {
       // Extract channel name (may have : prefix or trailing reason)
@@ -716,6 +823,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
         c->roster_count = 0;
         c->i_am_opped = false;
+        channel_live_reset(c);
         log_message(L_DEBUG, state, "[IRC] Parted channel %s\n", chan_name);
       }
     }
@@ -725,17 +833,26 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
     char *chan_name = strtok_r(params_copy, " ", &saveptr_irc);
     char *kicked_nick = strtok_r(NULL, " ", &saveptr_irc);
+    if (chan_name && kicked_nick)
+      chanenf_on_kick(state, chan_name, prefix, kicked_nick);
     if (chan_name && kicked_nick &&
         strcasecmp(kicked_nick, state->current_nick) == 0) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_OUT;
         c->i_am_opped = false;
+        channel_live_reset(c);
       }
     }
+  } else if (strcmp(command, "QUIT") == 0 && prefix) {
+    char *qnick = strtok_r(prefix, "!", &saveptr_irc);
+    if (qnick)
+      chanenf_on_quit(state, qnick);
   } else if (strcmp(command, "NICK") == 0 && prefix) {
     char *old_nick = strtok_r(prefix, "!", &saveptr_irc);
     char *new_nick = (*params == ':') ? params + 1 : params;
+    if (old_nick && new_nick)
+      chanenf_on_nick(state, old_nick, new_nick);
     if (old_nick && new_nick &&
         strcasecmp(old_nick, state->current_nick) == 0) {
       snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);

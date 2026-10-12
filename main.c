@@ -138,6 +138,8 @@ static void state_init(bot_state_t *state) {
   state->trusted_bot_count = 0;
   state->config_dirty = false;
   state->last_config_write = 0;
+  sendq_init(state);
+  isupport_reset(state);
   hub_client_init(state);
   dcc_init(state);
   srand(time(NULL));
@@ -150,6 +152,8 @@ static void state_destroy(bot_state_t *state) {
   for (int i = 0; i < state->hub_count; i++)
     OPENSSL_cleanse(state->hubs[i].ed_pub, sizeof(state->hubs[i].ed_pub));
   channel_list_destroy(state);
+  sendq_clear(state);
+  chancfg_free(state);
   /* The base64 copy of the identity key and the live session key die with
    * the raw key (the whole state is mlock'd in state_init; this is the wipe). */
   OPENSSL_cleanse(state->hub_key,         sizeof(state->hub_key));
@@ -988,6 +992,7 @@ int main(int argc, char *argv[]) {
     irc_check_status(&state);
     channel_manager_check_joins(&state);
     commands_activity_tick(&state, time(NULL));
+    chanenf_tick(&state);
     hub_client_upgrade_report_tick(&state);
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
@@ -1046,10 +1051,28 @@ int main(int argc, char *argv[]) {
         max_fd = state.hub_fd;
     }
 
+    /* Lines wait in the send queue and pacing allows one: wake as soon as
+     * the socket is writable.  Otherwise the 1 s select timeout below is the
+     * tick that drains them. */
+    if (state.server_fd != -1 && sendq_ready(&state)) {
+      FD_SET(state.server_fd, &write_fds);
+      if (state.server_fd > max_fd)
+        max_fd = state.server_fd;
+    }
+
     // DCC chats (connect in progress, or open)
     dcc_fill_fds(&state, &read_fds, &write_fds, &max_fd);
 
     struct timeval tv = {1, 0}; // 1 second timeout
+    /* Lines waiting for credit: wake exactly when the next one may go (0 =
+     * now), never later than the 1 s tick. */
+    if (state.server_fd != -1) {
+      int wait_ms = sendq_next_ms(&state);
+      if (wait_ms >= 0 && wait_ms < 1000) {
+        tv.tv_sec = 0;
+        tv.tv_usec = wait_ms * 1000;
+      }
+    }
     if (max_fd == -1) {
       select(0, NULL, NULL, NULL, &tv);
       continue;
@@ -1077,6 +1100,11 @@ int main(int argc, char *argv[]) {
 
       dcc_process(&state, &read_fds, &write_fds);
     }
+
+    /* Paced output: whatever the queue may send now.  The select() timeout
+     * above is sized to the next credit, so lines leave on time. */
+    if (state.server_fd != -1)
+      sendq_drain(&state);
   }
 
   // --- CLEANUP ---

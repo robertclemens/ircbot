@@ -330,13 +330,28 @@ bool config_load(bot_state_t *state, const char *password,
           // (chan,key,op,ts) Actually fallback matches 3 items. First matches 4
           // items. Adjust logic:
 
-          chan_t *c = channel_add(state, chan);
+          /* Channel names match regardless of ASCII case (D39): a file that
+           * holds both "#Chan" and "#chan" merges into one entry, the newest
+           * stamp winning (the first writer's spelling is kept). */
+          bool is_add = (strcmp(op, "del") != 0);
+          time_t eff_ts = (ts > 0) ? ts : time(NULL);
+          chan_t *c = channel_find(state, chan);
           if (c) {
+            /* timestamp 0 = a C| line got here first (held unmanaged) */
+            if (c->timestamp == 0 ||
+                lww_accepts(eff_ts, is_add, c->timestamp, c->is_managed)) {
+              snprintf(c->key, MAX_KEY, "%s", chan_key);
+              c->is_managed = is_add;
+              c->timestamp = eff_ts;
+              if (!c->is_managed)
+                c->status = C_OUT;
+            }
+          } else if ((c = channel_add(state, chan)) != NULL) {
             if (strlen(chan_key) > 0) {
               snprintf(c->key, MAX_KEY, "%s", chan_key);
             }
-            c->is_managed = (strcmp(op, "del") != 0);
-            c->timestamp = (ts > 0) ? ts : time(NULL);
+            c->is_managed = is_add;
+            c->timestamp = eff_ts;
 
             if (strlen(chan_key) > 0)
               state->chan_count++;
@@ -562,8 +577,21 @@ bool config_load(bot_state_t *state, const char *password,
         break;
 
       case 'D': /* D|1: user/mask changes made while the hub was unreachable
-                 * are still to be pushed (admin_delta_pending). */
-        state->admin_delta_pending = (strcmp(data, "1") == 0);
+                 * are still to be pushed (admin_delta_pending).  A D| line
+                 * with fields (D|<modes>|<settings>|<ts>) is the network
+                 * defaults record; the two never share a shape. */
+        if (strchr(data, '|') == NULL)
+          state->admin_delta_pending = (strcmp(data, "1") == 0);
+        else
+          chancfg_apply_d_line(state, data);
+        break;
+
+      case 'C': /* C|#chan|<modes>|<settings>|add/del|ts (modes.md) */
+        chancfg_apply_c_line(state, data);
+        break;
+
+      case 'B': /* B|<#chan|*>|<mask>|<expires>|<flags>|<setter>|<reason>|op|ts */
+        chancfg_apply_b_line(state, data);
         break;
 
       case 'O': /* Network options string: O|<letters>|<timestamp>
@@ -861,9 +889,34 @@ static void config_write_file(const bot_state_t *state, const char *password) {
     CFG_WRITE("s|%s\n", state->server_list[i]);
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+    /* A channel known only from its C| line (no c| yet) has no record of
+     * its own to write. */
+    if (c->timestamp == 0 && !c->is_managed)
+      continue;
     const char *key = (c->key[0] != '\0') ? c->key : "";
     CFG_WRITE("c|%s|%s|%s|%lld\n",
               c->name, key, c->is_managed ? "add" : "del", (long long)c->timestamp);
+  }
+
+  /* modes.md records: per-channel settings, network defaults, bans.  Raw
+   * settings text goes back out unchanged, unknown names included. */
+  for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+    char cl[C_LINE_MAX + 2];
+    int cn = chancfg_format_c_line(c, cl, sizeof(cl));
+    if (cn < 0) { overflow = true; break; }
+    if (cn > 0) CFG_WRITE("%s", cl);
+  }
+  {
+    char dl[D_LINE_MAX + 2];
+    int dn = chancfg_format_d_line(state, dl, sizeof(dl));
+    if (dn < 0) overflow = true;
+    else if (dn > 0) CFG_WRITE("%s", dl);
+  }
+  for (int i = 0; i < state->cfg_ban_count; i++) {
+    char bl[B_LINE_MAX + 2];
+    int bn = chancfg_format_b_line(&state->cfg_bans[i], bl, sizeof(bl));
+    if (bn <= 0) { overflow = true; break; }
+    CFG_WRITE("%s", bl);
   }
 
   for (int i = 0; i < state->user_record_count; i++) {

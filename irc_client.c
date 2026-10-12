@@ -320,6 +320,13 @@ static int irc_pick_server(bot_state_t *state, time_t now) {
 }
 
 void irc_disconnect(bot_state_t *state) {
+  /* Last chance for queued lines (a parting PRIVMSG, a restart notice) to go
+   * out on whatever credit is left; a write error here already disconnected. */
+  if ((state->status & S_CONNECTED) && state->server_fd != -1) {
+    sendq_drain(state);
+    if (!(state->status & S_CONNECTED) && state->server_fd == -1)
+      return;
+  }
   irc_apply_refusal(state);
   // Send QUIT first so the server removes the nick immediately.
   // Without this, NAT holds the TCP state and the nick ghosts until ping-timeout.
@@ -346,6 +353,8 @@ void irc_disconnect(bot_state_t *state) {
   }
   state->status = S_NONE;
   state->is_ssl = false;
+  sendq_clear(state);
+  isupport_reset(state);
   channel_list_reset_status(state);
 }
 
@@ -473,6 +482,13 @@ static bool irc_line_is_keepalive(const char *line) {
  * down. */
 static int irc_send_line(bot_state_t *state, const char *buffer, int len) {
   if (dcc_divert_reply(state, buffer, len)) return len;
+  if (!(state->status & S_CONNECTED)) return -1;
+  return sendq_enqueue(state, buffer, len);
+}
+
+/* The write itself, for a line the send queue has decided may go now.  A
+ * write error drops the link (which also empties the queue). */
+int irc_write_raw(bot_state_t *state, const char *buffer, int len) {
   if (!(state->status & S_CONNECTED)) return -1;
   if (!HIDEPINGPONG || !irc_line_is_keepalive(buffer))
     log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
@@ -667,6 +683,8 @@ void irc_connect(bot_state_t *state) {
 
   if (sockfd != -1) {
     state->server_fd = sockfd;
+    sendq_clear(state); /* new link: empty queue, full burst */
+    isupport_reset(state);
     state->status = S_CONNECTED;
     state->last_pong_time = time(NULL);
     state->pong_pending = false;
