@@ -4,6 +4,7 @@
 #ifdef HAVE_CURL
 #include <curl/curl.h>
 #endif
+#include <errno.h>
 #include <limits.h>
 #include <netinet/in.h>
 #include <openssl/err.h>
@@ -15,13 +16,28 @@
 #include <sys/socket.h>
 #include <time.h>
 
+/* A non-blocking call with nothing to do.  POSIX lets EAGAIN and EWOULDBLOCK
+ * differ; where they are one value (Linux) testing both trips -Wlogical-op. */
+#if EAGAIN == EWOULDBLOCK
+#define IO_WOULD_BLOCK(e) ((e) == EAGAIN)
+#else
+#define IO_WOULD_BLOCK(e) ((e) == EAGAIN || (e) == EWOULDBLOCK)
+#endif
+
+/* FD_ISSET for a descriptor already known to be >= 0.  musl does the macro's
+ * index math in unsigned long, which -Wsign-conversion reports at every call;
+ * the one conversion is spelled out here. */
+static inline bool fd_isset(int fd, const fd_set *set) {
+  return FD_ISSET((unsigned)fd, set) != 0;
+}
+
 #define BOT_NAME "ircbot.c by trojanman"
 /* -D-overridable so a release build can stamp its own version without
  * editing the tree (the testnet builds a bumped-version artifact this
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.4.7"
+#define BOT_VERSION "2.4.8"
 #endif
 
 // Only edit this section
@@ -126,6 +142,7 @@
   10 // Time delay for trying to gain the target nick (outside of givenick cmd)
 #define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
 #define CHECK_LAG_TIMEOUT 60    // Lag timeout
+#define IRC_REGISTER_TIMEOUT 90 // Connected but no 001 by then: drop, try the next server
 #define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops); opped bots WHO only on deop
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
 /* IRC server refusals (bans / throttles) -- see irc_note_refusal().  A server
@@ -730,6 +747,7 @@ typedef struct {
   long long credit_ms;         /* send credit, capped at burst * interval */
   long long last_ms;           /* monotonic ms of the last refill */
   unsigned long dropped;       /* lines dropped because the queue was full */
+  int   hold;                  /* sendq_hold depth: >0 queues without draining */
 } sendq_t;
 
 /* Rate-limit memory for CMD_CHAN_EVENT (hub_client_chan_event). */
@@ -1240,7 +1258,7 @@ void handle_signal(int signum);
 void config_read(bot_state_t *state, const char *filename);
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename);
-void config_write(const bot_state_t *state, const char *password);
+void config_write(bot_state_t *state, const char *password);
 void config_write_local(const bot_state_t *state, const char *password);
 void config_notify_hub_if_changed(bot_state_t *state);
 chan_t *channel_add(bot_state_t *state, const char *name);
@@ -1248,7 +1266,6 @@ bool channel_remove(bot_state_t *state, const char *name);
 chan_t *channel_find(const bot_state_t *state, const char *name);
 void channel_list_destroy(bot_state_t *state);
 void channel_list_reset_status(bot_state_t *state);
-void channel_manager_check_joins(bot_state_t *state);
 void channel_manager_check_joins(bot_state_t *state);
 /* channel.c: free a channel's live ban list and reset its live state. */
 void channel_live_reset(chan_t *c);
@@ -1343,6 +1360,7 @@ bool chancfg_setting_is_flag(const char *name);
 /* Listing support: index 0..CS_COUNT-1 are the cset_id_t settings, then the
  * FL_COUNT floods.  name is NULL past the end or for a hidden one. */
 const char *chancfg_item_name(int idx, bool net);
+bool chancfg_item_help(int idx, char *def, size_t def_size, const char **what);
 /* 2 = channel override, 1 = network default, 0 = built-in. */
 int  chancfg_item_source(const bot_state_t *state, const chan_t *c, int idx);
 void chancfg_free(bot_state_t *state);
@@ -1452,7 +1470,8 @@ bool chanenf_key_managed(const bot_state_t *state, const chan_t *c);
 
 void irc_connect(bot_state_t *state);
 void irc_disconnect(bot_state_t *state);
-int irc_printf(bot_state_t *state, const char *format, ...);
+int irc_printf(bot_state_t *state, const char *format, ...)
+    __attribute__((format(printf, 2, 3)));
 /* The actual write of one finished line to the server socket (the send
  * queue calls it when pacing allows).  A write error disconnects. */
 int irc_write_raw(bot_state_t *state, const char *buffer, int len);
@@ -1467,6 +1486,8 @@ void sendq_clear(bot_state_t *state);            /* link gone: drop it all */
  * once while credit lasts.  Returns len, or -1 when it had to be dropped. */
 int  sendq_enqueue(bot_state_t *state, const char *line, int len);
 int  sendq_drain(bot_state_t *state);            /* lines written now */
+void sendq_hold(bot_state_t *state);             /* queue only, so MODEs pack */
+void sendq_release(bot_state_t *state);          /* undo one hold; drain at 0 */
 bool sendq_pending(const bot_state_t *state);
 /* True when lines wait AND credit allows one now (select write-set hint). */
 bool sendq_ready(bot_state_t *state);
@@ -1505,9 +1526,11 @@ void dcc_check_timeouts(bot_state_t *state);
 bool dcc_divert_reply(bot_state_t *state, const char *line, int len);
 void dcc_close_all(bot_state_t *state, const char *reason);
 void bot_comms_send_command(bot_state_t *state, const char *target_nick,
-                            const char *format, ...);
+                            const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
 void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
-                            const char *target_nick, const char *format, ...);
+                            const char *target_nick, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
 _Noreturn void handle_fatal_error(const char *message);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
 int updater_check_cli(const char *variant);
@@ -1548,7 +1571,8 @@ const char *updater_host_variant(void);
 bool util_download_file(const char *url, const char *path);
 bool util_sha256_file(const char *path, char *output_hash_hex);
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
-                 const char *format, ...);
+                 const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
 int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
                            const unsigned char *key, unsigned char *ciphertext,
                            unsigned char *tag);

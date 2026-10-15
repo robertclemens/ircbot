@@ -248,7 +248,7 @@ static void show_settings(bot_state_t *state, const char *nick, chan_t *c) {
   row[0] = '\0';
   irc_printf(state, "PRIVMSG %s :Settings for %s (c = channel, n = network "
                     "default, b = built-in):\r\n", nick, net ? "default" : c->name);
-  for (int i = 0; i < CS_COUNT + FL_COUNT; i++) {
+  for (int i = 0; i < (int)CS_COUNT + (int)FL_COUNT; i++) {
     const char *name = chancfg_item_name(i, net);
     if (!name)
       continue;
@@ -424,10 +424,10 @@ void chancmd_ban_add(bot_state_t *state, const char *nick,
   /* optional: minutes|perm, then sticky, then the reason is the rest */
   time_t expires = 0;
   bool sticky = false;
-  char *rest = save ? save : (char *)"";
+  const char *rest = save ? save : "";
   while (*rest == ' ')
     rest++;
-  char *p = rest;
+  const char *p = rest;
   size_t wl = strcspn(p, " ");
   if (wl > 0) {
     char w[16] = {0};

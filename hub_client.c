@@ -111,7 +111,7 @@ static bool hub_send_frame(bot_state_t *state, int cmd, const char *payload,
   uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
   memcpy(cipher, &net_len, 4);
   int total = 4 + cipher_len + GCM_TAG_LEN;
-  if (send(state->hub_fd, cipher, total, 0) != total) {
+  if (send(state->hub_fd, cipher, (size_t)total, 0) != total) {
     hub_client_disconnect(state);
     return false;
   }
@@ -242,9 +242,9 @@ void hub_client_heartbeat(bot_state_t *state) {
       crypto_aes_gcm_encrypt(plain, 5, state->hub_session_key, buffer + 4, tag);
   if (enc_len > 0) {
     memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(enc_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
     memcpy(buffer, &net_len, 4);
-    if (send(state->hub_fd, buffer, 4 + enc_len + GCM_TAG_LEN, 0) !=
+    if (send(state->hub_fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN), 0) !=
         (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
       hub_client_disconnect(state);
     }
@@ -779,9 +779,9 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
 
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_BOT_DELTA;
-  uint32_t inner_len = htonl(pay_len);
+  uint32_t inner_len = htonl((uint32_t)pay_len);
   memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
+  memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
   int cipher_len = crypto_aes_gcm_encrypt(
@@ -789,10 +789,10 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
 
   if (cipher_len > 0) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
     memcpy(cipher, &net_len, 4);
     int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
+    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
       log_message(L_DEBUG, state, "[HUB] Delta pushed: %s=%s ts=%ld\n",
                   key, value ? value : "", (long)ts);
       return true;
@@ -819,8 +819,8 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
  * timestamp compare — pushing them would just log one REJECTED line per
  * record on every connect.  (The retired bot password p| is never sent.)
  */
-void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
-                                        int max_len) {
+static void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
+                                               int max_len) {
   int offset = 0;
   int written;
   const bool hub_only = is_opt_set(state, OPT_HUB_ONLY_MUTATIONS);
@@ -837,12 +837,12 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
       log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
                   c->name, c->is_managed, op, (long)c->timestamp);
       if (c->key[0] != '\0') {
-        written = snprintf(buffer + offset, max_len - offset,
+        written = snprintf(buffer + offset, (size_t)(max_len - offset),
                            "c|%s|%s|%d|%s|%ld\n",
                            c->name, c->key, (int)c->modes, op,
                            (long)c->timestamp);
       } else {
-        written = snprintf(buffer + offset, max_len - offset,
+        written = snprintf(buffer + offset, (size_t)(max_len - offset),
                            "c|%s||%d|%s|%ld\n",
                            c->name, (int)c->modes, op,
                            (long)c->timestamp);
@@ -882,7 +882,7 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
    * sends legacy shapes with an empty password slot, which this bot also
    * parses.  (Bot->hub push namespace — unrelated to the v| vhost line in the
    * local config file.)  The timestamp field is unused. */
-  written = snprintf(buffer + offset, max_len - offset, "v|%d|%d\n",
+  written = snprintf(buffer + offset, (size_t)(max_len - offset), "v|%d|%d\n",
                      BOT_PROTO_VERSION, 1);
   if (written > 0 && written < max_len - offset) {
     offset += written;
@@ -891,7 +891,7 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   // Hostmask — use the timestamp captured when actual_hostname last changed;
   // never use time(NULL) here or every push looks like new data to the hub.
   if (state->actual_hostname[0] != '\0' && state->actual_hostname_ts > 0) {
-    written = snprintf(buffer + offset, max_len - offset, "h|%s|%ld\n",
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "h|%s|%ld\n",
                        state->actual_hostname, (long)state->actual_hostname_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
@@ -900,7 +900,7 @@ void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
 
   // Nick — same stable-timestamp rule.
   if (state->current_nick[0] != '\0' && state->current_nick_ts > 0) {
-    written = snprintf(buffer + offset, max_len - offset, "n|%s|%ld\n",
+    written = snprintf(buffer + offset, (size_t)(max_len - offset), "n|%s|%ld\n",
                        state->current_nick, (long)state->current_nick_ts);
     if (written > 0 && written < max_len - offset) {
       offset += written;
@@ -959,12 +959,12 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
               "[HUB] Requesting ops via hub: target=%s chan=%s\n", target_uuid,
               channel);
 
-  int pay_len = strlen(payload);
+  int pay_len = (int)strlen(payload);
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_OP_REQUEST;
-  uint32_t inner_len = htonl(pay_len);
+  uint32_t inner_len = htonl((uint32_t)pay_len);
   memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
+  memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
   int cipher_len = crypto_aes_gcm_encrypt(
@@ -972,10 +972,10 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
 
   if (cipher_len > 0) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
     memcpy(cipher, &net_len, 4);
     int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
+    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
       return true;
     }
     hub_client_disconnect(state);
@@ -1017,9 +1017,9 @@ bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
 
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_INVITE_REQUEST;
-  uint32_t inner_len = htonl(pay_len);
+  uint32_t inner_len = htonl((uint32_t)pay_len);
   memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
+  memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
   int cipher_len = crypto_aes_gcm_encrypt(
@@ -1027,10 +1027,10 @@ bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
 
   if (cipher_len > 0) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
     memcpy(cipher, &net_len, 4);
     int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
+    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
       log_message(L_INFO, state,
                   "[HUB] Sent INVITE_REQUEST for %s in %s\n", nick, channel);
       return true;
@@ -1176,12 +1176,12 @@ void hub_client_push_config(bot_state_t *state) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Pushing config to hub (%zu bytes)\n",
               strlen(payload));
 
-  int pay_len = strlen(payload);
+  int pay_len = (int)strlen(payload);
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_CONFIG_PUSH;
-  uint32_t inner_len = htonl(pay_len);
+  uint32_t inner_len = htonl((uint32_t)pay_len);
   memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
+  memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
   int cipher_len = crypto_aes_gcm_encrypt(
@@ -1189,11 +1189,11 @@ void hub_client_push_config(bot_state_t *state) {
 
   if (cipher_len > 0) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
     memcpy(cipher, &net_len, 4);
 
     int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
+    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
       for (int i = 0; i < state->cfg_ban_count; i++)
         state->cfg_bans[i].push_pending = false;
       log_message(L_INFO, state, "[HUB] Config pushed to hub\n");
@@ -1229,9 +1229,9 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
 
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)CMD_CONFIG_PUSH;
-  uint32_t inner_len = htonl(pay_len);
+  uint32_t inner_len = htonl((uint32_t)pay_len);
   memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, pay_len);
+  memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
   int cipher_len = crypto_aes_gcm_encrypt(
@@ -1239,10 +1239,10 @@ void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
 
   if (cipher_len > 0) {
     memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl(cipher_len + GCM_TAG_LEN);
+    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
     memcpy(cipher, &net_len, 4);
     int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, total, 0) == total) {
+    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
       chan->enf_pending = false;
       log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
                   chan->name, (int)chan->modes);
@@ -1393,7 +1393,7 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
     if (!state->user_records[i].is_active &&
         (cutoff == 0 || state->user_records[i].timestamp < cutoff)) {
       memmove(&state->user_records[i], &state->user_records[i + 1],
-              (state->user_record_count - i - 1) * sizeof(user_record_t));
+              (size_t)(state->user_record_count - i - 1) * sizeof(user_record_t));
       state->user_record_count--;
       purged++;
       i--;
@@ -1404,7 +1404,7 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
     if (!state->mask_records[i].is_active &&
         (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
       memmove(&state->mask_records[i], &state->mask_records[i + 1],
-              (state->mask_record_count - i - 1) * sizeof(mask_record_t));
+              (size_t)(state->mask_record_count - i - 1) * sizeof(mask_record_t));
       state->mask_record_count--;
       purged++;
       i--;
@@ -1420,7 +1420,7 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
   return purged;
 }
 
-void hub_client_process_config_data(bot_state_t *state, const char *payload) {
+static void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Processing config data from hub\n");
 
   /* Hub is authoritative for user/mask records. Replace rather than merge so
@@ -1456,7 +1456,9 @@ void hub_client_process_config_data(bot_state_t *state, const char *payload) {
   /* Change 5: static, sized to a full config payload so a large hub config is
    * parsed whole (no truncation).  Single-threaded, non-reentrant. */
   static char work_buf[MAX_CONFIG_PAYLOAD];
-  snprintf(work_buf, sizeof(work_buf), "%s", payload);
+  size_t work_len = strnlen(payload, sizeof(work_buf) - 1);
+  memcpy(work_buf, payload, work_len);
+  work_buf[work_len] = '\0';
 
   /* UUIDs named by this payload's b| lines.  With a T| marker the hub is
    * saying "this is the whole trusted set", and every other trusted bot is
@@ -1973,8 +1975,8 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
                                        : "key sent");
 }
 
-void hub_handle_response(bot_state_t *state, int cmd, char *payload,
-                         int payload_len) {
+static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
+                                int payload_len) {
   switch (cmd) {
   case CMD_PING:
     if (!HIDEPINGPONG)
@@ -2029,7 +2031,7 @@ void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       char nick[MAX_NICK];
       char *bang = strchr(hostmask, '!');
       if (bang) {
-        size_t nick_len = bang - hostmask;
+        size_t nick_len = (size_t)(bang - hostmask);
         if (nick_len >= MAX_NICK)
           nick_len = MAX_NICK - 1;
         memcpy(nick, hostmask, nick_len);
@@ -2371,12 +2373,12 @@ void hub_client_connect(bot_state_t *state) {
   auth_state = HUB_AUTH_NONE;
   snprintf(state->current_hub, sizeof(state->current_hub), "%s", hub_original);
 
-  int uuid_len = strlen(state->bot_uuid);
-  uint32_t net_len = htonl(uuid_len);
+  int uuid_len = (int)strlen(state->bot_uuid);
+  uint32_t net_len = htonl((uint32_t)uuid_len);
   unsigned char uuid_frame[4 + 36];
   memcpy(uuid_frame, &net_len, 4);
-  memcpy(uuid_frame + 4, state->bot_uuid, uuid_len);
-  if (send(state->hub_fd, uuid_frame, 4 + uuid_len, 0) == 4 + uuid_len) {
+  memcpy(uuid_frame + 4, state->bot_uuid, (size_t)uuid_len);
+  if (send(state->hub_fd, uuid_frame, (size_t)(4 + uuid_len), 0) == 4 + uuid_len) {
     auth_state = HUB_AUTH_SENT_UUID;
     log_message(L_INFO, state, "[HUB] Connected to %s.\n", state->current_hub);
   } else {
@@ -2393,9 +2395,9 @@ void hub_client_process(bot_state_t *state) {
   unsigned char header[4];
   int header_read = 0;
   while (header_read < 4) {
-    int n = recv(state->hub_fd, header + header_read, 4 - header_read, 0);
+    int n = (int)recv(state->hub_fd, header + header_read, (size_t)(4 - header_read), 0);
     if (n <= 0) {
-      if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK || errno == EINTR))
+      if (n < 0 && (IO_WOULD_BLOCK(errno) || errno == EINTR))
         return;
       hub_client_disconnect(state);
       return;
@@ -2404,22 +2406,23 @@ void hub_client_process(bot_state_t *state) {
   }
   uint32_t net_len;
   memcpy(&net_len, header, 4);
-  int packet_len = ntohl(net_len);
+  uint32_t wire_len = ntohl(net_len);
   /* Change 5: a CMD_CONFIG_DATA frame from the hub can exceed MAX_BUFFER at
    * scale — bound by the config-frame ceiling instead of the small wire size. */
-  if (packet_len <= 0 || packet_len > MAX_HUB_FRAME) {
+  if (wire_len == 0 || wire_len > MAX_HUB_FRAME) {
     hub_client_disconnect(state);
     return;
   }
-  unsigned char *packet_body = malloc(packet_len);
+  int packet_len = (int)wire_len;
+  unsigned char *packet_body = malloc((size_t)packet_len);
   if (!packet_body) {
     hub_client_disconnect(state);
     return;
   }
   int total_read = 0;
   while (total_read < packet_len) {
-    int r = recv(state->hub_fd, packet_body + total_read,
-                 packet_len - total_read, 0);
+    int r = (int)recv(state->hub_fd, packet_body + total_read,
+                      (size_t)(packet_len - total_read), 0);
     if (r <= 0) {
       if (r < 0 && errno == EINTR) continue;
       free(packet_body);
@@ -2610,9 +2613,9 @@ void hub_client_process(bot_state_t *state) {
               pong_plain, 5, state->hub_session_key, pong_buf + 4, pong_tag);
           if (pong_enc > 0) {
             memcpy(pong_buf + 4 + pong_enc, pong_tag, GCM_TAG_LEN);
-            uint32_t pong_len = htonl(pong_enc + GCM_TAG_LEN);
+            uint32_t pong_len = htonl((uint32_t)(pong_enc + GCM_TAG_LEN));
             memcpy(pong_buf, &pong_len, 4);
-            if (send(state->hub_fd, pong_buf, 4 + pong_enc + GCM_TAG_LEN, 0) <= 0) {
+            if (send(state->hub_fd, pong_buf, (size_t)(4 + pong_enc + GCM_TAG_LEN), 0) <= 0) {
               hub_client_disconnect(state);
               free(packet_body);
               return;
@@ -2625,13 +2628,13 @@ void hub_client_process(bot_state_t *state) {
         if (plain_len > 5) {
           uint32_t payload_len_network;
           memcpy(&payload_len_network, &plain[1], 4);
-          int payload_len = ntohl(payload_len_network);
+          int payload_len = (int)ntohl(payload_len_network);
 
           if (payload_len > 0 && payload_len <= (plain_len - 5)) {
             /* Change 5: static, sized to the largest inbound frame (see plain
              * above). payload_len <= plain_len-5 <= MAX_HUB_FRAME-5. */
             static char payload_buf[MAX_HUB_FRAME];
-            memcpy(payload_buf, &plain[5], payload_len);
+            memcpy(payload_buf, &plain[5], (size_t)payload_len);
             payload_buf[payload_len] = '\0';
 
             hub_handle_response(state, cmd, payload_buf, payload_len);

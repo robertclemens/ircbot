@@ -166,7 +166,7 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
       } else if (!adding) {
         /* -k clears the key regardless of arg */
         c->key[0] = '\0';
-        c->modes &= ~(chan_mode_t)M_K;
+        c->modes = (chan_mode_t)(c->modes & ~(unsigned)M_K);
       }
       if (current_arg)
         current_arg = strtok_r(NULL, " ", &saveptr);
@@ -179,7 +179,7 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
       if (adding)
         c->modes |= M_I;
       else
-        c->modes &= ~(chan_mode_t)M_I;
+        c->modes = (chan_mode_t)(c->modes & ~(unsigned)M_I);
     }
     // --- Modes that NEVER take an argument (t, s, n, m, p, etc) ---
   }

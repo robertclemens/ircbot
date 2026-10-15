@@ -129,8 +129,8 @@ static void gen_uuid_v4(char out[37]) {
   unsigned char r[16];
   if (RAND_bytes(r, sizeof(r)) != 1)
     handle_fatal_error("RAND_bytes failed generating a UUID");
-  r[6] = (r[6] & 0x0f) | 0x40;
-  r[8] = (r[8] & 0x3f) | 0x80;
+  r[6] = (unsigned char)((r[6] & 0x0f) | 0x40);
+  r[8] = (unsigned char)((r[8] & 0x3f) | 0x80);
   snprintf(out, 37,
            "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
            r[0], r[1], r[2], r[3], r[4], r[5], r[6], r[7], r[8], r[9], r[10],
@@ -183,11 +183,11 @@ bool config_load(bot_state_t *state, const char *password,
     return false;
   }
 
-  unsigned char *ciphertext = malloc(ciphertext_len);
+  unsigned char *ciphertext = malloc((size_t)ciphertext_len);
   if (!ciphertext)
     handle_fatal_error("malloc failed for ciphertext");
 
-  if (fread(ciphertext, 1, ciphertext_len, in_file) != (size_t)ciphertext_len) {
+  if (fread(ciphertext, 1, (size_t)ciphertext_len, in_file) != (size_t)ciphertext_len) {
     log_message(
         L_INFO, state,
         "[CFG] Error: Could not read the full contents of the config file.\n");
@@ -203,7 +203,7 @@ bool config_load(bot_state_t *state, const char *password,
     return false;
   }
 
-  unsigned char *plaintext = malloc(ciphertext_len + 1);
+  unsigned char *plaintext = malloc((size_t)ciphertext_len + 1);
   if (!plaintext)
     handle_fatal_error("malloc failed for plaintext");
   int len;
@@ -218,7 +218,7 @@ bool config_load(bot_state_t *state, const char *password,
   }
   if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
       EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
-                        ciphertext_len) != 1) {
+                        (int)ciphertext_len) != 1) {
     EVP_CIPHER_CTX_free(ctx);
     secure_wipe(key, sizeof(key));
     secure_wipe(plaintext, (size_t)ciphertext_len);
@@ -238,13 +238,13 @@ bool config_load(bot_state_t *state, const char *password,
     secure_wipe(plaintext, (size_t)ciphertext_len);
     unsigned char legacy_key[32];
     if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                       (unsigned char *)password, (int)strlen(password),
+                       (const unsigned char *)password, (int)strlen(password),
                        1, legacy_key, NULL) > 0) {
       EVP_CIPHER_CTX *lctx = EVP_CIPHER_CTX_new();
       if (lctx) {
         int lpl = 0, ll = 0;
         if (EVP_DecryptInit_ex(lctx, EVP_aes_256_gcm(), NULL, legacy_key, iv) == 1 &&
-            EVP_DecryptUpdate(lctx, plaintext, &lpl, ciphertext, ciphertext_len) == 1) {
+            EVP_DecryptUpdate(lctx, plaintext, &lpl, ciphertext, (int)ciphertext_len) == 1) {
           EVP_CIPHER_CTX_ctrl(lctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
           int lrc = EVP_DecryptFinal_ex(lctx, plaintext + lpl, &ll);
           if (lrc > 0) {
@@ -407,8 +407,8 @@ bool config_load(bot_state_t *state, const char *password,
       case 'o': // Oper record  } shapes: config_parse_user_line (UUID-keyed),
       case 'a': // Admin record }         or the pre-UUID forms below
       {
-        const char *f[5];
-        size_t fl[5];
+        const char *f[5] = {0};
+        size_t fl[5] = {0};
         int nf = split_fields(data, f, fl, 5);
         if (state->user_record_count >= MAX_USER_RECORDS) break;
         if (is_uuid_field(f[0], fl[0])) {
@@ -476,9 +476,11 @@ bool config_load(bot_state_t *state, const char *password,
         }
         break;
 
-      case 'l': // Log level (bot-specific)
-        state->log_type = (log_type_t)atoi(data);
+      case 'l': { // Log level (bot-specific)
+        int lt = atoi(data);
+        state->log_type = (log_type_t)lt;
         break;
+      }
 
       case 'L': { // Log file cap in bytes (bot-specific), clamped on load
         long cap = strtol(data, NULL, 10);
@@ -655,8 +657,8 @@ bool config_load(bot_state_t *state, const char *password,
     /* Generate a simple UUID-like value using random bytes */
     unsigned char rnd[16];
     RAND_bytes(rnd, sizeof(rnd));
-    rnd[6] = (rnd[6] & 0x0f) | 0x40; /* version 4 */
-    rnd[8] = (rnd[8] & 0x3f) | 0x80; /* variant */
+    rnd[6] = (unsigned char)((rnd[6] & 0x0f) | 0x40); /* version 4 */
+    rnd[8] = (unsigned char)((rnd[8] & 0x3f) | 0x80); /* variant */
     char admin_uuid[37];
     snprintf(admin_uuid, sizeof(admin_uuid),
              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -702,8 +704,8 @@ bool config_load(bot_state_t *state, const char *password,
       if (strcmp(u->uuid, "MIGRATE_O") != 0 || nu >= MAX_USER_RECORDS) continue;
       unsigned char ornd[16];
       RAND_bytes(ornd, sizeof(ornd));
-      ornd[6] = (ornd[6] & 0x0f) | 0x40;
-      ornd[8] = (ornd[8] & 0x3f) | 0x80;
+      ornd[6] = (unsigned char)((ornd[6] & 0x0f) | 0x40);
+      ornd[8] = (unsigned char)((ornd[8] & 0x3f) | 0x80);
       char ouuid[37];
       snprintf(ouuid, sizeof(ouuid),
                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -721,7 +723,7 @@ bool config_load(bot_state_t *state, const char *password,
       }
       /* Deduplicate name */
       bool collision = true;
-      int suffix = 2;
+      unsigned suffix = 2;
       char try_name[64];
       snprintf(try_name, sizeof(try_name), "%s", derived_name);
       while (collision) {
@@ -733,7 +735,7 @@ bool config_load(bot_state_t *state, const char *password,
              * long derived_name can never push the suffix out of the buffer:
              * a truncated suffix would collapse two distinct names to the same
              * string and silently defeat this dedup loop. */
-            snprintf(try_name, sizeof(try_name), "%.*s_%d",
+            snprintf(try_name, sizeof(try_name), "%.*s_%u",
                      (int)(sizeof(try_name) - 12), derived_name, suffix++);
             break;
           }
@@ -943,7 +945,7 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   }
 
   if (state->log_type != DEFAULT_LOG_LEVEL)
-    CFG_WRITE("l|%d\n", state->log_type);
+    CFG_WRITE("l|%d\n", (int)state->log_type);
   /* 0 is a state that never ran state_init (the setup wizard): default. */
   if (state->log_max_size > 0 && state->log_max_size != BOT_LOG_FILE_SIZE)
     CFG_WRITE("L|%ld\n", state->log_max_size);
@@ -1021,7 +1023,7 @@ static void config_write_file(const bot_state_t *state, const char *password) {
     secure_wipe(plaintext_overrides, (size_t)cap);
     handle_fatal_error("malloc failed for ciphertext");
   }
-  int len, ciphertext_len;
+  int len = 0, ciphertext_len = 0;
 
   EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
   bool enc_ok = ctx &&
@@ -1057,7 +1059,7 @@ static void config_write_file(const bot_state_t *state, const char *password) {
       fwrite(salt,       1, sizeof(salt),       out_file) == sizeof(salt)       &&
       fwrite(iv,         1, sizeof(iv),         out_file) == sizeof(iv)         &&
       fwrite(tag,        1, sizeof(tag),         out_file) == sizeof(tag)        &&
-      fwrite(ciphertext, 1, ciphertext_len,      out_file) == (size_t)ciphertext_len &&
+      fwrite(ciphertext, 1, (size_t)ciphertext_len, out_file) == (size_t)ciphertext_len &&
       fflush(out_file) == 0 &&
       fsync(fileno(out_file)) == 0;
 
@@ -1077,10 +1079,10 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   }
 }
 
-void config_write(const bot_state_t *state, const char *password) {
+void config_write(bot_state_t *state, const char *password) {
   config_write_file(state, password);
   if (state->hub_count > 0 && state->hub_authenticated)
-    hub_client_push_config((bot_state_t *)state);
+    hub_client_push_config(state);
 }
 
 /* Save config to disk only — does NOT push to hub.

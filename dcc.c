@@ -61,7 +61,7 @@ static bool dcc_flush(dcc_session_t *s) {
       s->outlen -= (size_t)n;
     } else if (n < 0 && errno == EINTR) {
       continue;
-    } else if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) {
+    } else if (n < 0 && IO_WOULD_BLOCK(errno)) {
       return true;
     } else {
       return false;
@@ -487,8 +487,7 @@ static void dcc_on_connect(bot_state_t *state, dcc_session_t *s) {
 static void dcc_read(bot_state_t *state, dcc_session_t *s) {
   char buf[2048];
   ssize_t n = recv(s->fd, buf, sizeof(buf), 0);
-  if (n == 0 || (n < 0 && errno != EAGAIN && errno != EWOULDBLOCK &&
-                 errno != EINTR)) {
+  if (n == 0 || (n < 0 && !IO_WOULD_BLOCK(errno) && errno != EINTR)) {
     log_message(L_INFO, state, "[DCC] %s (%s) closed the chat\n", s->name,
                 s->user_host);
     dcc_free(state, s);
@@ -556,15 +555,15 @@ void dcc_process(bot_state_t *state, const fd_set *rfds, const fd_set *wfds) {
     if (s->phase == DCC_CONNECTING) {
       /* A slot connected after select() may reuse a closed fd's number;
        * dcc_on_connect's getpeername() tells a finished connect apart. */
-      if (FD_ISSET(s->fd, wfds))
+      if (fd_isset(s->fd, wfds))
         dcc_on_connect(state, s);
       continue;
     }
     if (s->phase != DCC_OPEN)
       continue;
-    if (FD_ISSET(s->fd, wfds) && !dcc_flush(s))
+    if (fd_isset(s->fd, wfds) && !dcc_flush(s))
       s->failed = true;
-    if (!s->failed && FD_ISSET(s->fd, rfds))
+    if (!s->failed && fd_isset(s->fd, rfds))
       dcc_read(state, s);
     if (s->phase == DCC_OPEN && s->failed)
       dcc_close(state, s, NULL);

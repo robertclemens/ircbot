@@ -296,12 +296,13 @@ static bool irckey_parse(const char *line, irckey_t *k) {
 
 static bool irckey_open(const irckey_t *k, const char *pass, size_t plen,
                         unsigned char priv[KEY_LEN]) {
-  unsigned char key[32];
+  unsigned char key[32], tag[16];
+  memcpy(tag, k->ct + KEY_LEN, sizeof(tag));
   uint64_t n = (uint64_t)1 << k->log2n;
   uint64_t maxmem = 128ULL * k->r * n + (1ULL << 20) + 128ULL * k->r * k->p;
   bool ok = EVP_PBE_scrypt(pass, plen, k->salt, 16, n, k->r, k->p, maxmem, key, 32) == 1 &&
             gcm(false, key, k->nonce, (const unsigned char *)k->aad, strlen(k->aad), k->ct,
-                KEY_LEN, priv, (unsigned char *)k->ct + KEY_LEN);
+                KEY_LEN, priv, tag);
   OPENSSL_cleanse(key, sizeof(key));
   return ok;
 }
@@ -436,10 +437,10 @@ static long parse_expire(const char *s) {
   long v = strtol(s, &e, 10);
   if (e == s || v < 0 || errno) return -2;
   long mul = 1;
-  if (*e == 's') mul = 1, e++;
-  else if (*e == 'm') mul = 60, e++;
-  else if (*e == 'h') mul = 3600, e++;
-  else if (*e == 'd') mul = 86400, e++;
+  if (*e == 's') { mul = 1; e++; }
+  else if (*e == 'm') { mul = 60; e++; }
+  else if (*e == 'h') { mul = 3600; e++; }
+  else if (*e == 'd') { mul = 86400; e++; }
   if (*e || v > EXPIRE_MAX / mul) return -2;
   return v * mul;
 }
@@ -615,7 +616,10 @@ static int holder_call(const char *name, char op, const void *in, size_t il,
   unsigned char h[3] = {(unsigned char)op, (unsigned char)(il >> 8), (unsigned char)il};
   unsigned char r[3];
   int rc = -1;
-  if (il <= HOLD_MAX && hc_io(c, h, 3, true) && (!il || hc_io(c, (void *)in, il, true)) &&
+  /* hc_io only reads its buffer when writing, so the const input passes
+   * unchanged; the union drops the qualifier without a cast. */
+  union { const void *ro; void *rw; } ib = { .ro = in };
+  if (il <= HOLD_MAX && hc_io(c, h, 3, true) && (!il || hc_io(c, ib.rw, il, true)) &&
       hc_io(c, r, 3, false)) {
     size_t rl = ((size_t)r[1] << 8) | r[2];
     if (r[0] == 0 && rl <= cap && (!rl || hc_io(c, out, rl, false))) rc = (int)rl;
@@ -1021,7 +1025,7 @@ static bool hold_serve(hconn_t c, time_t deadline) {
     if (il <= HOLD_MAX && (!il || hc_io(c, in, il, false)))
       n = hold_answer(h[0], in, il, out, deadline, &quit);
   }
-  r[0] = n < 0 ? 1 : 0;
+  r[0] = (unsigned char)(n < 0 ? 1 : 0);
   r[1] = 0;
   r[2] = (unsigned char)(n < 0 ? 0 : n);
   if (hc_io(c, r, 3, true) && n > 0) (void)hc_io(c, out, (size_t)n, true);

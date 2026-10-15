@@ -113,9 +113,11 @@ static void strip_ident_tilde(const char *in, char *out, size_t out_size) {
 // auth_trusted_bot_by_host: wildcard-match user_host against the stored
 // trusted-bot hostmasks.  Strict on the full mask by design (see
 // ARCHITECTURE.md): the mask a peer publishes is the server-displayed one.
-trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
-                                        const char *user_host) {
-  if (state->trusted_bot_count == 0) return NULL;
+// trusted_bot_index_by_host returns the matching index or -1, so the
+// const-state callers need no cast.
+static int trusted_bot_index_by_host(const bot_state_t *state,
+                                     const char *user_host) {
+  if (state->trusted_bot_count == 0) return -1;
   char norm_user_host[MAX_MASK_LEN];
   strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
   for (int i = 0; i < state->trusted_bot_count; i++) {
@@ -123,9 +125,15 @@ trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
     strip_ident_tilde(state->trusted_bots[i].mask, norm_hostmask,
                       sizeof(norm_hostmask));
     if (auth_wildcard_match(norm_hostmask, norm_user_host))
-      return &state->trusted_bots[i];
+      return i;
   }
-  return NULL;
+  return -1;
+}
+
+trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
+                                        const char *user_host) {
+  int i = trusted_bot_index_by_host(state, user_host);
+  return i < 0 ? NULL : &state->trusted_bots[i];
 }
 
 trusted_bot_t *auth_trusted_bot_by_uuid(bot_state_t *state, const char *uuid) {
@@ -158,11 +166,10 @@ trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick) {
 bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
                          char *uuid_out, size_t uuid_out_size) {
   if (uuid_out && uuid_out_size > 0) uuid_out[0] = '\0';
-  trusted_bot_t *tb =
-      auth_trusted_bot_by_host((bot_state_t *)state, user_host);
-  if (!tb) return false;
+  int i = trusted_bot_index_by_host(state, user_host);
+  if (i < 0) return false;
   if (uuid_out && uuid_out_size > 0)
-    snprintf(uuid_out, uuid_out_size, "%s", tb->uuid);
+    snprintf(uuid_out, uuid_out_size, "%s", state->trusted_bots[i].uuid);
   return true;
 }
 

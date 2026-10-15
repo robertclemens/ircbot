@@ -435,8 +435,24 @@ bool chan_member_authorised(const bot_state_t *state, const chan_t *c,
  * dynamic limit owns it); dry only counts what it would send; require_known
  * refuses to act on a live-mode picture we never received (the enforcement
  * path -- the one-shot apply sends everything when unknown). */
+static int mode_sync(bot_state_t *state, chan_t *c, bool skip_limit, bool dry,
+                     bool require_known, char *summary, size_t summary_size);
+
+/* The changes are held and leave packed, several per MODE line. */
 int chanmode_sync(bot_state_t *state, chan_t *c, bool skip_limit, bool dry,
                   bool require_known, char *summary, size_t summary_size) {
+  if (dry)
+    return mode_sync(state, c, skip_limit, dry, require_known, summary,
+                     summary_size);
+  sendq_hold(state);
+  int n = mode_sync(state, c, skip_limit, dry, require_known, summary,
+                    summary_size);
+  sendq_release(state);
+  return n;
+}
+
+static int mode_sync(bot_state_t *state, chan_t *c, bool skip_limit, bool dry,
+                     bool require_known, char *summary, size_t summary_size) {
   const char *spec = chancfg_get_modes(state, c);
   char want[128];
   if (strlen(spec) >= sizeof(want)) {

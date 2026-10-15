@@ -230,6 +230,10 @@ bool bot_comms_handle_privmsg(bot_state_t *state, const char *nick,
  * (hub relay when connected, else PRIVMSG). */
 static void b2_vsend(bot_state_t *state, const trusted_bot_t *tb,
                      const char *target_nick, const char *format,
+                     va_list args)
+    __attribute__((format(printf, 4, 0)));
+static void b2_vsend(bot_state_t *state, const trusted_bot_t *tb,
+                     const char *target_nick, const char *format,
                      va_list args) {
   if (!tb || !tb->has_pub || tb->uuid[0] == '\0') {
     log_message(L_DEBUG, state,

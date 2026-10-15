@@ -1161,6 +1161,16 @@ void commands_activity_tick(bot_state_t *state, time_t now) {
   }
 }
 
+/* chname: the new name of a bot is its IRC nick, so it must be one the ircd
+ * takes (a literal format, so irc_printf's arguments are checked). */
+static void say_bad_rfc_nick(bot_state_t *state, const char *nick,
+                             const char *name) {
+  irc_printf(state,
+             "PRIVMSG %s :Error: '%s' is not a valid IRC nick: a letter or one "
+             "of []\\`_^{} first, then letters, digits, those or '-'.\r\n",
+             nick, name);
+}
+
 /* The admin/oper command tree, split out of commands_handle_private_message
  * so the caller wipes the decrypted command after every return path here.
  * command/arg1..arg3 point into the caller's cmd_plaintext. */
@@ -1534,7 +1544,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
             srv_line[soff++] = ','; srv_line[soff++] = ' ';
           }
           if (soff + elen < (int)sizeof(srv_line) - 1) {
-            memcpy(srv_line + soff, entry, elen);
+            memcpy(srv_line + soff, entry, (size_t)elen);
             soff += elen; srv_line[soff] = '\0';
           }
         }
@@ -1558,7 +1568,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               in_buf[in_off++] = ','; in_buf[in_off++] = ' ';
             }
             if (in_off + elen < (int)sizeof(in_buf) - 1) {
-              memcpy(in_buf + in_off, entry, elen);
+              memcpy(in_buf + in_off, entry, (size_t)elen);
               in_off += elen; in_buf[in_off] = '\0';
             }
           } else {
@@ -1567,7 +1577,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               out_buf[out_off++] = ','; out_buf[out_off++] = ' ';
             }
             if (out_off + elen < (int)sizeof(out_buf) - 1) {
-              memcpy(out_buf + out_off, c->name, elen);
+              memcpy(out_buf + out_off, c->name, (size_t)elen);
               out_off += elen; out_buf[out_off] = '\0';
             }
           }
@@ -1630,9 +1640,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           char hubs_line[300] = ""; int hoff = 0;
           for (int i = 0; i < state->hub_count; i++) {
             int hlen = (int)strlen(state->hubs[i].addr);
-            if (hoff) { hubs_line[hoff++] = ','; hubs_line[hoff++] = ' '; }
-            if (hoff + hlen < (int)sizeof(hubs_line) - 1) {
-              memcpy(hubs_line + hoff, state->hubs[i].addr, hlen);
+            if (hoff + (hoff ? 2 : 0) + hlen < (int)sizeof(hubs_line) - 1) {
+              if (hoff) { hubs_line[hoff++] = ','; hubs_line[hoff++] = ' '; }
+              memcpy(hubs_line + hoff, state->hubs[i].addr, (size_t)hlen);
               hoff += hlen; hubs_line[hoff] = '\0';
             }
           }
@@ -1652,7 +1662,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               first = 0; toff = 0; trust_line[0] = '\0';
             }
             if (toff) { trust_line[toff++] = ','; trust_line[toff++] = ' '; }
-            memcpy(trust_line + toff, tname, tlen);
+            memcpy(trust_line + toff, tname, (size_t)tlen);
             toff += tlen; trust_line[toff] = '\0';
           }
           if (toff)
@@ -1679,7 +1689,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
             first = 0; toff = 0; trust_line[0] = '\0';
           }
           if (toff) { trust_line[toff++] = ','; trust_line[toff++] = ' '; }
-          memcpy(trust_line + toff, tname, tlen);
+          memcpy(trust_line + toff, tname, (size_t)tlen);
           toff += tlen; trust_line[toff] = '\0';
         }
         if (toff)
@@ -1745,14 +1755,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       /* A bot's new name is its IRC nick, so it must be one the ircd takes;
        * admin/oper names are account names and keep the rule above. */
-      static const char *const rfc_nick_err =
-          "PRIVMSG %s :Error: '%s' is not a valid IRC nick: a letter or one "
-          "of []\\`_^{} first, then letters, digits, those or '-'.\r\n";
       bool cn_found = false;
       /* Case 1: this bot's own target nick */
       if (strcasecmp(state->target_nick, arg1) == 0) {
         if (!is_rfc_nick(arg2)) {
-          irc_printf(state, rfc_nick_err, nick, arg2);
+          say_bad_rfc_nick(state, nick, arg2);
           return;
         }
         snprintf(state->target_nick, MAX_NICK, "%s", arg2);
@@ -1787,7 +1794,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           auth_trusted_bot_nick(tb, bnick);
           if (strcasecmp(bnick, arg1) != 0) continue;
           if (!is_rfc_nick(arg2)) {
-            irc_printf(state, rfc_nick_err, nick, arg2);
+            say_bad_rfc_nick(state, nick, arg2);
             return;
           }
           /* Replace the nick part of the mask (up to '!') */
@@ -1980,7 +1987,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Error: RNG failure.\r\n", nick);
         return;
       }
-      rnd[6]=(rnd[6]&0x0f)|0x40; rnd[8]=(rnd[8]&0x3f)|0x80;
+      rnd[6]=(unsigned char)((rnd[6]&0x0f)|0x40); rnd[8]=(unsigned char)((rnd[8]&0x3f)|0x80);
       char new_uuid[37];
       snprintf(new_uuid, sizeof(new_uuid),
                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -2738,7 +2745,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state,
                      "PRIVMSG %s :Syntax: chanmode <#channel> [<modes> [args]|-] - Show, set or reset "
                      "the channel's stored modes (i m n p s t k l). +k takes a key and +l a limit "
-                     "(1..99999) as arguments, left to right; '-' goes back to the network default. "
+                     "(1..99999) as arguments, left to right; '-' goes back to the network default (built-in +nt). "
                      "The modes are applied once if this bot is opped; with +enforcemodes the bots "
                      "keep them. chkey <#channel> <key> is chanmode <#channel> +k <key>.\r\n", nick);
         } else if (strcasecmp(arg1, "chanset") == 0) {
@@ -2746,10 +2753,22 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: chanset <#channel|default> [+opt -opt ...] [<name> <value|default>] "
                      "[flood <type> <N:S|off|default>] - Show or change channel settings.\r\n", nick);
           irc_printf(state,
-                     "PRIVMSG %s :  Options: enforcemodes bitch protectops revenge stopnethack enforcebans "
-                     "dynamicbans dontkickops cycle dynamiclimit. Values: bantime bantype banidle limitgap "
-                     "limitdelay. Floods: chan ctcp join nick deop kick ban. 'default' also takes "
-                     "'flood cmd|msg|ctcp' (bot floods), 'ignoretime <min>' and 'sendq B:I' (burst 1..100, interval 0..10000 ms).\r\n", nick);
+                     "PRIVMSG %s :  On/off options take +name or -name; the others take a value or "
+                     "'default' (inherit again); a flood takes N:S (more than N in S seconds), off or "
+                     "default. Only unauthorised members are acted on, by an opped bot. Setting "
+                     "(built-in default): what it does --\r\n", nick);
+          for (int i = 0;; i++) {
+            char def[24];
+            const char *what;
+            if (!chancfg_item_help(i, def, sizeof(def), &what))
+              break;
+            const char *name = chancfg_item_name(i, true);
+            if (!name)
+              continue;
+            bool net_only = !chancfg_item_name(i, false);
+            irc_printf(state, "PRIVMSG %s :  %s (%s)%s: %s\r\n", nick, name, def,
+                       net_only ? " [default only]" : "", what);
+          }
         } else if (strcasecmp(arg1, "+ban") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: +ban <#channel|*> <nick!user@host> [<minutes>|perm] [sticky] [reason] - "

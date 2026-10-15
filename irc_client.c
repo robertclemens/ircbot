@@ -333,7 +333,7 @@ void irc_disconnect(bot_state_t *state) {
   if ((state->status & S_CONNECTED) && state->server_fd != -1) {
     const char *quit_msg = "QUIT :bye\r\n";
     if (state->is_ssl && state->ssl) {
-      SSL_write(state->ssl, quit_msg, strlen(quit_msg));
+      SSL_write(state->ssl, quit_msg, (int)strlen(quit_msg));
     } else {
       send(state->server_fd, quit_msg, strlen(quit_msg), MSG_NOSIGNAL);
     }
@@ -506,7 +506,7 @@ int irc_write_raw(bot_state_t *state, const char *buffer, int len) {
     int total_sent = 0;
     while (total_sent < len) {
       ssize_t sent = write(state->server_fd, buffer + total_sent,
-                           len - total_sent);
+                           (size_t)(len - total_sent));
       if (sent <= 0) {
         if (errno == EINTR) continue;
         log_message(L_INFO, state,
@@ -709,7 +709,7 @@ void irc_handle_read(bot_state_t *state) {
   ssize_t bytes_read;
   if (state->is_ssl) {
     bytes_read = SSL_read(state->ssl, read_buffer + buffer_len,
-                          sizeof(read_buffer) - (size_t)buffer_len - 1);
+                          (int)(sizeof(read_buffer) - (size_t)buffer_len - 1));
     if (bytes_read <= 0) {
       int ssl_err = SSL_get_error(state->ssl, (int)bytes_read);
       if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
@@ -723,8 +723,7 @@ void irc_handle_read(bot_state_t *state) {
     bytes_read = read(state->server_fd, read_buffer + buffer_len,
                       sizeof(read_buffer) - (size_t)buffer_len - 1);
     if (bytes_read <= 0) {
-      if (bytes_read == 0 || (errno != EWOULDBLOCK && errno != EAGAIN &&
-                               errno != EINTR)) {
+      if (bytes_read == 0 || (!IO_WOULD_BLOCK(errno) && errno != EINTR)) {
         irc_disconnect(state);
         buffer_len = 0;
       }
@@ -750,7 +749,7 @@ void irc_handle_read(bot_state_t *state) {
   int remaining = buffer_len - (int)(line_start - read_buffer);
   if (remaining < 0) remaining = 0;
   if (remaining > 0 && line_start != read_buffer) {
-      memmove(read_buffer, line_start, remaining);
+      memmove(read_buffer, line_start, (size_t)remaining);
   }
   buffer_len = remaining;
   read_buffer[buffer_len] = '\0';
@@ -784,6 +783,18 @@ void irc_check_status(bot_state_t *state) {
      * holds are applied inside irc_connect(). */
     if (now - state->last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL)
       irc_connect(state);
+    return;
+  }
+
+  /* Registration watchdog.  Any received byte refreshes last_pong_time, and
+   * a server answers an unregistered client's PING (451 or PONG), so without
+   * this a link that never reaches 001 is held open forever, off IRC. */
+  if (!(state->status & S_AUTHED) &&
+      now - state->connection_time > IRC_REGISTER_TIMEOUT) {
+    log_message(L_INFO, state,
+                "[INFO] No registration (001) after %d seconds. "
+                "Disconnecting.\n", IRC_REGISTER_TIMEOUT);
+    irc_disconnect(state);
     return;
   }
 

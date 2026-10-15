@@ -536,17 +536,22 @@ int crypto_reply_open(const unsigned char key[32], const unsigned char *aad,
 
 unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
-    int len = strlen(input);
-    unsigned char *buffer = (unsigned char *)malloc(len);
+    size_t slen = strlen(input);
+    if (slen == 0 || slen > INT_MAX) {
+        *out_len = 0;
+        return NULL;
+    }
+    int len = (int)slen;
+    unsigned char *buffer = (unsigned char *)malloc(slen);
     if (!buffer) {
         *out_len = 0;
         return NULL;
     }
     
-    memset(buffer, 0, len);
+    memset(buffer, 0, slen);
     b64 = BIO_new(BIO_f_base64());
     BIO_set_flags(b64, BIO_FLAGS_BASE64_NO_NL);
-    bmem = BIO_new_mem_buf((void *)input, len);
+    bmem = BIO_new_mem_buf(input, len);
     bmem = BIO_push(b64, bmem);
     
     *out_len = BIO_read(bmem, buffer, len);

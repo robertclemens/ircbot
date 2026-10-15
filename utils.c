@@ -71,10 +71,13 @@ _Noreturn void handle_fatal_error(const char *message) {
 void updater_host_arch(char *out, size_t out_size) {
   if (!out || out_size == 0) return;
   struct utsname u;
-  if (uname(&u) == 0 && u.machine[0])
-    snprintf(out, out_size, "%s", u.machine);
-  else
+  if (uname(&u) == 0 && u.machine[0]) {
+    size_t n = strnlen(u.machine, out_size - 1);
+    memcpy(out, u.machine, n);
+    out[n] = '\0';
+  } else {
     snprintf(out, out_size, "unknown");
+  }
 }
 
 void updater_host_libc(char *out, size_t out_size) {
@@ -146,9 +149,11 @@ int updater_version_cmp(const char *a, const char *b) {
   return local_strverscmp(version_strip_v(a), version_strip_v(b));
 }
 
+#ifdef HAVE_CURL /* only the curl-based updater compares for equality */
 static bool version_eq(const char *a, const char *b) {
   return strcasecmp(version_strip_v(a), version_strip_v(b)) == 0;
 }
+#endif
 
 /* ---- Upgrade hand-off marker -------------------------------------------
  * exec() throws away everything the old process knew, so the upgrade id and
@@ -1361,7 +1366,7 @@ bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
 /* Run argv[0] with argv, stdout+stderr captured into `out` (first line
  * kept), killed after `timeout_s`.  Returns its exit status, or -1 when it
  * could not run or timed out.  No shell: every argument is passed as-is. */
-static int run_bounded(char *const argv[], int timeout_s, char *out,
+static int run_bounded(const char *const argv[], int timeout_s, char *out,
                        size_t out_size) {
   if (out && out_size) out[0] = '\0';
   int pipefd[2];
@@ -1382,7 +1387,10 @@ static int run_bounded(char *const argv[], int timeout_s, char *out,
     long maxfd = sysconf(_SC_OPEN_MAX);
     if (maxfd < 0 || maxfd > 65536) maxfd = 65536;
     for (int fd = 3; fd < maxfd; fd++) close(fd);
-    execv(argv[0], argv);
+    /* execv() takes char *const[] for historical reasons only: POSIX never
+     * writes through it, so the union passes the const array unchanged. */
+    union { const char *const *ro; char *const *rw; } av = { .ro = argv };
+    execv(argv[0], av.rw);
     _exit(127);
   }
   close(pipefd[1]);
@@ -1423,15 +1431,15 @@ static int run_bounded(char *const argv[], int timeout_s, char *out,
  * Nothing live is touched either way; the scratch directory is removed. */
 static bool staged_selftest(const char *archive, char *err, size_t err_size) {
   static const char *dir = "./ircbot_selftest_tmp";
-  char *rm[] = {"/bin/rm", "-rf", (char *)dir, NULL};
+  const char *rm[] = {"/bin/rm", "-rf", dir, NULL};
   run_bounded(rm, 30, NULL, 0);
   if (mkdir(dir, 0700) != 0) {
     snprintf(err, err_size, "could not stage the new build for its selftest");
     return false;
   }
   char out[256];
-  char *tar[] = {"/bin/tar", "-xzf", (char *)archive, "--strip-components=1",
-                 "-C", (char *)dir, NULL};
+  const char *tar[] = {"/bin/tar", "-xzf", archive, "--strip-components=1",
+                       "-C", dir, NULL};
   if (access("/bin/tar", X_OK) != 0) tar[0] = "/usr/bin/tar";
   if (run_bounded(tar, 60, out, sizeof(out)) != 0) {
     run_bounded(rm, 30, NULL, 0);
@@ -1440,7 +1448,7 @@ static bool staged_selftest(const char *archive, char *err, size_t err_size) {
   }
   char bin[64];
   snprintf(bin, sizeof(bin), "%s/ircbot", dir);
-  char *st[] = {bin, "-selftest", NULL};
+  const char *st[] = {bin, "-selftest", NULL};
   int rc = run_bounded(st, UPGRADE_SELFTEST_SECS, out, sizeof(out));
   run_bounded(rm, 30, NULL, 0);
   if (rc != 0) {

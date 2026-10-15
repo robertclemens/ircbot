@@ -385,7 +385,9 @@ static bool ban_active_room(const bot_state_t *state, const char *chan) {
     if (b->active && strcasecmp(b->chan, chan) == 0)
       n++;
   }
-  return n < (strcmp(chan, "*") == 0 ? MAX_GLOBAL_BANS : MAX_BANS_PER_CHAN);
+  if (strcmp(chan, "*") == 0)
+    return n < MAX_GLOBAL_BANS;
+  return n < MAX_BANS_PER_CHAN;
 }
 
 /* A slot for a new entry: grows the table up to CFG_MAX_BANS, then reuses the
@@ -716,12 +718,62 @@ bool chancfg_setting_is_flag(const char *name) {
 }
 
 const char *chancfg_item_name(int idx, bool net) {
-  if (idx < 0 || idx >= CS_COUNT + FL_COUNT)
+  if (idx < 0 || idx >= (int)CS_COUNT + (int)FL_COUNT)
     return NULL;
   if (idx < CS_COUNT)
     return (CSET[idx].net_only && !net) ? NULL : CSET[idx].name;
   return (idx - CS_COUNT >= FL_CHAN_COUNT && !net) ? NULL
                                                     : FL_NAME[idx - CS_COUNT];
+}
+
+/* What item idx does, in the same index space as chancfg_item_name (the
+ * hub console's help channel set / network set say the same). */
+static const char *const ITEM_WHAT[CS_COUNT + FL_COUNT] = {
+  "put back any change away from the stored modes",
+  "only authorised users and bots may hold ops",
+  "re-op an authorised member someone deopped; lift bans on one",
+  "deop whoever deops, kicks or bans an authorised member; again: kick + ban",
+  "take back ops a netsplit rejoin gave to unauthorised members",
+  "kick the unauthorised members a new ban matches",
+  "set a listed ban only while someone it matches is in the channel",
+  "ops are never acted on for chan, ctcp, join and nick floods",
+  "a bot alone in a channel with no ops parts and rejoins for ops",
+  "keep +l at the member count plus limitgap",
+  "minutes an automatic ban (flood, revenge) lasts; 0 = permanent",
+  "ban mask shape 0-9: 2 = *!*@host, 4 = *!*@*.host, 7 = nick!*@host",
+  "dynamicbans: minutes with no match before a listed ban is lifted",
+  "dynamiclimit: free places above the member count",
+  "dynamiclimit: seconds between limit changes",
+  "minutes a flooding host or user stays ignored",
+  "messages to the channel per host: kick, again: ban",
+  "CTCPs to the channel per host: kick, again: ban",
+  "joins per host (join/part cycling): ban + kick",
+  "nick changes per host: kick, again: ban",
+  "deops by an unauthorised op: deop them, re-op the victims",
+  "kicks by an unauthorised op: deop them, again: kick + ban",
+  "bans by an unauthorised op: deop them, lift bans on authorised",
+  "commands per user: extras dropped; 3x the rate ignores the user",
+  "other messages to a bot per host: the host is ignored",
+  "CTCPs to a bot per host: the host is ignored",
+  "a bot's IRC output: B lines at once, then one every I ms",
+};
+
+/* Item idx's built-in value as typed (on/off, a number, N:S) and what it
+ * does; false for an index past the end. */
+bool chancfg_item_help(int idx, char *def, size_t def_size, const char **what) {
+  if (idx < 0 || idx >= (int)CS_COUNT + (int)FL_COUNT)
+    return false;
+  if (idx < CS_COUNT) {
+    if (CSET[idx].hi == 1)
+      snprintf(def, def_size, "%s", CSET[idx].builtin ? "on" : "off");
+    else
+      snprintf(def, def_size, "%ld", CSET[idx].builtin);
+  } else {
+    int k = idx - CS_COUNT;
+    snprintf(def, def_size, "%d:%d", FL_BUILTIN[k][0], FL_BUILTIN[k][1]);
+  }
+  *what = ITEM_WHAT[idx];
+  return true;
 }
 
 int chancfg_item_source(const bot_state_t *state, const chan_t *c, int idx) {
@@ -807,7 +859,10 @@ bool chancfg_settings_edit(char *settings, size_t cap, bool net,
       goto full;
     ol += (size_t)w;
   }
-  if (ol >= cap || ol > (net ? D_SETTINGS_MAX : C_SETTINGS_MAX))
+  size_t field_max = C_SETTINGS_MAX;
+  if (net)
+    field_max = D_SETTINGS_MAX;
+  if (ol >= cap || ol > field_max)
     goto full;
   memcpy(settings, out, ol + 1);
   return true;

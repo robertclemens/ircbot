@@ -58,7 +58,11 @@ void log_message(log_type_t flag, const bot_state_t *state, const char *format,
   snprintf(full_log_line, sizeof(full_log_line), "[%s] %s", time_buf,
            base_message);
 
-  bot_state_t *mutable_state = (bot_state_t *)state;
+  /* The log ring is the one part of state every logger writes, including
+   * callers holding only a const view (the state itself is never const); the
+   * union drops the qualifier without a cast. */
+  union { const bot_state_t *ro; bot_state_t *rw; } su = { .ro = state };
+  bot_state_t *mutable_state = su.rw;
 
   int buffer_index = get_log_index(flag);
   if (buffer_index != -1) {

@@ -93,11 +93,16 @@ static bool is_me(const bot_state_t *state, const char *nick) {
   return nick && strcasecmp(nick, state->current_nick) == 0;
 }
 
-static roster_entry_t *rfind(chan_t *c, const char *nick) {
+static int rindex_of(const chan_t *c, const char *nick) {
   for (int i = 0; i < c->roster_count; i++)
     if (strcasecmp(c->roster[i].nick, nick) == 0)
-      return &c->roster[i];
-  return NULL;
+      return i;
+  return -1;
+}
+
+static roster_entry_t *rfind(chan_t *c, const char *nick) {
+  int i = rindex_of(c, nick);
+  return i < 0 ? NULL : &c->roster[i];
 }
 
 static void rremove(chan_t *c, const char *nick) {
@@ -126,8 +131,8 @@ bool chanenf_nuh_authorised(const bot_state_t *state, const char *nuh) {
  * roster entry's cached verdict at once. */
 static uint64_t fp_str(uint64_t h, const char *s) {
   for (; *s; s++)
-    h = (h ^ (unsigned char)*s) * 1099511628211ULL;
-  return (h ^ 0xff) * 1099511628211ULL;
+    h = (h ^ (unsigned char)*s) * UINT64_C(1099511628211);
+  return (h ^ 0xff) * UINT64_C(1099511628211);
 }
 
 static unsigned auth_epoch(bot_state_t *state) {
@@ -148,7 +153,7 @@ static unsigned auth_epoch(bot_state_t *state) {
     const user_record_t *u = &state->user_records[i];
     h = fp_str(h, u->uuid) + (uint64_t)u->is_active;
   }
-  h = h * 1099511628211ULL + (uint64_t)state->trusted_bot_count * 3 +
+  h = h * UINT64_C(1099511628211) + (uint64_t)state->trusted_bot_count * 3 +
       (uint64_t)state->mask_record_count * 5 + (uint64_t)state->user_record_count;
   if (!state->auth_gen || h != state->auth_fp ||
       state->auth_seen_cfg_gen != state->cfg_gen) {
@@ -161,13 +166,21 @@ static unsigned auth_epoch(bot_state_t *state) {
   return state->auth_gen;
 }
 
+/* The roster lives in state->channels, which is never const: a caller's const
+ * view still names a writable entry, so writing its cache fields is defined.
+ * The union drops the qualifier without a cast. */
+static roster_entry_t *roster_cache(const roster_entry_t *e) {
+  union { const roster_entry_t *ro; roster_entry_t *rw; } u = { .ro = e };
+  return u.rw;
+}
+
 /* The verdict is cached in the entry (only its cache fields change, so the
- * const is cast away); every wildcard match against the bots / masks is
- * paid once per entry per auth_gen instead of once per ban x entry. */
+ * const is dropped by roster_cache); every wildcard match against the bots /
+ * masks is paid once per entry per auth_gen instead of once per ban x entry. */
 static bool entry_authorised(bot_state_t *state, const roster_entry_t *e) {
   if (is_me(state, e->nick))
     return true;
-  roster_entry_t *m = (roster_entry_t *)e;
+  roster_entry_t *m = roster_cache(e);
   unsigned gen = auth_epoch(state);
   if (m->auth_gen != gen) {
     m->authorised = auth_is_authorised(state, m->hostmask);
@@ -183,7 +196,8 @@ bool chanenf_chan_nuh_authorised(bot_state_t *state, const chan_t *c,
     return false;
   if (is_me(state, nick))
     return true;
-  const roster_entry_t *e = c ? rfind((chan_t *)c, nick) : NULL;
+  int ri = c ? rindex_of(c, nick) : -1;
+  const roster_entry_t *e = ri < 0 ? NULL : &c->roster[ri];
   if (e && strcasecmp(e->hostmask, nuh) == 0)
     return entry_authorised(state, e);
   return auth_is_authorised(state, nuh);
@@ -805,7 +819,9 @@ static long limit_due(bot_state_t *state, chan_t *c) {
 
 static void exec_limit(bot_state_t *state, chan_t *c) {
   long want = limit_due(state, c);
-  if (!want || recent_key(state, c, "limit", "", RECENT_MODE_MS))
+  /* a queued backup runs here too: it obeys limitdelay like the sweep */
+  if (!want || time(NULL) - c->enf_last_limit < chancfg_get(state, c, CS_LIMITDELAY) ||
+      recent_key(state, c, "limit", "", RECENT_MODE_MS))
     return;
   char det[32];
   snprintf(det, sizeof(det), "+l %ld", want);
@@ -1052,8 +1068,8 @@ static bool ban_hits_authorised(bot_state_t *state, const chan_t *c,
   return false;
 }
 
-void chanenf_on_mode(bot_state_t *state, const char *chan, const char *prefix,
-                     const char *modes, char *args) {
+static void on_mode(bot_state_t *state, const char *chan, const char *prefix,
+                    const char *modes, char *args) {
   chan_t *c = chan ? channel_find(state, chan) : NULL;
   if (!c || c->status != C_IN || !modes)
     return;
@@ -1138,8 +1154,12 @@ void chanenf_on_mode(bot_state_t *state, const char *chan, const char *prefix,
       }
     } else if (strchr("imnpstkl", ch)) {
       mode_changed = true;
-      if (ch == 'l' && adding && (server_src || !src_unauth))
+      if (ch == 'l' && adding && (server_src || !src_unauth)) {
         c->enf_last_limit = time(NULL); /* limitdelay counts from here */
+        /* someone set it: a backup's queued limit job is stale, and fired
+         * after the next joins it would race the holder for the same value */
+        jobs_drop(state, c, JA_LIMIT);
+      }
     }
   }
   if (mode_changed) {
@@ -1397,7 +1417,24 @@ static void minute_sweep(bot_state_t *state, time_t now) {
   }
 }
 
+/* What one MODE line or one tick sends (deops, re-ops, bans, a revert) is
+ * held and leaves packed: several changes per MODE line. */
+void chanenf_on_mode(bot_state_t *state, const char *chan, const char *prefix,
+                     const char *modes, char *args) {
+  sendq_hold(state);
+  on_mode(state, chan, prefix, modes, args);
+  sendq_release(state);
+}
+
+static void tick(bot_state_t *state);
+
 void chanenf_tick(bot_state_t *state) {
+  sendq_hold(state);
+  tick(state);
+  sendq_release(state);
+}
+
+static void tick(bot_state_t *state) {
   if (!(state->status & S_CONNECTED))
     return;
   time_t now = time(NULL);

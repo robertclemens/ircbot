@@ -20,6 +20,11 @@
  * lane 1 for a protocol or protection line, otherwise the new line itself).
  * A protection line identical to one already queued is not queued twice.
  *
+ * A caller about to send several changes at once (a mode revert, one
+ * enforcement pass) wraps them in sendq_hold() / sendq_release(): while held
+ * nothing drains, so the MODE lines all wait in lane 1 and leave packed
+ * instead of one change per line through the burst credit.
+ *
  * No timer or thread of its own: sendq_drain() runs from irc_printf (credit
  * is usually there) and after every main-loop select(), whose timeout is
  * sendq_next_ms() (<= 1 s) while lines wait, so a line leaves on time. */
@@ -204,8 +209,20 @@ int sendq_enqueue(bot_state_t *state, const char *line, int len) {
   q->q[lane][(q->head[lane] + q->count[lane]) % MAX_SENDQ] = copy;
   q->count[lane]++;
   q->total++;
-  sendq_drain(state);
+  if (q->hold == 0)
+    sendq_drain(state);
   return len;
+}
+
+void sendq_hold(bot_state_t *state) {
+  state->sendq.hold++;
+}
+
+/* The outermost release drains what the hold kept back.  It can write to
+ * the server and so drop the link, like any irc_printf. */
+void sendq_release(bot_state_t *state) {
+  if (state->sendq.hold > 0 && --state->sendq.hold == 0)
+    sendq_drain(state);
 }
 
 /* --- MODE packing ------------------------------------------------------- */

@@ -142,7 +142,7 @@ static void state_init(bot_state_t *state) {
   isupport_reset(state);
   hub_client_init(state);
   dcc_init(state);
-  srand(time(NULL));
+  srand((unsigned)time(NULL));
 }
 
 static void state_destroy(bot_state_t *state) {
@@ -175,7 +175,7 @@ static void flush_stdin_if_needed(const char *buffer, size_t len) {
 static void get_input(const char *prompt, char *buffer, size_t len) {
   printf("%s: ", prompt);
   fflush(stdout);
-  if (fgets(buffer, len, stdin) == NULL) {
+  if (fgets(buffer, (int)len, stdin) == NULL) {
     buffer[0] = '\0';
     return;
   }
@@ -189,9 +189,9 @@ static void get_password(const char *prompt, char *buffer, size_t len) {
   fflush(stdout);
   tcgetattr(STDIN_FILENO, &oldt);
   newt = oldt;
-  newt.c_lflag &= ~ECHO;
+  newt.c_lflag &= ~(tcflag_t)ECHO;
   tcsetattr(STDIN_FILENO, TCSANOW, &newt);
-  if (fgets(buffer, len, stdin) == NULL) {
+  if (fgets(buffer, (int)len, stdin) == NULL) {
     buffer[0] = '\0';
   } else {
     flush_stdin_if_needed(buffer, len);
@@ -301,7 +301,7 @@ static bool passfile_create(const char *path, const char *password) {
   if (fchmod(fd, 0600) != 0) { perror("fchmod"); close(fd); free(enc_buf); goto done; }
 
   ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
-        write(fd, enc_buf, enc_len)     == enc_len   &&
+        write(fd, enc_buf, (size_t)enc_len) == enc_len &&
         write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
 
   if (!ok) perror("write " PASS_FILE);
@@ -490,8 +490,8 @@ static void run_config_wizard(void) {
         secure_wipe(priv64, HUB_KEY_RAW_LEN);
         return;
       }
-      rnd[6] = (rnd[6] & 0x0f) | 0x40;
-      rnd[8] = (rnd[8] & 0x3f) | 0x80;
+      rnd[6] = (unsigned char)((rnd[6] & 0x0f) | 0x40);
+      rnd[8] = (unsigned char)((rnd[8] & 0x3f) | 0x80);
       snprintf(state.bot_uuid, sizeof(state.bot_uuid),
                "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-"
                "%02x%02x%02x%02x%02x%02x",
@@ -767,7 +767,7 @@ static void run_config_wizard(void) {
   if (!hub_managed) {
     unsigned char rnd[16];
     RAND_bytes(rnd, sizeof(rnd));
-    rnd[6]=(rnd[6]&0x0f)|0x40; rnd[8]=(rnd[8]&0x3f)|0x80;
+    rnd[6]=(unsigned char)((rnd[6]&0x0f)|0x40); rnd[8]=(unsigned char)((rnd[8]&0x3f)|0x80);
     char new_uuid[37];
     snprintf(new_uuid, sizeof(new_uuid),
              "%02x%02x%02x%02x-%02x%02x-%02x%02x-%02x%02x-%02x%02x%02x%02x%02x%02x",
@@ -1082,19 +1082,19 @@ int main(int argc, char *argv[]) {
 
     if (activity > 0) {
       // Handle IRC Data
-      if (state.server_fd != -1 && FD_ISSET(state.server_fd, &read_fds)) {
+      if (state.server_fd != -1 && fd_isset(state.server_fd, &read_fds)) {
         irc_handle_read(&state);
       }
 
       // Handle Hub Async Connection Completion
       if (state.hub_fd != -1 && !state.hub_connected &&
-          FD_ISSET(state.hub_fd, &write_fds)) {
+          fd_isset(state.hub_fd, &write_fds)) {
         state.hub_connected = true;
         hub_client_on_connect(&state);
       }
 
       // Handle Hub Incoming Data (Pongs, Configs, etc.)
-      if (state.hub_fd != -1 && FD_ISSET(state.hub_fd, &read_fds)) {
+      if (state.hub_fd != -1 && fd_isset(state.hub_fd, &read_fds)) {
         hub_client_process(&state);
       }
 
