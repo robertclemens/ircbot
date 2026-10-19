@@ -173,10 +173,24 @@ bool auth_is_trusted_bot(const bot_state_t *state, const char *user_host,
   return true;
 }
 
+/* A user whose standing counts in chan (user_flags plan §6, U12): every
+ * active admin everywhere (network staff, whatever their flags); an oper in
+ * the channels it is bound to, or everywhere with "*".  chan NULL = anywhere:
+ * an oper with any live binding (bot flood exemption is per bot, not per
+ * channel). */
+static bool user_counts_in(const bot_state_t *state, const user_record_t *ur,
+                           const char *chan) {
+  if (!ur->is_active) return false;
+  if (ur->type == 'a') return true;
+  if (!chan) return access_user_chan_count(state, ur->uuid, NULL) > 0;
+  return access_user_chan_ok(state, ur->uuid, chan);
+}
+
 /* modes.md §1: "authorised" = matches a trusted-bot mask, or an active
- * usermask of an active admin/oper.  The user record need not hold a key:
- * what matters is the operator's standing, not whether they can sign ~A2. */
-bool auth_is_authorised(const bot_state_t *state, const char *nuh) {
+ * usermask of an active admin/oper -- an oper only in its channels (plan
+ * §6).  The user record need not hold a key: what matters is the
+ * operator's standing, not whether they can sign ~A2. */
+bool auth_is_authorised(const bot_state_t *state, const char *nuh, const char *chan) {
   if (!state || !nuh || !nuh[0])
     return false;
   if (auth_is_trusted_bot(state, nuh, NULL, 0))
@@ -189,7 +203,7 @@ bool auth_is_authorised(const bot_state_t *state, const char *nuh) {
       continue;
     for (int j = 0; j < state->user_record_count; j++) {
       const user_record_t *ur = &state->user_records[j];
-      if (ur->is_active && strcmp(ur->uuid, mr->uuid) == 0)
+      if (strcmp(ur->uuid, mr->uuid) == 0 && user_counts_in(state, ur, chan))
         return true;
     }
   }
@@ -200,7 +214,7 @@ bool auth_is_authorised(const bot_state_t *state, const char *nuh) {
  * not in the channel right now.  Pattern-vs-pattern, so '*' on either side
  * is taken at its widest. */
 bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
-                                   char *who, size_t who_size) {
+                                   const char *chan, char *who, size_t who_size) {
   if (who && who_size)
     who[0] = '\0';
   if (!state || !mask)
@@ -211,7 +225,7 @@ bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
   strip_ident_tilde(mask, nmask, sizeof(nmask));
   for (int i = 0; i < state->trusted_bot_count; i++) {
     strip_ident_tilde(state->trusted_bots[i].mask, nother, sizeof(nother));
-    if (glob_overlap(nmask, nother)) {
+    if (hostmask_overlap(nmask, nother)) {
       if (who && who_size)
         snprintf(who, who_size, "bot %s", state->trusted_bots[i].mask);
       return true;
@@ -222,11 +236,11 @@ bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
     if (!mr->is_active || mr->mask[0] == '\0')
       continue;
     strip_ident_tilde(mr->mask, nother, sizeof(nother));
-    if (!glob_overlap(nmask, nother))
+    if (!hostmask_overlap(nmask, nother))
       continue;
     for (int j = 0; j < state->user_record_count; j++) {
       const user_record_t *ur = &state->user_records[j];
-      if (ur->is_active && strcmp(ur->uuid, mr->uuid) == 0) {
+      if (strcmp(ur->uuid, mr->uuid) == 0 && user_counts_in(state, ur, chan)) {
         if (who && who_size)
           snprintf(who, who_size, "user %s", ur->name);
         return true;

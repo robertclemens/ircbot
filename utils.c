@@ -251,6 +251,12 @@ bool updater_hub_rollback(bot_state_t *state, const char *reason) {
     log_message(L_INFO, state,
                 "[UPGRADE] Could not restore %s; keeping the current one\n",
                 prev_cfg);
+  /* The pre-2.5.0 pass file, only if this process rewrote it (the old
+   * build cannot read the new one). */
+  if (state->pass_prev_saved && rename(PASS_PREV_FILE, PASS_FILE) != 0)
+    log_message(L_INFO, state,
+                "[UPGRADE] Could not restore %s; keeping the current one\n",
+                PASS_PREV_FILE);
   if (rename(prev_exe, state->executable_path) != 0) {
     log_message(L_INFO, state, "[UPGRADE] Could not restore %s\n", prev_exe);
     return false;

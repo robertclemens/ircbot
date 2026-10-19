@@ -160,6 +160,30 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
           }
         }
       } else if (bot_command && bot_arg1 &&
+                 strcasecmp(bot_command, "OPUSER") == 0) {
+        /* OPUSER #chan nick: a person the sender vouched for (an admin or
+         * an oper bound to the channel, user_flags plan §5).  +bitch still
+         * holds here: only an authorised member is opped. */
+        char *bot_arg2 = strtok_r(NULL, " ", &sp);
+        chan_t *oc = bot_arg2 ? channel_find(state, bot_arg1) : NULL;
+        if (oc && oc->status == C_IN && oc->i_am_opped) {
+          bool found = false;
+          bool auth = chan_member_authorised(state, oc, bot_arg2, &found);
+          if (!chancfg_get(state, oc, CS_BITCH) || (found && auth)) {
+            log_message(L_INFO, state, "[BOT-COMMS] Opping %s in %s (bot req)\n", bot_arg2,
+                        bot_arg1);
+            irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, bot_arg2);
+          }
+        }
+      } else if (bot_command && bot_arg1 &&
+                 strcasecmp(bot_command, "UNBANUSER") == 0) {
+        /* UNBANUSER #chan nick!user@host: lift the bans that match a person
+         * the sender vouched for (its hostmask as the IRC server showed it) */
+        char *bot_arg2 = strtok_r(NULL, " ", &sp);
+        if (bot_arg2 && strchr(bot_arg2, '!') && strchr(bot_arg2, '@'))
+          chan_access_service(state, "", CHAN_REQ_UNBAN, bot_arg1, sender->uuid, NULL,
+                              bot_arg2, NULL);
+      } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "UNBAN") == 0) {
         /* Hubless counterpart of CMD_CHAN_ACTION unban.  The mask matched
          * against the ban list is the sender's own b| record -- never
@@ -318,4 +342,22 @@ void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
   b2_vsend(state, auth_trusted_bot_by_host(state, hostmask), target_nick,
            format, args);
   va_end(args);
+}
+
+/* A person's op / invite / unban with no hub to ask (or a hub that never
+ * answered): every trusted bot gets it over ~B2; one that is in the channel
+ * and opped does it (user_flags plan §5). */
+void bot_comms_user_chan_fallback(bot_state_t *state, const char *kind, const char *chan,
+                                  const char *nick, const char *mask) {
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    char tb_nick[MAX_NICK];
+    auth_trusted_bot_nick(&state->trusted_bots[i], tb_nick);
+    if (!tb_nick[0]) continue;
+    if (strcmp(kind, "invite") == 0)
+      bot_comms_send_command(state, tb_nick, "INVITE %s %s", chan, nick);
+    else if (strcmp(kind, "op") == 0)
+      bot_comms_send_command(state, tb_nick, "OPUSER %s %s", chan, nick);
+    else if (strcmp(kind, "unban") == 0)
+      bot_comms_send_command(state, tb_nick, "UNBANUSER %s %s", chan, mask);
+  }
 }

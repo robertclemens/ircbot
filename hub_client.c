@@ -14,6 +14,7 @@
 #include <strings.h>
 #include <sys/select.h>
 #include <sys/socket.h>
+#include <sys/stat.h>
 #include <time.h>
 #include <unistd.h>
 
@@ -91,10 +92,11 @@ bool bot_self_pub_refresh(bot_state_t *state) {
 }
 
 /* Encrypt one [cmd][len][payload] frame under the hub session key and send
- * it.  Returns false (after disconnecting on a send error) if it could not. */
-static bool hub_send_frame(bot_state_t *state, int cmd, const char *payload,
+ * it, authenticated or not (CMD_BOT_RETIRE_ACK answers mid-handshake).
+ * Returns false (after disconnecting on a send error) if it could not. */
+static bool hub_seal_frame(bot_state_t *state, int cmd, const char *payload,
                            int pay_len) {
-  if (!state->hub_authenticated || state->hub_fd == -1) return false;
+  if (state->hub_fd == -1) return false;
   if (pay_len < 0 || pay_len > MAX_BUFFER - 64) return false;
   unsigned char plain[MAX_BUFFER];
   plain[0] = (unsigned char)cmd;
@@ -116,6 +118,56 @@ static bool hub_send_frame(bot_state_t *state, int cmd, const char *payload,
     return false;
   }
   return true;
+}
+
+static bool hub_send_frame(bot_state_t *state, int cmd, const char *payload,
+                           int pay_len) {
+  if (!state->hub_authenticated) return false;
+  return hub_seal_frame(state, cmd, payload, pay_len);
+}
+
+/* Overwrite a file with zeros, flush it and unlink it.  True when it is gone
+ * (or never existed).  O_NOFOLLOW: a symlink planted in the bot's directory
+ * never gets another file zeroed. */
+static bool retire_wipe_file(const char *path) {
+  int fd = open(path, O_WRONLY | O_NOFOLLOW | O_CLOEXEC);
+  if (fd < 0) return errno == ENOENT || unlink(path) == 0 || errno == ENOENT;
+  struct stat st;
+  bool ok = fstat(fd, &st) == 0 && S_ISREG(st.st_mode);
+  if (ok) {
+    static const unsigned char zero[4096];
+    off_t left = st.st_size;
+    while (ok && left > 0) {
+      size_t n = left > (off_t)sizeof(zero) ? sizeof(zero) : (size_t)left;
+      ssize_t w = write(fd, zero, n);
+      if (w <= 0) ok = false;
+      else left -= w;
+    }
+    if (ok && fsync(fd) != 0) ok = false;
+  }
+  close(fd);
+  if (unlink(path) != 0 && errno != ENOENT) ok = false;
+  return ok;
+}
+
+/* CMD_BOT_RETIRE: this bot was deleted on the hub (bot del).  Wipe every
+ * config file (keys, hubs, channels), tell the hub, leave IRC and exit.  A
+ * cron restart then finds no config and stops at once. */
+static void hub_client_retire(bot_state_t *state) {
+  log_message(L_INFO, state, "[HUB] This bot was deleted on the hub: wiping its config "
+                             "and exiting\n");
+  state->retired = true;
+  bool ok = retire_wipe_file(CONFIG_FILE);
+  ok = retire_wipe_file(CONFIG_FILE ".tmp") && ok;
+  ok = retire_wipe_file(CONFIG_FILE UPGRADE_PREV_SUFFIX) && ok;
+  ok = retire_wipe_file(PASS_FILE) && ok;
+  ok = retire_wipe_file(PASS_PREV_FILE) && ok;
+  if (!ok)
+    log_message(L_INFO, state, "[HUB] Could not wipe every config file; exiting anyway\n");
+  hub_seal_frame(state, CMD_BOT_RETIRE_ACK, ok ? "1" : "0", 1);
+  if (state->server_fd != -1) irc_printf(state, "QUIT :Removed from the botnet\r\n");
+  state->status |= S_DIE;
+  hub_client_disconnect(state);
 }
 
 /* Sign a domain-separated challenge with the Ed25519 private key.
@@ -466,7 +518,8 @@ void hub_client_upgrade_report_tick(bot_state_t *state) {
 
 /* Field `idx` of `s`, NUL-terminated into `dst`.  An over-long field is a
  * malformed frame, not something to truncate silently: false, `dst` empty. */
-/* Send every pending activity report (auth_mark_used) to the hub, chunked
+/* Send every pending activity report (auth_mark_used, chancfg_ban_mark_used)
+ * to the hub, chunked
  * under MAX_BUFFER.  A record is cleared only once its frame went out; with
  * no hub link they wait for the next authentication. */
 void hub_client_send_activity(bot_state_t *state) {
@@ -474,31 +527,39 @@ void hub_client_send_activity(bot_state_t *state) {
   const int cap = MAX_BUFFER - 64;
   char *buf = malloc((size_t)cap);
   if (!buf) return;
-  int len = 0, total = state->user_record_count + state->mask_record_count;
+  const int nu = state->user_record_count, nm = state->mask_record_count;
+  int len = 0, total = nu + nm + state->cfg_ban_count;
   int first = 0; /* first record index in the current chunk */
   for (int i = 0; i <= total; i++) {
-    char line[MAX_MASK_LEN + 96];
+    char line[MAX_MASK_LEN + MAX_CHAN + 96];
     int w = 0;
-    if (i < state->user_record_count) {
+    if (i < nu) {
       const user_record_t *u = &state->user_records[i];
       if (u->act_pending > 0)
         w = snprintf(line, sizeof(line), "a|%s|%lld\n", u->uuid,
                      (long long)u->act_pending);
-    } else if (i < total) {
-      const mask_record_t *m = &state->mask_records[i - state->user_record_count];
+    } else if (i < nu + nm) {
+      const mask_record_t *m = &state->mask_records[i - nu];
       if (m->act_pending > 0)
         w = snprintf(line, sizeof(line), "m|%s|%s|%lld\n", m->uuid, m->mask,
                      (long long)m->act_pending);
+    } else if (i < total) {
+      const cfg_ban_t *b = &state->cfg_bans[i - nu - nm];
+      if (b->act_pending > 0)
+        w = snprintf(line, sizeof(line), "B|%s|%s|%lld\n", b->chan, b->mask,
+                     (long long)b->act_pending);
     }
     if (w >= (int)sizeof(line)) w = 0;
     /* Flush when the chunk is full or at the end. */
     if (len > 0 && (i == total || len + w > cap)) {
       if (!hub_send_frame(state, CMD_ACTIVITY, buf, len)) break;
       for (int j = first; j < i; j++) {
-        if (j < state->user_record_count)
+        if (j < nu)
           state->user_records[j].act_pending = 0;
+        else if (j < nu + nm)
+          state->mask_records[j - nu].act_pending = 0;
         else
-          state->mask_records[j - state->user_record_count].act_pending = 0;
+          state->cfg_bans[j - nu - nm].act_pending = 0;
       }
       len = 0;
     }
@@ -805,9 +866,43 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
   return false;
 }
 
+/* hl|<addr>/<fp>,...: the hubs this bot dials, so the hub console's hub del
+ * can say which bots still list a hub.  <fp> is the first 8 bytes of SHA-256
+ * over the hub's pinned Ed25519 key, in hex: never the key.  An address the
+ * hub would refuse (over HL_ADDR_MAX, or a byte outside a host:port) goes out
+ * empty.  The hub stamps the record itself.  0 when it does not fit. */
+static int hub_client_hublist_line(const bot_state_t *state, char *out, size_t cap) {
+  int w = snprintf(out, cap, "hl|");
+  if (w < 0 || (size_t)w >= cap) return 0;
+  size_t o = (size_t)w;
+  int n = 0;
+  for (int i = 0; i < state->hub_count && i < MAX_SERVERS; i++) {
+    const hub_entry_t *he = &state->hubs[i];
+    if (!he->ed_pub_set) continue;
+    unsigned char md[EVP_MAX_MD_SIZE];
+    unsigned int mdl = 0;
+    if (EVP_Digest(he->ed_pub, sizeof(he->ed_pub), md, &mdl, EVP_sha256(), NULL) != 1 ||
+        mdl < 8)
+      continue;
+    bool addr_ok = he->addr[0] && strlen(he->addr) <= HL_ADDR_MAX;
+    for (const char *p = he->addr; addr_ok && *p; p++)
+      addr_ok = isalnum((unsigned char)*p) || strchr(".:-_[]", *p);
+    w = snprintf(out + o, cap - o, "%s%s/%02x%02x%02x%02x%02x%02x%02x%02x", n ? "," : "",
+                 addr_ok ? he->addr : "", md[0], md[1], md[2], md[3], md[4], md[5], md[6],
+                 md[7]);
+    if (w < 0 || (size_t)w >= cap - o) return 0;
+    o += (size_t)w;
+    n++;
+  }
+  w = snprintf(out + o, cap - o, "\n");
+  if (w < 0 || (size_t)w >= cap - o) return 0;
+  return (int)(o + (size_t)w);
+}
+
 /**
  * Generate config payload for hub sync
- * Includes: c| (channels), h| (hostmask), n| (nick), v| (protocol version)
+ * Includes: c| (channels), h| (hostmask), n| (nick), v| (protocol version),
+ * hl| (the hubs this bot dials)
  * Excludes: a|, o|, m| (hub-authoritative; pushed separately by
  * hub_client_push_admin_delta) and the local-only s|, u|, g|, l|, i|, k|
  * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted as well, except a
@@ -903,6 +998,15 @@ static void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
     written = snprintf(buffer + offset, (size_t)(max_len - offset), "n|%s|%ld\n",
                        state->current_nick, (long)state->current_nick_ts);
     if (written > 0 && written < max_len - offset) {
+      offset += written;
+    }
+  }
+
+  {
+    char hl[HL_VALUE_MAX + 8];
+    written = hub_client_hublist_line(state, hl, sizeof(hl));
+    if (written > 0 && written < max_len - offset) {
+      memcpy(buffer + offset, hl, (size_t)written);
       offset += written;
     }
   }
@@ -1003,43 +1107,6 @@ bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
   return true;
 }
 
-/* Send CMD_INVITE_REQUEST to hub: hub will broadcast to all bots */
-bool hub_client_send_invite_request(bot_state_t *state, const char *nick,
-                                    const char *channel) {
-  if (!state->hub_connected || !state->hub_authenticated ||
-      state->hub_fd == -1)
-    return false;
-
-  char payload[256];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s", nick, channel);
-  if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
-    return false;
-
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_INVITE_REQUEST;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
-      log_message(L_INFO, state,
-                  "[HUB] Sent INVITE_REQUEST for %s in %s\n", nick, channel);
-      return true;
-    }
-    hub_client_disconnect(state);
-  }
-  return false;
-}
-
 /* Ask the mesh to let us into a channel.  Only `kind|channel` goes on the
  * wire: the hub resolves our nick and hostmask from its own records, so this
  * frame cannot be used to ask for someone else's mask to be unbanned. */
@@ -1113,20 +1180,27 @@ void hub_client_push_admin_delta(bot_state_t *state) {
   const int chunk_cap = MAX_BUFFER - 64;
   char payload[MAX_BUFFER];
   int offset = 0, frames = 0;
-  int total_lines = state->user_record_count + state->mask_record_count;
+  /* then the admin flags and oper channel bindings (uf| / uc|), after the
+   * users they name */
+  int nu = state->user_record_count, nm = state->mask_record_count;
+  int nf = state->uflag_record_count;
+  int total_lines = nu + nm + nf + state->uchan_record_count;
 
   for (int i = 0; i < total_lines; i++) {
     char line[CFG_MASK_LINE_MAX > CFG_USER_LINE_MAX ? CFG_MASK_LINE_MAX
                                                     : CFG_USER_LINE_MAX];
     int w;
-    if (i < state->user_record_count) {
+    if (i < nu) {
       w = config_format_user_line(&state->user_records[i], line, sizeof(line));
-    } else {
-      const mask_record_t *m =
-          &state->mask_records[i - state->user_record_count];
+    } else if (i < nu + nm) {
+      const mask_record_t *m = &state->mask_records[i - nu];
       w = snprintf(line, sizeof(line), "m|%s|%s|%s|%ld|%ld\n", m->uuid,
                    m->mask, m->is_active ? "add" : "del", (long)m->last_used,
                    (long)m->timestamp);
+    } else if (i < nu + nm + nf) {
+      w = access_format_uflag(&state->uflag_records[i - nu - nm], line, sizeof(line));
+    } else {
+      w = access_format_uchan(&state->uchan_records[i - nu - nm - nf], line, sizeof(line));
     }
     if (w <= 0 || w >= (int)sizeof(line)) {
       log_message(L_INFO, state, "[HUB] Admin delta: record %d too long; "
@@ -1412,6 +1486,9 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
   }
 
   purged += chancfg_purge_bans(state, cutoff);
+  /* binding tombstones, and flags / bindings whose user went above (a live
+   * user's "*" del stays) */
+  purged += access_purge(state, cutoff);
 
   if (purged > 0) {
     log_message(L_INFO, state, "[HUB] Purged %d tombstoned entries\n", purged);
@@ -1435,9 +1512,11 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
    * When such lines ARE present the "replace to drop stale UUIDs" semantics
    * still hold, because parsing rebuilds the whole set. */
   bool has_user_lines = false, has_mask_lines = false, has_trust_set = false;
+  bool has_access_lines = false;
   for (const char *p = payload; p && *p; ) {
     if ((p[0] == 'a' || p[0] == 'o') && p[1] == '|') has_user_lines = true;
     else if (p[0] == 'm' && p[1] == '|') has_mask_lines = true;
+    else if (p[0] == 'u' && (p[1] == 'f' || p[1] == 'c') && p[2] == '|') has_access_lines = true;
     else if (p[0] == 'T' && p[1] == '|') has_trust_set = true;
     const char *nl = strchr(p, '\n');
     if (!nl) break;
@@ -1452,6 +1531,12 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   memcpy(saved_masks, state->mask_records, sizeof(mask_record_t) * (size_t)saved_mask_count);
   if (has_user_lines) state->user_record_count = 0;
   if (has_mask_lines) state->mask_record_count = 0;
+  /* uf| / uc| (user_flags plan): the hub's set replaces ours like a|/o|/m|.
+   * A hub that predates them sends none and ours stay (then migrated). */
+  if (has_access_lines) {
+    state->uflag_record_count = 0;
+    state->uchan_record_count = 0;
+  }
 
   /* Change 5: static, sized to a full config payload so a large hub config is
    * parsed whole (no truncation).  Single-threaded, non-reentrant. */
@@ -1482,6 +1567,17 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
      * drop it (bots never applied a hub purge). */
     if (strncmp(line, "PURGE|", 6) == 0) {
       hub_client_apply_purge(state, line + 6);
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
+    /* uf| / uc|: admin flags and oper channel bindings (access.c) */
+    if (line[0] == 'u' && (line[1] == 'f' || line[1] == 'c') && line[2] == '|') {
+      bool changed = false;
+      if (!access_ingest(state, line[1], line + 3, false, &changed))
+        log_message(L_DEBUG, state, "[HUB-SYNC] Malformed %.2s| record ignored\n", line);
+      else if (changed)
+        updates++;
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -1568,6 +1664,9 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
             updates++;
             log_message(L_INFO, state, "[HUB] Updated channel: %s (%s)\n", chan,
                         op);
+            /* a channel removed takes its oper bindings with it, at the
+             * same stamp, as on every hub (user_flags plan U6) */
+            if (!is_add) access_chan_cascade(state, chan, (time_t)ts);
             // If channel changed from managed to unmanaged, PART the channel
             if (was_managed && !is_add && c->status == C_IN) {
               log_message(L_INFO, state, "[HUB] Parting channel %s (synced del)\n", chan);
@@ -1829,6 +1928,12 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
     }
   }
 
+  /* Flags / bindings of users this payload dropped go; a user it brought
+   * without any (an older hub, an older bot's +admin / +oper) gets what it
+   * could do before flags (access_migrate). */
+  access_prune(state);
+  if (access_migrate(state) > 0) updates++;
+
   /* Restore locally-updated last_seen / last_used timestamps that are newer
    * than what the hub sent (e.g. from recent auths not yet flushed to hub). */
   for (int i = 0; i < state->user_record_count; i++) {
@@ -1975,9 +2080,88 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
                                        : "key sent");
 }
 
+/* ---- A person's channel request (irchub user_flags plan §5) ------------- */
+
+/* Ask the hub to op / invite / unban a person this bot could not serve
+ * itself.  false = no hub link (the caller asks its trusted bots directly). */
+bool hub_client_send_user_chan_request(bot_state_t *state, const char *kind, const char *chan,
+                                       const char *user_uuid, const char *nick,
+                                       const char *mask) {
+  if (!state->hub_connected || !state->hub_authenticated || state->hub_fd == -1)
+    return false;
+  unsigned char rnd[8];
+  if (RAND_bytes(rnd, sizeof(rnd)) != 1) return false;
+  char rid[USER_CHAN_RID_MAX + 1];
+  for (size_t i = 0; i < sizeof(rnd); i++) snprintf(rid + 2 * i, 3, "%02x", rnd[i]);
+  char payload[MAX_BUFFER];
+  int n = snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s|%s", rid, kind, chan, user_uuid,
+                   nick, mask);
+  if (n <= 0 || n >= (int)sizeof(payload)) return false;
+  /* the oldest slot goes if all are taken */
+  user_chan_pending_t *slot = &state->user_chan_pending[0];
+  for (int i = 0; i < USER_CHAN_PENDING; i++) {
+    user_chan_pending_t *p = &state->user_chan_pending[i];
+    if (!p->rid[0]) { slot = p; break; }
+    if (p->sent < slot->sent) slot = p;
+  }
+  if (!hub_send_frame(state, CMD_USER_CHAN_REQUEST, payload, n)) return false;
+  memset(slot, 0, sizeof(*slot));
+  snprintf(slot->rid, sizeof(slot->rid), "%s", rid);
+  snprintf(slot->kind, sizeof(slot->kind), "%s", kind);
+  snprintf(slot->chan, sizeof(slot->chan), "%s", chan);
+  snprintf(slot->nick, sizeof(slot->nick), "%s", nick);
+  snprintf(slot->mask, sizeof(slot->mask), "%s", mask);
+  slot->sent = time(NULL);
+  log_message(L_INFO, state, "[CHANREQ] Asked the hub to %s %s on %s (rid %s)\n", kind, nick,
+              chan, rid);
+  return true;
+}
+
+/* CMD_USER_CHAN_RESULT: rid|ok|detail or rid|fail|detail -> tell the person. */
+static void user_chan_result(bot_state_t *state, const char *payload) {
+  char rid[USER_CHAN_RID_MAX + 1] = "", status[8] = "", detail[200] = "";
+  if (!payload || sscanf(payload, "%32[^|]|%7[^|]|%199[^\r\n]", rid, status, detail) < 2) return;
+  for (int i = 0; i < USER_CHAN_PENDING; i++) {
+    user_chan_pending_t *p = &state->user_chan_pending[i];
+    if (!p->rid[0] || strcmp(p->rid, rid) != 0) continue;
+    bool ok = strcmp(status, "ok") == 0;
+    /* the detail is the hub's text: no control bytes reach IRC */
+    for (char *c = detail; *c; c++)
+      if ((unsigned char)*c < 0x20 || *c == 0x7f) *c = ' ';
+    irc_printf(state, "PRIVMSG %s :%s %s: %s%s%s%s\r\n", p->nick, p->kind, p->chan,
+               ok ? "done" : "not done", detail[0] ? (ok ? " (" : " - ") : "", detail,
+               detail[0] && ok ? ")" : "");
+    log_message(L_INFO, state, "[CHANREQ] %s %s on %s: %s %s\n", p->kind, p->nick, p->chan,
+                status, detail);
+    memset(p, 0, sizeof(*p));
+    return;
+  }
+}
+
+/* Requests the hub never answered (an older hub ignores the frame): ask the
+ * trusted bots directly instead, once. */
+void hub_client_user_chan_tick(bot_state_t *state) {
+  time_t now = time(NULL);
+  for (int i = 0; i < USER_CHAN_PENDING; i++) {
+    user_chan_pending_t *p = &state->user_chan_pending[i];
+    if (!p->rid[0] || now - p->sent < USER_CHAN_REPLY_WAIT) continue;
+    log_message(L_INFO, state, "[CHANREQ] No answer from the hub for %s %s on %s; asking "
+                               "the bots directly\n", p->kind, p->nick, p->chan);
+    bot_comms_user_chan_fallback(state, p->kind, p->chan, p->nick, p->mask);
+    memset(p, 0, sizeof(*p));
+  }
+}
+
 static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
                                 int payload_len) {
   switch (cmd) {
+  case CMD_USER_CHAN_RESULT:
+    if (payload && payload_len > 0) {
+      payload[payload_len] = '\0';
+      user_chan_result(state, payload);
+    }
+    break;
+
   case CMD_PING:
     if (!HIDEPINGPONG)
       log_message(L_DEBUG, state, "[HUB] Received PING from hub\n");
@@ -2546,6 +2730,12 @@ void hub_client_process(bot_state_t *state) {
         int ack_pl = crypto_aes_gcm_decrypt(
             packet_body, packet_len - GCM_TAG_LEN,
             state->hub_session_key, ack_pt, ack_tag);
+        if (ack_pl == 1 && ack_pt[0] == CMD_BOT_RETIRE) {
+          /* Revoked: the hub proved itself (signed challenge, sealed ACK). */
+          free(packet_body);
+          hub_client_retire(state);
+          return;
+        }
         if (ack_pl == 1 && ack_pt[0] == 0x01) {
           state->hub_authenticated = true;
           auth_state = HUB_AUTH_COMPLETE;
@@ -2600,7 +2790,12 @@ void hub_client_process(bot_state_t *state) {
     if (plain_len > 0) {
       unsigned char cmd = plain[0];
 
-      if (cmd == CMD_PING) {
+      if (cmd == CMD_BOT_RETIRE) {
+        /* Empty payload: handled before the payload dispatch below. */
+        free(packet_body);
+        hub_client_retire(state);
+        return;
+      } else if (cmd == CMD_PING) {
         // RATE LIMIT: Only respond to ping once per 5 seconds
         time_t now = time(NULL);
         if (now - last_pong_sent >= 5) {

@@ -261,9 +261,9 @@ static void passfile_build_context(char *buf, size_t len) {
 }
 
 static bool passfile_derive_key(const char *ctx, const unsigned char *salt,
-                                unsigned char *key) {
+                                int iterations, unsigned char *key) {
   return PKCS5_PBKDF2_HMAC(ctx, (int)strlen(ctx), salt, SALT_SIZE,
-                            PBKDF2_ITERATIONS, EVP_sha256(), 32, key) == 1;
+                            iterations, EVP_sha256(), 32, key) == 1;
 }
 
 static bool passfile_create(const char *path, const char *password) {
@@ -279,7 +279,7 @@ static bool passfile_create(const char *path, const char *password) {
   }
 
   passfile_build_context(ctx, sizeof(ctx));
-  if (!passfile_derive_key(ctx, salt, key)) {
+  if (!passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key)) {
     fprintf(stderr, "Key derivation failed.\n");
     goto done;
   }
@@ -296,16 +296,25 @@ static bool passfile_create(const char *path, const char *password) {
     goto done;
   }
 
-  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  /* Written beside it and renamed over it, so a rewrite (-p, or the
+   * PBKDF2 migration at start) never leaves a half-written pass file. */
+  char tmp[PATH_MAX];
+  if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
+    free(enc_buf);
+    goto done;
+  }
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
   if (fd < 0) { perror("open"); free(enc_buf); goto done; }
-  if (fchmod(fd, 0600) != 0) { perror("fchmod"); close(fd); free(enc_buf); goto done; }
+  if (fchmod(fd, 0600) != 0) { perror("fchmod"); close(fd); remove(tmp); free(enc_buf); goto done; }
 
   ok = (write(fd, salt,    SALT_SIZE)   == SALT_SIZE &&
         write(fd, enc_buf, (size_t)enc_len) == enc_len &&
         write(fd, tag,     GCM_TAG_LEN) == GCM_TAG_LEN);
 
   if (!ok) perror("write " PASS_FILE);
-  close(fd);
+  if (close(fd) != 0) ok = false;
+  if (ok && rename(tmp, path) != 0) { perror("rename " PASS_FILE); ok = false; }
+  if (!ok) remove(tmp);
   free(enc_buf);
 
 done:
@@ -314,9 +323,40 @@ done:
   return ok;
 }
 
-static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
+/* The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
+ * UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to PASS_PREV_FILE
+ * first; passfile_create() renames a new one over PASS_FILE, so the link keeps
+ * the old bytes and mode.  One attempt: on failure the file stays readable as
+ * it is and the next ordinary start rewrites it. */
+static void passfile_upgrade_tick(bot_state_t *s) {
+  if (!s->pass_rewrite_due || time(NULL) < s->pass_rewrite_due) return;
+  s->pass_rewrite_due = 0;
+  char pass[MAX_PASS];
+  bot_get_startup_pass(s, pass);
+  remove(PASS_PREV_FILE);
+  if (!pass[0] || link(PASS_FILE, PASS_PREV_FILE) != 0) {
+    log_message(L_INFO, s, "[CFG] %s kept at PBKDF2 %dk: could not keep a "
+                "copy for rollback\n", PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
+  } else if (passfile_create(PASS_FILE, pass)) {
+    s->pass_prev_saved = true;
+    log_message(L_INFO, s, "[CFG] %s rewritten with PBKDF2 %dk (old copy in "
+                "%s until the next ordinary start)\n", PASS_FILE,
+                PBKDF2_ITERATIONS / 1000, PASS_PREV_FILE);
+  } else {
+    remove(PASS_PREV_FILE);
+    log_message(L_INFO, s, "[CFG] %s kept at PBKDF2 %dk: rewrite failed\n",
+                PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
+  }
+  secure_wipe(pass, sizeof(pass));
+}
+
+/* *legacy is set when the file only opened under PBKDF2_ITERATIONS_LEGACY
+ * (written before 2.5.0); main() then rewrites it under the current count. */
+static bool passfile_load(const char *path, char *out_pass, size_t out_len,
+                          bool *legacy) {
   struct stat st;
   bool ok = false;
+  if (legacy) *legacy = false;
 
   if (stat(path, &st) != 0) return false;
 
@@ -352,14 +392,20 @@ static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
   unsigned char key[32];
   char ctx[256];
   passfile_build_context(ctx, sizeof(ctx));
-  if (!passfile_derive_key(ctx, salt, key)) goto done;
 
   mlock(out_pass, out_len);
   unsigned char *plain = malloc((size_t)enc_len);
   if (!plain) goto done;
   mlock(plain, (size_t)enc_len);
 
-  int dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+  int dec_len = -1;
+  if (passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key))
+    dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+  if (dec_len <= 0 &&
+      passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS_LEGACY, key)) {
+    dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
+    if (dec_len > 0 && legacy) *legacy = true;
+  }
   if (dec_len > 0 && (size_t)dec_len < out_len) {
     plain[dec_len] = 0;
     memcpy(out_pass, plain, (size_t)dec_len + 1);
@@ -578,9 +624,10 @@ static void run_config_wizard(void) {
 
     if (hub_managed) {
       printf("\n--- Hub Configuration ---\n");
-      printf("You'll need each hub's address and public key (the base64 from\n");
-      printf("the hub's hub_public.b64 file). Each hub has its own keypair, so\n");
-      printf("the key is pinned per hub.\n");
+      printf("You'll need each hub's address and public key: './irchub -id' on\n");
+      printf("the hub's host prints both (as the '+hub' line), so does 'hub show'\n");
+      printf("in its console. Each hub has its own keypair, so the key is pinned\n");
+      printf("per hub.\n");
 
       while (state.hub_count < MAX_SERVERS) {
         char hub_addr[256];
@@ -612,7 +659,7 @@ static void run_config_wizard(void) {
           /* Hub public key (44-char raw Ed25519 or 88-char combined). */
           unsigned char hub_pub[32];
           printf("\n--- Hub #%d Public Key ---\n", state.hub_count + 1);
-          printf("Paste the base64 from the hub's hub_public.b64 file "
+          printf("Paste the hub's public key from './irchub -id' or 'hub show' "
                  "(44 or 88 chars).\n");
           while (!hpub_valid) {
             get_input("Hub public key", hub_pub_input, sizeof(hub_pub_input));
@@ -830,7 +877,7 @@ static int run_selftest(void) {
   }
   char pw[MAX_PASS];
   memset(pw, 0, sizeof(pw));
-  if (!passfile_load(PASS_FILE, pw, sizeof(pw))) {
+  if (!passfile_load(PASS_FILE, pw, sizeof(pw), NULL)) {
     printf("selftest: FAIL cannot read %s\n", PASS_FILE);
     return 1;
   }
@@ -855,6 +902,47 @@ static int run_selftest(void) {
   return 0;
 }
 
+/* -id: print this bot's uuid, public key and fingerprint — what the hub
+ * console's `bot add` (or a standalone peer's +bot) needs — from the config,
+ * and exit.  Read-only: no daemon, no PID lock, no config rewrite. */
+static int run_identity(char *password) {
+  bot_state_t *st = calloc(1, sizeof(*st));
+  if (!st) {
+    OPENSSL_cleanse(password, MAX_PASS);
+    fprintf(stderr, "Out of memory.\n");
+    return 1;
+  }
+  state_init(st);
+  g_config_readonly = true;
+  bool ok = config_load(st, password, CONFIG_FILE);
+  OPENSSL_cleanse(password, MAX_PASS);
+  int rc = 1;
+  if (!ok) {
+    fprintf(stderr, "Cannot load %s (wrong password?).\n", CONFIG_FILE);
+  } else if (!st->self_pub_set || !st->bot_uuid[0]) {
+    fprintf(stderr, "%s has no identity key or uuid; re-run -setup.\n",
+            CONFIG_FILE);
+  } else {
+    char *pub_b64 = base64_encode(st->self_pub, HUB_KEY_RAW_LEN);
+    char fp[KEY_FP_LEN + 1];
+    crypto_key_fingerprint(st->self_pub, fp);
+    if (pub_b64) {
+      printf("Bot nick:        %s\n", st->target_nick);
+      printf("Bot UUID:        %s\n", st->bot_uuid);
+      printf("Bot public key:  %s\n", pub_b64);
+      printf("Key fingerprint: %s\n", fp);
+      printf("Hub console:     bot add %s %s %s\n", st->target_nick,
+             st->bot_uuid, pub_b64);
+      free(pub_b64);
+      rc = 0;
+    }
+  }
+  state_destroy(st);
+  OPENSSL_cleanse(st, sizeof(*st));
+  free(st);
+  return rc;
+}
+
 int main(int argc, char *argv[]) {
   harden_process();
 #ifdef HAVE_CURL
@@ -863,9 +951,11 @@ int main(int argc, char *argv[]) {
 
   bool do_setup = false;
   bool do_passfile = false;
+  bool do_identity = false;
   for (int i = 1; i < argc; i++) {
     if (strcmp(argv[i], "-setup") == 0) do_setup = true;
     if (strcmp(argv[i], "-p")     == 0) do_passfile = true;
+    if (strcmp(argv[i], "-id")    == 0) do_identity = true;
     /* -checkupdate [variant]: verify the release channel and exit; needs no
      * config, no password and no PID lock. */
     if (strcmp(argv[i], "-checkupdate") == 0)
@@ -923,7 +1013,9 @@ int main(int argc, char *argv[]) {
   char startup_password[MAX_PASS];
   memset(startup_password, 0, sizeof(startup_password));
 
-  if (!passfile_load(PASS_FILE, startup_password, sizeof(startup_password))) {
+  bool pass_legacy = false;
+  if (!passfile_load(PASS_FILE, startup_password, sizeof(startup_password),
+                     &pass_legacy)) {
     get_password("Config Password", startup_password, sizeof(startup_password));
     if (!startup_password[0]) {
       fprintf(stderr, "No password provided.\n");
@@ -931,7 +1023,30 @@ int main(int argc, char *argv[]) {
     }
   }
 
+  if (do_identity) return run_identity(startup_password);
+
+  /* A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
+   * start.  On the start a hub-driven upgrade made (its marker is still
+   * here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
+   * is done with this process, and keeps the old copy for a rollback (see
+   * passfile_upgrade_tick).  An ordinary start drops any such copy left by an
+   * earlier run: a hub rollback is only ever for the process that made it. */
+  bool upgrade_start = (access(UPGRADE_MARKER_FILE, F_OK) == 0);
+  if (!upgrade_start) remove(PASS_PREV_FILE);
+  if (pass_legacy) {
+    if (upgrade_start)
+      printf("%s: rewritten with PBKDF2 %dk in %ds (upgrade in progress)\n",
+             PASS_FILE, PBKDF2_ITERATIONS / 1000, UPGRADE_PASS_REWRITE_SECS);
+    else if (passfile_create(PASS_FILE, startup_password))
+      printf("%s: rewritten with PBKDF2 %dk\n", PASS_FILE,
+             PBKDF2_ITERATIONS / 1000);
+    else
+      fprintf(stderr, "%s: could not rewrite with PBKDF2 %dk; still readable "
+              "as it is\n", PASS_FILE, PBKDF2_ITERATIONS / 1000);
+  }
+
   printf("%s %s\n", BOT_NAME, BOT_VERSION);
+  fflush(stdout); /* or the buffered lines are written again by the fork */
   daemonize();
 
   ssl_init_openssl();
@@ -986,6 +1101,8 @@ int main(int argc, char *argv[]) {
   bot_set_startup_pass(&state, startup_password);
   memset(startup_password, 0, sizeof(startup_password));
   state.server_list[state.server_count] = NULL;
+  if (pass_legacy && upgrade_start)
+    state.pass_rewrite_due = time(NULL) + UPGRADE_PASS_REWRITE_SECS;
 
   // --- MAIN LOOP ---
   while (!(state.status & S_DIE) && !g_shutdown_flag) {
@@ -994,6 +1111,7 @@ int main(int argc, char *argv[]) {
     commands_activity_tick(&state, time(NULL));
     chanenf_tick(&state);
     hub_client_upgrade_report_tick(&state);
+    passfile_upgrade_tick(&state);
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin
@@ -1027,6 +1145,7 @@ int main(int argc, char *argv[]) {
     if (state.hub_count > 0) {
       hub_client_connect(&state);   // Attempts connection if needed
       hub_client_heartbeat(&state); // Sends pings if authenticated
+      hub_client_user_chan_tick(&state); // unanswered person requests -> ~B2
     }
 
     fd_set read_fds, write_fds;

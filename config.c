@@ -197,75 +197,56 @@ bool config_load(bot_state_t *state, const char *password,
   }
   fclose(in_file);
 
-  unsigned char key[32];
-  if (!crypto_derive_config_key(password, salt, key)) {
-    free(ciphertext);
-    return false;
-  }
-
   unsigned char *plaintext = malloc((size_t)ciphertext_len + 1);
   if (!plaintext)
     handle_fatal_error("malloc failed for plaintext");
-  int len;
-  int plaintext_len;
+  int plaintext_len = 0;
+  int len = 0;
 
-  EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
-  if (!ctx) {
-    secure_wipe(key, sizeof(key));
-    free(ciphertext);
-    free(plaintext);
-    return false;
-  }
-  if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) != 1 ||
-      EVP_DecryptUpdate(ctx, plaintext, &plaintext_len, ciphertext,
-                        (int)ciphertext_len) != 1) {
-    EVP_CIPHER_CTX_free(ctx);
-    secure_wipe(key, sizeof(key));
-    secure_wipe(plaintext, (size_t)ciphertext_len);
-    free(ciphertext);
-    free(plaintext);
-    return false;
-  }
-  EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
-
-  int final_rc = EVP_DecryptFinal_ex(ctx, plaintext + plaintext_len, &len);
-  EVP_CIPHER_CTX_free(ctx);
-  bool migrated_from_legacy = false;
-  if (final_rc <= 0) {
-    /* PBKDF2 key failed GCM tag check — try legacy EVP_BytesToKey for
-     * one-time migration of configs written before the PBKDF2 upgrade.
-     * On success the config is immediately re-written with PBKDF2. */
-    secure_wipe(plaintext, (size_t)ciphertext_len);
-    unsigned char legacy_key[32];
-    if (EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
-                       (const unsigned char *)password, (int)strlen(password),
-                       1, legacy_key, NULL) > 0) {
-      EVP_CIPHER_CTX *lctx = EVP_CIPHER_CTX_new();
-      if (lctx) {
-        int lpl = 0, ll = 0;
-        if (EVP_DecryptInit_ex(lctx, EVP_aes_256_gcm(), NULL, legacy_key, iv) == 1 &&
-            EVP_DecryptUpdate(lctx, plaintext, &lpl, ciphertext, (int)ciphertext_len) == 1) {
-          EVP_CIPHER_CTX_ctrl(lctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag);
-          int lrc = EVP_DecryptFinal_ex(lctx, plaintext + lpl, &ll);
-          if (lrc > 0) {
-            plaintext_len = lpl + ll;
-            migrated_from_legacy = true;
-            final_rc = 1;
-          } else {
-            secure_wipe(plaintext, (size_t)ciphertext_len);
-          }
+  /* Current PBKDF2 count first; then the two older keys for a one-time
+   * migration — PBKDF2 at the pre-2.5.0 count, and EVP_BytesToKey from
+   * before PBKDF2.  A legacy hit is rewritten under the current count below
+   * (never under -selftest, which must not touch the running build's file). */
+  int final_rc = 0;
+  const char *migrated_from_legacy = NULL;
+  for (int kdf = 0; kdf < 3 && final_rc <= 0; kdf++) {
+    unsigned char key[32];
+    bool derived;
+    if (kdf == 2)
+      derived = EVP_BytesToKey(EVP_aes_256_gcm(), EVP_sha256(), salt,
+                               (const unsigned char *)password,
+                               (int)strlen(password), 1, key, NULL) > 0;
+    else
+      derived = crypto_derive_config_key(
+          password, salt, kdf == 0 ? PBKDF2_ITERATIONS : PBKDF2_ITERATIONS_LEGACY, key);
+    if (derived) {
+      EVP_CIPHER_CTX *ctx = EVP_CIPHER_CTX_new();
+      if (ctx) {
+        int pl = 0, fl = 0;
+        if (EVP_DecryptInit_ex(ctx, EVP_aes_256_gcm(), NULL, key, iv) == 1 &&
+            EVP_DecryptUpdate(ctx, plaintext, &pl, ciphertext,
+                              (int)ciphertext_len) == 1 &&
+            EVP_CIPHER_CTX_ctrl(ctx, EVP_CTRL_GCM_SET_TAG, GCM_TAG_LEN, tag) == 1 &&
+            EVP_DecryptFinal_ex(ctx, plaintext + pl, &fl) > 0) {
+          plaintext_len = pl;
+          len = fl;
+          final_rc = 1;
+          if (kdf == 1) migrated_from_legacy = "PBKDF2 100k";
+          if (kdf == 2) migrated_from_legacy = "EVP_BytesToKey";
+        } else {
+          /* Unverified plaintext must not outlive a failed tag check. */
+          secure_wipe(plaintext, (size_t)ciphertext_len);
         }
-        EVP_CIPHER_CTX_free(lctx);
+        EVP_CIPHER_CTX_free(ctx);
       }
-      secure_wipe(legacy_key, sizeof(legacy_key));
     }
-    if (final_rc <= 0) {
-      log_message(L_INFO, state, "[CFG] Decryption failed (wrong password?).\n");
-      secure_wipe(key, sizeof(key));
-      free(ciphertext);
-      free(plaintext);
-      return false;
-    }
+    secure_wipe(key, sizeof(key));
+  }
+  free(ciphertext);
+  if (final_rc <= 0) {
+    log_message(L_INFO, state, "[CFG] Decryption failed (wrong password?).\n");
+    free(plaintext);
+    return false;
   }
 
   if (final_rc > 0) {
@@ -283,6 +264,16 @@ bool config_load(bot_state_t *state, const char *password,
         line[line_sz - 1] = '\0';
 
       if (strlen(line) < 2 || line[0] == '#') {
+        line = strtok_r(NULL, "\n", &saveptr1);
+        continue;
+      }
+
+      /* uf| / uc|: admin flags and oper channel bindings (access.c);
+       * users load first in this file, records of a user that never loads
+       * go with access_prune below */
+      if (line[0] == 'u' && (line[1] == 'f' || line[1] == 'c') && line[2] == '|') {
+        if (!access_ingest(state, line[1], line + 3, false, NULL))
+          log_message(L_INFO, state, "[CFG] Ignoring invalid %.2s| line\n", line);
         line = strtok_r(NULL, "\n", &saveptr1);
         continue;
       }
@@ -625,9 +616,7 @@ bool config_load(bot_state_t *state, const char *password,
     }
   }
 
-  secure_wipe(key, sizeof(key));
   secure_wipe(plaintext, (size_t)plaintext_len);
-  free(ciphertext);
   free(plaintext);
 
   /* Migration: a legacy 'j|' global hub pubkey applies to every hub that did
@@ -777,9 +766,10 @@ bool config_load(bot_state_t *state, const char *password,
     memcpy(state->mask_records, new_masks, sizeof(new_masks));
     state->mask_record_count = nm;
   }
-  if (migrated_from_legacy)
+  if (migrated_from_legacy && !g_config_readonly)
     log_message(L_INFO, state,
-                "[CFG] Config re-encrypted with PBKDF2 (legacy migration).\n");
+                "[CFG] Config re-encrypted with PBKDF2 %dk (was %s).\n",
+                PBKDF2_ITERATIONS / 1000, migrated_from_legacy);
 
   /* Identity key.  Standalone configs from before bots had keys carry no k|;
    * the ~A2 / ~B2 transports need one, so mint it here.  A hub-managed bot
@@ -836,9 +826,17 @@ bool config_load(bot_state_t *state, const char *password,
                 "[CFG] Dropped the retired bot password (p|); bots use public "
                 "keys now.\n");
 
+  /* Flags / bindings: drop those with no user, then give every user that
+   * has none what they could do before flags (admins +a, opers *). */
+  int access_before = state->uflag_record_count + state->uchan_record_count;
+  access_prune(state);
+  bool access_changed =
+      state->uflag_record_count + state->uchan_record_count != access_before;
+  access_changed |= access_migrate(state) > 0;
+
   /* Rewrite once if anything above changed the on-disk shape. */
   if ((needs_migration || migrated_from_legacy || legacy_user_lines > 0 ||
-       dropped_botpass || identity_minted) &&
+       dropped_botpass || identity_minted || access_changed) &&
       !g_config_readonly)
     config_write(state, password);
 
@@ -856,6 +854,7 @@ bool config_load(bot_state_t *state, const char *password,
 /* Serialize state to the encrypted config file on disk.
  * Does NOT push to the hub — callers that want a push call config_write(). */
 static void config_write_file(const bot_state_t *state, const char *password) {
+  if (state->retired) return;   /* wiped on the hub's order: stays gone */
   if (strlen(password) >= MAX_PASS)
     return;
 
@@ -936,6 +935,20 @@ static void config_write_file(const bot_state_t *state, const char *password) {
               (long long)m->last_used, (long long)m->timestamp);
   }
 
+  /* admin flags and oper channel bindings, after the users they name */
+  for (int i = 0; i < state->uflag_record_count && !overflow; i++) {
+    char l[CFG_UF_LINE_MAX];
+    int w = access_format_uflag(&state->uflag_records[i], l, sizeof(l));
+    if (w <= 0 || w >= (int)sizeof(l)) { overflow = true; break; }
+    CFG_WRITE("%s", l);
+  }
+  for (int i = 0; i < state->uchan_record_count && !overflow; i++) {
+    char l[CFG_UC_LINE_MAX];
+    int w = access_format_uchan(&state->uchan_records[i], l, sizeof(l));
+    if (w <= 0 || w >= (int)sizeof(l)) { overflow = true; break; }
+    CFG_WRITE("%s", l);
+  }
+
   for (int i = 0; i < state->trusted_bot_count; i++) {
     char bline[CFG_BLINE_MAX];
     int bl = config_format_bot_line(&state->trusted_bots[i], bline,
@@ -1006,7 +1019,7 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   unsigned char key[32];
   unsigned char iv[GCM_IV_LEN];
   if (RAND_bytes(salt, sizeof(salt)) != 1 ||
-      !crypto_derive_config_key(password, salt, key) ||
+      !crypto_derive_config_key(password, salt, PBKDF2_ITERATIONS, key) ||
       RAND_bytes(iv, sizeof(iv)) != 1) {
     fprintf(stderr, "[CFG] RNG/KDF failure; aborting config write.\n");
     secure_wipe(key, sizeof(key));

@@ -16,10 +16,10 @@ void secure_wipe(void *ptr, size_t len) {
 }
 
 bool crypto_derive_config_key(const char *password, const unsigned char *salt,
-                              unsigned char out_key[32]) {
-    if (!password || !salt || !out_key) return false;
+                              int iterations, unsigned char out_key[32]) {
+    if (!password || !salt || !out_key || iterations <= 0) return false;
     return PKCS5_PBKDF2_HMAC(password, (int)strlen(password),
-                             salt, SALT_SIZE, PBKDF2_ITERATIONS,
+                             salt, SALT_SIZE, iterations,
                              EVP_sha256(), 32, out_key) == 1;
 }
 

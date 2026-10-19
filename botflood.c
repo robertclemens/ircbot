@@ -175,18 +175,18 @@ int botflood_ctcp_at(bot_state_t *state, const char *nuh, bool authorised,
 }
 
 int botflood_msg(bot_state_t *state, const char *nuh) {
-  return botflood_msg_at(state, nuh, auth_is_authorised(state, nuh),
+  return botflood_msg_at(state, nuh, auth_is_authorised(state, nuh, NULL),
                          flood_now_ms());
 }
 
 int botflood_ctcp(bot_state_t *state, const char *nuh) {
-  return botflood_ctcp_at(state, nuh, auth_is_authorised(state, nuh),
+  return botflood_ctcp_at(state, nuh, auth_is_authorised(state, nuh, NULL),
                           flood_now_ms());
 }
 
 bool botflood_host_ignored(bot_state_t *state, const char *nuh) {
   char host[FLOOD_HOST_MAX];
-  if (!host_key(nuh, host, sizeof(host)) || auth_is_authorised(state, nuh))
+  if (!host_key(nuh, host, sizeof(host)) || auth_is_authorised(state, nuh, NULL))
     return false;
   long long now = flood_now_ms();
   return quiet_at(state, now) || ignore_find(state, host, now) != NULL;

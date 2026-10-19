@@ -584,7 +584,8 @@ static void run_user_command(bot_state_t *state, const char *nick,
                              char *cmd_line) {
   char *sp_cmd;
   /* The commands that take a free-form tail (chanmode, chanset, +ban, -ban,
-   * bans) get the whole argument line, copied before strtok_r cuts it up. */
+   * bans) or a fourth argument (+admin, +oper: flags / channels) get the
+   * whole argument line, copied before strtok_r cuts it up. */
   char argbuf[SEAL_MAX_PLAINTEXT + 1];
   char *argline = NULL;
   {
@@ -593,7 +594,7 @@ static void run_user_command(bot_state_t *state, const char *nick,
       cl++;
     size_t vl = strcspn(cl, " ");
     static const char *const TAILED[] = {"chanmode", "chanset", "+ban", "-ban",
-                                         "bans", NULL};
+                                         "bans", "+admin", "+oper", NULL};
     for (int i = 0; TAILED[i]; i++) {
       if (strlen(TAILED[i]) == vl && strncasecmp(cl, TAILED[i], vl) == 0) {
         const char *a = cl + vl;
@@ -900,8 +901,18 @@ static void list_users(bot_state_t *state, const char *nick, char type) {
     if (!u->is_active) snprintf(del_tag, sizeof(del_tag), " [deleted]");
     char kfp[KEY_FP_LEN + 1];
     user_key_fp(u, kfp);
-    irc_printf(state, "PRIVMSG %s :| %-*s  key %s  (last seen: %s)%s\r\n",
-               nick, name_w, u->name, kfp, ts_buf, del_tag);
+    /* user_flags plan U9: an admin's flags, an oper's channels */
+    char acc[300];
+    if (type == 'a') {
+      const char *fl = access_user_flags(state, u->uuid);
+      snprintf(acc, sizeof(acc), "%s%s", fl[0] ? "+" : "", fl[0] ? fl : "(no flags)");
+    } else {
+      char cl[256];
+      access_user_chans(state, u->uuid, cl, sizeof(cl));
+      snprintf(acc, sizeof(acc), "%s", cl[0] ? cl : "(no channels)");
+    }
+    irc_printf(state, "PRIVMSG %s :| %-*s  %s  key %s  (last seen: %s)%s\r\n",
+               nick, name_w, u->name, acc, kfp, ts_buf, del_tag);
     shown++;
   }
   if (shown == 0)
@@ -1171,6 +1182,224 @@ static void say_bad_rfc_nick(bot_state_t *state, const char *nick,
              nick, name);
 }
 
+/* ---- Admin flags (irchub docs/plans/2026-10-16_user_flags_plan.md §2) ----
+ * The flag each admin command needs on a bot ('a' passes every check).
+ * 'x' = the target user's role decides (+a for an admin, +o for an oper).
+ * 0 = none: views, help, and dcc (a DCC chat only carries commands, each of
+ * which is checked here). */
+static const struct {
+  const char *name;
+  char        flag;
+} BOT_CMD_FLAGS[] = {
+  {"die", 'b'},      {"jump", 'b'},      {"+bot", 'b'},      {"-bot", 'b'},
+  {"givenick", 'b'}, {"chnick", 'b'},    {"saveconf", 'b'},  {"rekey", 'b'},
+  {"+server", 'b'},  {"-server", 'b'},
+  {"join", 'c'},     {"part", 'c'},      {"op", 'c'},        {"invite", 'c'},
+  {"unban", 'c'},    {"key", 'c'},       {"chanmode", 'c'},  {"chanset", 'c'},
+  {"+ban", 'c'},     {"-ban", 'c'},
+  {"+hub", 'h'},     {"-hub", 'h'},      {"setlog", 'h'},    {"getlog", 'h'},
+  {"update", 'u'},
+  {"+admin", 'a'},   {"-admin", 'a'},    {"chattr", 'a'},
+  {"+oper", 'o'},    {"-oper", 'o'},     {"chanoper", 'o'},
+  {"+usermask", 'x'}, {"-usermask", 'x'}, {"chkey", 'x'},
+};
+
+static const char *bot_flag_word(char f) {
+  switch (f) {
+  case 'a': return "full admin";
+  case 'b': return "bots";
+  case 'c': return "channels";
+  case 'h': return "hub";
+  case 'o': return "opers";
+  case 'u': return "upgrades";
+  default:  return "?";
+  }
+}
+
+/* An active user record by name, or NULL. */
+static user_record_t *user_by_name(bot_state_t *state, const char *name) {
+  for (int i = 0; name && i < state->user_record_count; i++)
+    if (state->user_records[i].is_active && strcasecmp(state->user_records[i].name, name) == 0)
+      return &state->user_records[i];
+  return NULL;
+}
+
+/* The flag this command line needs from admin `me`, 0 for none (a view, your
+ * own key, or a target that does not exist -- the command answers that). */
+static char bot_cmd_flag(bot_state_t *state, const user_record_t *me, const char *command,
+                         const char *arg1) {
+  char f = 0;
+  for (size_t i = 0; i < sizeof(BOT_CMD_FLAGS) / sizeof(BOT_CMD_FLAGS[0]); i++)
+    if (strcasecmp(command, BOT_CMD_FLAGS[i].name) == 0) f = BOT_CMD_FLAGS[i].flag;
+  if (f != 'x') return f;
+  if (strcasecmp(command, "chkey") == 0) {
+    if (arg1 && arg1[0] == '#') return 'c';              /* chkey #chan <key> */
+    if (me && arg1 && strcasecmp(arg1, me->name) == 0) return 0;  /* your own key */
+  }
+  const user_record_t *t = user_by_name(state, arg1);
+  return !t ? 0 : t->type == 'a' ? 'a' : 'o';
+}
+
+/* Whether admin `me` holds the flag (or +a). */
+static bool bot_has_flag(bot_state_t *state, const user_record_t *me, char f) {
+  return !f || (me && access_user_has_flag(state, me->uuid, f));
+}
+
+/* op / invite / unban / key for an admin (+c, checked by the gate) or an oper
+ * on a channel it is bound to (user_flags plan U7/U8, §4.2).  This bot acts
+ * when it can; otherwise the hub's channel-request election is asked (the
+ * answer comes back as CMD_USER_CHAN_RESULT), and with no hub every trusted
+ * bot over ~B2.  key never needs anyone: this bot holds every channel's key. */
+static void user_chan_command(bot_state_t *state, const char *nick, const char *user_host,
+                              const user_record_t *me, const char *kind, const char *arg1) {
+  if (!arg1 || !arg1[0]) {
+    irc_printf(state, "PRIVMSG %s :Syntax: %s <#channel>\r\n", nick, kind);
+    return;
+  }
+  char chan[MAX_CHAN];
+  if (snprintf(chan, sizeof(chan), "%s%s", (arg1[0] == '#' || arg1[0] == '&') ? "" : "#",
+               arg1) >= (int)sizeof(chan) ||
+      !access_chan_name_ok(chan) || strcmp(chan, "*") == 0) {
+    irc_printf(state, "PRIVMSG %s :Error: '%s' is not a channel.\r\n", nick, arg1);
+    return;
+  }
+  if (!me) return;
+  if (me->type == 'o' && !access_user_chan_ok(state, me->uuid, chan)) {
+    irc_printf(state, "PRIVMSG %s :Error: you have no access to %s.\r\n", nick, chan);
+    log_message(L_CMD, state, "[CMD] %s refused '%s %s': not bound to it\n", me->name, kind,
+                chan);
+    return;
+  }
+  chan_t *c = channel_find(state, chan);
+  if (!c || !c->is_managed) {
+    irc_printf(state, "PRIVMSG %s :Error: %s is not a managed channel.\r\n", nick, chan);
+    return;
+  }
+  if (strcmp(kind, "key") == 0) {
+    if (c->key[0])
+      irc_printf(state, "PRIVMSG %s :Key for %s: %s\r\n", nick, chan, c->key);
+    else
+      irc_printf(state, "PRIVMSG %s :No key is stored for %s.\r\n", nick, chan);
+    return;
+  }
+  bool can = c->status == C_IN && c->i_am_opped;
+  if (can) {
+    if (strcmp(kind, "op") == 0) {
+      irc_printf(state, "MODE %s +o %s\r\n", chan, nick);
+    } else if (strcmp(kind, "invite") == 0) {
+      irc_printf(state, "INVITE %s %s\r\n", nick, chan);
+      irc_printf(state, "PRIVMSG %s :Inviting you to %s\r\n", nick, chan);
+    } else {
+      chan_access_service(state, "", CHAN_REQ_UNBAN, chan, me->uuid, NULL, user_host, NULL);
+      irc_printf(state, "PRIVMSG %s :Lifting the bans on %s that match you.\r\n", nick, chan);
+    }
+    return;
+  }
+  /* Escalate: the hub (one elected bot does it), else the trusted bots */
+  if (hub_client_send_user_chan_request(state, kind, chan, me->uuid, nick, user_host)) {
+    irc_printf(state, "PRIVMSG %s :I am not opped in %s; asked the network.\r\n", nick, chan);
+    return;
+  }
+  bot_comms_user_chan_fallback(state, kind, chan, nick, user_host);
+  irc_printf(state, "PRIVMSG %s :I am not opped in %s; asked the other bots.\r\n", nick, chan);
+}
+
+/* Word n (0-based) of a space-separated line, or "" (cap bytes with NUL). */
+static void nth_word(const char *line, int n, char *out, size_t cap) {
+  out[0] = '\0';
+  const char *p = line ? line : "";
+  for (int i = 0; *p; i++) {
+    while (*p == ' ') p++;
+    size_t l = strcspn(p, " ");
+    if (!l) break;
+    if (i == n) {
+      snprintf(out, cap, "%.*s", (int)(l < cap ? l : cap - 1), p);
+      return;
+    }
+    p += l;
+  }
+}
+
+/* Plan R2: whether uuid is the last live admin holding +a. */
+static bool last_full_admin(bot_state_t *state, const char *uuid) {
+  if (!strchr(access_user_flags(state, uuid), 'a')) return false;
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *u = &state->user_records[i];
+    if (u->is_active && u->type == 'a' && strcmp(u->uuid, uuid) != 0 &&
+        strchr(access_user_flags(state, u->uuid), 'a'))
+      return false;
+  }
+  return true;
+}
+
+/* help op / invite / unban / key (admins and opers alike). */
+static void help_user_chan(bot_state_t *state, const char *nick, const char *cmd) {
+  if (strcasecmp(cmd, "op") == 0)
+    irc_printf(state, "PRIVMSG %s :Syntax: op <#channel> - Get operator status on a channel "
+                      "(asks the network if this bot is not opped there).\r\n", nick);
+  else if (strcasecmp(cmd, "invite") == 0)
+    irc_printf(state, "PRIVMSG %s :Syntax: invite <#channel> - Invite yourself to a channel "
+                      "(asks the network if this bot is not opped there).\r\n", nick);
+  else if (strcasecmp(cmd, "unban") == 0)
+    irc_printf(state, "PRIVMSG %s :Syntax: unban <#channel> - Lift the bans on a channel that "
+                      "match you (asks the network if this bot is not opped there).\r\n", nick);
+  else
+    irc_printf(state, "PRIVMSG %s :Syntax: key <#channel> - The channel's key, sent to you "
+                      "(sealed when you sign in with ~A2S).\r\n", nick);
+  irc_printf(state, "PRIVMSG %s :  Admins: needs +c.  Opers: the channels you are bound to "
+                    "(help shows them).\r\n", nick);
+}
+
+/* help (admin): the commands this admin may run here, by row; opt 'h' hides
+ * the ones that must go through the hub console.  A target-dependent command
+ * ('x') shows for +a or +o (chkey always: your own key needs no flag). */
+static void help_admin_list(bot_state_t *state, const char *nick, const user_record_t *me) {
+  static const char *const ROWS[][12] = {
+    {"die", "jump", "op", "invite", "unban", "key", "join", "part", "status", "givenick",
+     "chnick", NULL},
+    {"+server", "-server", "servers", "bots", "admins", "opers", "match", "dcc", NULL},
+    {"+admin", "-admin", "chattr", "+oper", "-oper", "chanoper", "+usermask", "-usermask",
+     "chkey", NULL},
+    {"+bot", "-bot", "+hub", "-hub", "rekey", NULL},
+    {"chanmode", "chanset", "+ban", "-ban", "bans", NULL},
+    {"saveconf", "setlog", "getlog", "update", "help", NULL},
+  };
+  static const char *const HUB_ONLY[] = {"+admin", "-admin", "chattr", "+oper", "-oper",
+                                         "chanoper", "+usermask", "-usermask", "+bot", "-bot",
+                                         "join", "part", "chkey", "chanmode", "chanset",
+                                         "+ban", "-ban", NULL};
+  bool hub_only = is_opt_set(state, OPT_HUB_ONLY_MUTATIONS);
+  for (size_t r = 0; r < sizeof(ROWS) / sizeof(ROWS[0]); r++) {
+    char line[256];
+    size_t o = 0;
+    line[0] = '\0';
+    for (int k = 0; ROWS[r][k]; k++) {
+      const char *c = ROWS[r][k];
+      bool hidden = false;
+      for (int h = 0; hub_only && HUB_ONLY[h] && !hidden; h++) hidden = strcmp(c, HUB_ONLY[h]) == 0;
+      if (hidden) continue;
+      char f = 0;
+      for (size_t i = 0; i < sizeof(BOT_CMD_FLAGS) / sizeof(BOT_CMD_FLAGS[0]); i++)
+        if (strcmp(c, BOT_CMD_FLAGS[i].name) == 0) f = BOT_CMD_FLAGS[i].flag;
+      bool ok = f == 'x' ? (strcmp(c, "chkey") == 0 || bot_has_flag(state, me, 'a') ||
+                            bot_has_flag(state, me, 'o'))
+                         : bot_has_flag(state, me, f);
+      if (!ok) continue;
+      int w = snprintf(line + o, sizeof(line) - o, "%s%s", o ? ", " : "", c);
+      if (w > 0 && (size_t)w < sizeof(line) - o) o += (size_t)w;
+    }
+    if (o) irc_printf(state, "PRIVMSG %s : |   %s\r\n", nick, line);
+  }
+  if (hub_only)
+    irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels "
+                      "via the hub console)\r\n", nick);
+  if (me) {
+    const char *fl = access_user_flags(state, me->uuid);
+    irc_printf(state, "PRIVMSG %s : |   your flags: %s%s\r\n", nick, fl[0] ? "+" : "",
+               fl[0] ? fl : "none (views only)");
+  }
+}
+
 /* The admin/oper command tree, split out of commands_handle_private_message
  * so the caller wipes the decrypted command after every return path here.
  * command/arg1..arg3 point into the caller's cmd_plaintext. */
@@ -1185,7 +1414,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
      * must be performed on the hub console instead.  Help text also hides them. */
     if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
       static const char * const HUB_ONLY_CMDS[] = {
-        "+admin", "-admin", "+oper", "-oper",
+        "+admin", "-admin", "+oper", "-oper", "chattr", "chanoper",
         "+usermask", "-usermask",
         "+bot", "-bot",
         "join", "part",
@@ -1207,6 +1436,16 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           return;
         }
       }
+    }
+
+    /* admin flags (plan R4): every command this bot runs is checked here */
+    char need_flag = bot_cmd_flag(state, auth_user, command, arg1);
+    if (!bot_has_flag(state, auth_user, need_flag)) {
+      irc_printf(state, "PRIVMSG %s :Error: '%s' needs +%c (%s).\r\n", nick, command,
+                 need_flag, bot_flag_word(need_flag));
+      log_message(L_CMD, state, "[CMD] %s refused '%s': needs +%c\n",
+                  auth_user ? auth_user->name : nick, command, need_flag);
+      return;
     }
 
     if (strcasecmp(command, "die") == 0) {
@@ -1305,49 +1544,19 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         // Soft delete - mark as unmanaged instead of removing
         c->is_managed = false;
         c->timestamp = lww_next_ts(c->timestamp);
+        /* its oper bindings go too, at the same stamp (user_flags U6) */
+        access_chan_cascade(state, channel_name, c->timestamp);
         log_message(L_DEBUG, state, "[PART-OP] Channel %s: soft delete ts=%ld\n",
                     channel_name, (long)c->timestamp);
         irc_printf(state, "PART %s\r\n", channel_name);
         config_write_with_state_pass(state);
       }
-    } else if (strcasecmp(command, "op") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: op <#channel>\r\n", nick);
-        return;
-      }
-      irc_printf(state, "MODE %s +o %s\r\n", arg1, nick);
-    } else if (strcasecmp(command, "invite") == 0) {
-      if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: invite <#channel>\r\n", nick);
-        return;
-      }
-      char inv_channel[MAX_CHAN];
-      if (arg1[0] == '#' || arg1[0] == '&') {
-        snprintf(inv_channel, sizeof(inv_channel), "%s", arg1);
-      } else {
-        snprintf(inv_channel, sizeof(inv_channel), "#%s", arg1);
-      }
-      chan_t *ic = channel_find(state, inv_channel);
-      if (ic && ic->status == C_IN) {
-        /* i_am_opped, not our roster entry: the roster isn't re-read while
-         * we hold ops, so after a nick change our entry has the old nick. */
-        if (ic->i_am_opped) {
-          irc_printf(state, "INVITE %s %s\r\n", nick, inv_channel);
-          irc_printf(state, "PRIVMSG %s :Inviting you to %s\r\n",
-                     nick, inv_channel);
-          return;
-        }
-      }
-      /* Escalate: hub, else a sealed ~B2 PRIVMSG to each trusted bot */
-      if (!hub_client_send_invite_request(state, nick, inv_channel)) {
-        for (int i = 0; i < state->trusted_bot_count; i++) {
-          char tb_nick[MAX_NICK];
-          auth_trusted_bot_nick(&state->trusted_bots[i], tb_nick);
-          if (tb_nick[0])
-            bot_comms_send_command(state, tb_nick,
-                                   "INVITE %s %s", inv_channel, nick);
-        }
-      }
+    } else if (strcasecmp(command, "op") == 0 || strcasecmp(command, "invite") == 0 ||
+               strcasecmp(command, "unban") == 0 || strcasecmp(command, "key") == 0) {
+      char kind[8];
+      snprintf(kind, sizeof(kind), "%s", command);
+      for (char *k = kind; *k; k++) *k = (char)tolower((unsigned char)*k);
+      user_chan_command(state, nick, user_host, auth_user, kind, arg1);
     } else if (strcasecmp(command, "+bot") == 0) {
       if (state->hub_count > 0) {
         irc_printf(state,
@@ -1946,13 +2155,51 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
        * travels and the bot never mints or delivers a key. */
       const bool add_admin = (strcasecmp(command, "+admin") == 0);
       const char *what = add_admin ? "+admin" : "+oper";
-      if (!arg1 || !arg2 || !arg3) {
+      /* the 4th word (user_flags plan U4/U5): an admin's flags, an oper's
+       * channels -- required, no default */
+      char acc[512];
+      nth_word(argline, 3, acc, sizeof(acc));
+      if (!arg1 || !arg2 || !arg3 || !acc[0]) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: %s <name> <pubkey> <nick!user@host> - "
+                   "PRIVMSG %s :Syntax: %s <name> <pubkey> <nick!user@host> %s - "
                    "<pubkey> is the user's 88-char public key. Ask them for "
                    "it; 'help %s' shows how they make one.\r\n",
-                   nick, what, what);
+                   nick, what, add_admin ? "<+a|flags>" : "<*|#chan,#chan>", what);
+        irc_printf(state, "PRIVMSG %s :  %s\r\n", nick,
+                   add_admin ? "flags: +a = full admin, or letters of what they may change: "
+                               "b bots, c channels, h hub, o opers, u upgrades (e.g. +chu)"
+                             : "channels: * = every channel, or #a,#b (they may op, invite, "
+                               "unban, key there)");
         return;
+      }
+      char flags[USER_FLAGS_MAX + 1] = "";
+      char chans[16][MAX_CHAN];
+      int nchans = 0;
+      if (add_admin) {
+        if (!access_flags_edit("", acc, flags, sizeof(flags)) || !flags[0]) {
+          irc_printf(state, "PRIVMSG %s :Error: flags are +a (full admin) or letters from "
+                            "bchou (e.g. +chu).\r\n", nick);
+          return;
+        }
+      } else {
+        char work[512];
+        snprintf(work, sizeof(work), "%s", acc);
+        char *save = NULL;
+        bool bad = false;
+        for (char *t = strtok_r(work, ",", &save); t && !bad; t = strtok_r(NULL, ",", &save)) {
+          bool dup = false;
+          for (int k = 0; k < nchans; k++) dup |= strcasecmp(chans[k], t) == 0;
+          if (dup) continue;
+          if (!access_chan_name_ok(t) || nchans >= 16) bad = true;
+          else snprintf(chans[nchans++], MAX_CHAN, "%s", t);
+        }
+        bool star = false;
+        for (int k = 0; k < nchans; k++) star |= strcmp(chans[k], "*") == 0;
+        if (bad || !nchans || (star && nchans > 1)) {
+          irc_printf(state, "PRIVMSG %s :Error: channels are * (every channel) or up to 16 "
+                            "of #a,#b.\r\n", nick);
+          return;
+        }
       }
       if (strlen(arg1) > 63) {
         irc_printf(state, "PRIVMSG %s :Error: name too long (max 63).\r\n", nick);
@@ -1981,6 +2228,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s :Error: mask table full.\r\n", nick);
         return;
       }
+      if ((add_admin && state->uflag_record_count >= MAX_USER_FLAGS) ||
+          (!add_admin && state->uchan_record_count + nchans + 1 > MAX_CHAN_BINDS)) {
+        irc_printf(state, "PRIVMSG %s :Error: flag / channel table full.\r\n", nick);
+        return;
+      }
       /* Generate UUID using random bytes */
       unsigned char rnd[16];
       if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
@@ -2007,12 +2259,106 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       snprintf(m->uuid, sizeof(m->uuid), "%s", new_uuid);
       snprintf(m->mask, sizeof(m->mask), "%s", arg3);
       m->is_active = true; m->timestamp = now;
+      /* flags / bindings at the user's own stamp; a channel-bound oper also
+       * gets its "*" del (access_migrate must never make it global) */
+      if (add_admin) {
+        access_uflag_put(state, new_uuid, flags, now);
+      } else {
+        for (int k = 0; k < nchans; k++) access_uchan_put(state, new_uuid, chans[k], true, now);
+        if (strcmp(chans[0], "*") != 0) access_uchan_put(state, new_uuid, "*", false, now);
+      }
       config_write_with_state_pass(state);
       hub_client_push_admin_delta(state);
       char kfp[KEY_FP_LEN + 1];
       user_key_fp(u, kfp);
-      irc_printf(state, "PRIVMSG %s :%s '%s' added with mask %s (key %s)\r\n",
-                 nick, add_admin ? "Admin" : "Oper", arg1, arg3, kfp);
+      char acc_shown[512];
+      if (add_admin) snprintf(acc_shown, sizeof(acc_shown), "flags +%s", flags);
+      else access_user_chans(state, new_uuid, acc_shown, sizeof(acc_shown));
+      irc_printf(state, "PRIVMSG %s :%s '%s' added with mask %s (key %s), %s%s\r\n",
+                 nick, add_admin ? "Admin" : "Oper", arg1, arg3, kfp,
+                 add_admin ? "" : "channels ", acc_shown);
+
+    } else if (strcasecmp(command, "chattr") == 0) {
+      /* chattr <name> <+x-y|letters>: an admin's flags (needs +a) */
+      if (!arg1 || !arg2) {
+        irc_printf(state, "PRIVMSG %s :Syntax: chattr <name> <+x-y|letters> - e.g. chattr "
+                          "dana +b-u, chattr dana +a\r\n", nick);
+        return;
+      }
+      user_record_t *t = user_by_name(state, arg1);
+      if (!t || t->type != 'a') {
+        irc_printf(state, "PRIVMSG %s :Error: no admin called '%s' (an oper has channels: "
+                          "chanoper).\r\n", nick, arg1);
+        return;
+      }
+      char old[USER_FLAGS_MAX + 1], nw[USER_FLAGS_MAX + 1];
+      snprintf(old, sizeof(old), "%s", access_user_flags(state, t->uuid));
+      if (!access_flags_edit(old, arg2, nw, sizeof(nw)) || !nw[0]) {
+        irc_printf(state, "PRIVMSG %s :Error: flags are +a (full admin) or letters from "
+                          "bchou; +x-y changes some.\r\n", nick);
+        return;
+      }
+      if (!strchr(nw, 'a') && last_full_admin(state, t->uuid)) {
+        irc_printf(state, "PRIVMSG %s :Error: '%s' is the last full admin (+a); make another "
+                          "admin +a first.\r\n", nick, t->name);
+        return;
+      }
+      if (strcmp(old, nw) == 0) {
+        irc_printf(state, "PRIVMSG %s :%s already has +%s.\r\n", nick, t->name, nw);
+        return;
+      }
+      if (!access_uflag_put(state, t->uuid, nw, access_next_ts(state, t->uuid))) {
+        irc_printf(state, "PRIVMSG %s :Error: flag table full.\r\n", nick);
+        return;
+      }
+      config_write_with_state_pass(state);
+      hub_client_push_admin_delta(state);
+      irc_printf(state, "PRIVMSG %s :%s: +%s -> +%s\r\n", nick, t->name, old[0] ? old : "", nw);
+
+    } else if (strcasecmp(command, "chanoper") == 0) {
+      /* chanoper add|del <#chan|*> <oper> (needs +o) */
+      bool add = arg1 && strcasecmp(arg1, "add") == 0;
+      if (!arg1 || !arg2 || !arg3 || (!add && strcasecmp(arg1, "del") != 0)) {
+        irc_printf(state, "PRIVMSG %s :Syntax: chanoper add|del <#chan|*> <oper> - * = every "
+                          "channel; add * drops the channels, add #c drops *, del * removes "
+                          "all\r\n", nick);
+        return;
+      }
+      user_record_t *t = user_by_name(state, arg3);
+      if (!t || t->type != 'o') {
+        irc_printf(state, "PRIVMSG %s :Error: no oper called '%s' (an admin has flags: "
+                          "chattr).\r\n", nick, arg3);
+        return;
+      }
+      if (!access_chan_name_ok(arg2)) {
+        irc_printf(state, "PRIVMSG %s :Error: a channel is #name, or * for every channel.\r\n",
+                   nick);
+        return;
+      }
+      uchan_record_t *cur = access_uchan_find(state, t->uuid, arg2);
+      bool live = cur && cur->is_active;
+      bool any_live = access_user_chan_count(state, t->uuid, NULL) > 0;
+      bool star = strcmp(arg2, "*") == 0;
+      if (!add && (star ? !any_live : !live)) {
+        irc_printf(state, "PRIVMSG %s :Error: %s has no %s.\r\n", nick, t->name,
+                   star ? "channels" : arg2);
+        return;
+      }
+      if (add && live && (star || !access_user_chan_ok(state, t->uuid, NULL))) {
+        irc_printf(state, "PRIVMSG %s :%s already has %s.\r\n", nick, t->name, arg2);
+        return;
+      }
+      if (access_chan_change(state, t->uuid, add, arg2) < 0) {
+        irc_printf(state, "PRIVMSG %s :Error: channel binding table full.\r\n", nick);
+        return;
+      }
+      config_write_with_state_pass(state);
+      hub_client_push_admin_delta(state);
+      char cl[512];
+      access_user_chans(state, t->uuid, cl, sizeof(cl));
+      irc_printf(state, "PRIVMSG %s :%s: channels now %s\r\n", nick, t->name,
+                 !cl[0] ? "none (no channel access)" : strcmp(cl, "*") == 0 ? "* (every channel)"
+                                                                         : cl);
 
     } else if (strcasecmp(command, "-admin") == 0) {
       if (!arg1) {
@@ -2026,6 +2372,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         }
       }
       if (!target) { irc_printf(state, "PRIVMSG %s :Error: admin '%s' not found.\r\n", nick, arg1); return; }
+      if (last_full_admin(state, target->uuid)) {
+        irc_printf(state, "PRIVMSG %s :Error: '%s' is the last full admin (+a); make another "
+                          "admin +a first.\r\n", nick, arg1);
+        return;
+      }
       target->is_active = false;
       target->timestamp = lww_next_ts(target->timestamp);
       for (int i = 0; i < state->mask_record_count; i++)
@@ -2442,6 +2793,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       free(dec);
       state->hub_count++;
       config_write_with_state_pass(state);
+      hub_client_push_config(state); /* its hl| list changed */
       irc_printf(state,
                  "PRIVMSG %s :Added Hub: %s (pubkey pinned)\r\n", nick, arg1);
       /* If we are not connected to any hub yet, try the new one now. */
@@ -2480,6 +2832,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         memset(&state->hubs[state->hub_count], 0,
                sizeof(state->hubs[state->hub_count]));
         config_write_with_state_pass(state);
+        hub_client_push_config(state); /* its hl| list changed */
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
 
         // If we disconnected and there are other hubs available, reconnect
@@ -2630,19 +2983,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s : | " BOT_NAME " " BOT_VERSION " help\r\n", nick);
         irc_printf(state, "PRIVMSG %s : +----------------------------------------------------------------------------\r\n", nick);
         irc_printf(state, "PRIVMSG %s : | \r\n", nick);
-        if (is_opt_set(state, OPT_HUB_ONLY_MUTATIONS)) {
-          irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, status, givenick, chnick\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +hub, -hub, rekey, saveconf, setlog, getlog, update, help, bans\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   (hub-only-mutation mode: users, masks, keys, channels via the hub console)\r\n", nick);
-        } else {
-          irc_printf(state, "PRIVMSG %s : |   die, jump, op, invite, join, part, status, givenick, chnick\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +server, -server, servers, bots, admins, opers, match, dcc\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +admin, -admin, +oper, -oper, +usermask, -usermask, chkey\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   +bot, -bot, +hub, -hub, rekey\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   chanmode, chanset, +ban, -ban, bans\r\n", nick);
-          irc_printf(state, "PRIVMSG %s : |   saveconf, setlog, getlog, update, help\r\n", nick);
-        }
+        help_admin_list(state, nick, auth_user);
         irc_printf(state, "PRIVMSG %s : |   'help auth' explains how clients sign in with their key\r\n", nick);
         irc_printf(state, "PRIVMSG %s : |\r\n", nick);
         irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
@@ -2659,11 +3000,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               "Servers that banned or throttled the bot are skipped; naming one "
               "clears its hold and retries it now.\r\n",
               nick);
-        } else if (strcasecmp(arg1, "op") == 0) {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: op <#channel> - Get operator status "
-                     "on a channel.\r\n",
-                     nick);
+        } else if (strcasecmp(arg1, "op") == 0 || strcasecmp(arg1, "unban") == 0 ||
+                   strcasecmp(arg1, "key") == 0) {
+          help_user_chan(state, nick, arg1);
         } else if (strcasecmp(arg1, "status") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: status - Show bot status.\r\n",
                      nick);
@@ -2716,16 +3055,28 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(state, "PRIVMSG %s :Syntax: opers - List all opers.\r\n", nick);
         } else if (strcasecmp(arg1, "+admin") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: +admin <name> <pubkey> <nick!user@host> - "
-                     "Add a named admin with a first usermask. Name must be unique across admins and opers.\r\n", nick);
+                     "PRIVMSG %s :Syntax: +admin <name> <pubkey> <nick!user@host> <+a|flags> - "
+                     "Add a named admin with a first usermask and their flags (needs +a). Name must be unique across admins and opers.\r\n", nick);
+          irc_printf(state,
+                     "PRIVMSG %s :  flags: +a = full admin; else the letters of what they may change: "
+                     "b bots, c channels, h hub, o opers, u upgrades. e.g. +admin dana <key> dana!*@* +chu\r\n", nick);
           help_keypair(state, nick);
+        } else if (strcasecmp(arg1, "chattr") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: chattr <name> <+x-y|letters> - Change an admin's flags (needs +a): "
+                     "+b-u adds b and removes u, chu or +a replaces them all. The last +a admin keeps +a.\r\n", nick);
+        } else if (strcasecmp(arg1, "chanoper") == 0) {
+          irc_printf(state,
+                     "PRIVMSG %s :Syntax: chanoper add|del <#chan|*> <oper> - Give an oper a channel or take it "
+                     "away (needs +o). * = every channel; add * drops the channels, add #c drops *, del * removes all.\r\n", nick);
         } else if (strcasecmp(arg1, "-admin") == 0) {
           irc_printf(state,
                      "PRIVMSG %s :Syntax: -admin <name> - Remove admin and all their masks.\r\n", nick);
         } else if (strcasecmp(arg1, "+oper") == 0) {
           irc_printf(state,
-                     "PRIVMSG %s :Syntax: +oper <name> <pubkey> <nick!user@host> - "
-                     "Add a named oper with a first usermask. Opers may use op, chkey (own key) and help.\r\n", nick);
+                     "PRIVMSG %s :Syntax: +oper <name> <pubkey> <nick!user@host> <*|#chan,#chan> - "
+                     "Add a named oper with a first usermask and their channels (needs +o). Opers may use "
+                     "op, invite, unban, key on their channels, chkey (own key) and help.\r\n", nick);
           help_keypair(state, nick);
         } else if (strcasecmp(arg1, "-oper") == 0) {
           irc_printf(state,
@@ -2782,9 +3133,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: bans [#channel|*] - List the network bans (all, or one channel's "
                      "plus the '*' ones).\r\n", nick);
         } else if (strcasecmp(arg1, "invite") == 0) {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: invite <#channel> - Invite yourself to a channel (asks the hub or a "
-                     "trusted bot if this bot is not opped there).\r\n", nick);
+          help_user_chan(state, nick, arg1);
         } else if (strcasecmp(arg1, "auth") == 0) {
           help_auth(state, nick);
         } else if (strcasecmp(arg1, "dcc") == 0) {
@@ -2811,8 +3160,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
               "PRIVMSG %s :Syntax: +bot <nick!user@host> <uuid> <pubkey> - "
               "Standalone bots only (hub-managed bots get peers from the hub): "
               "trust another bot for encrypted bot-to-bot commands. Copy the "
-              "UUID and Pubkey from that bot's 'status' (or its -setup "
-              "output). The mask should be the one the network shows for it.\r\n",
+              "UUID and Pubkey from that bot's 'status' (or run ./ircbot -id "
+              "on its host). The mask should be the one the network shows for "
+              "it.\r\n",
               nick);
         } else if (strcasecmp(arg1, "-bot") == 0) {
           irc_printf(state,
@@ -2859,8 +3209,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(
               state,
               "PRIVMSG %s :Syntax: +hub <host:port> <pubkey-b64> - Add a hub "
-              "and pin its Ed25519 pubkey (44 or 88 char base64 from the "
-              "hub's hub_public.b64).\r\n",
+              "and pin its Ed25519 pubkey (44 or 88 char base64: the public "
+              "key line of hub show in that hub's console, or of ./irchub -id "
+              "on its host).\r\n",
               nick);
         } else if (strcasecmp(arg1, "-hub") == 0) {
           irc_printf(
@@ -2885,11 +3236,14 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
     }
 
   } else if (is_op) {
-    if (strcasecmp(command, "op") == 0 && arg1) {
-      char *saveptr_op;
-      char *op_arg1 = strtok_r(arg1, " ", &saveptr_op);
-      if (op_arg1)
-        irc_printf(state, "MODE %s +o %s\r\n", op_arg1, nick);
+    /* an oper: op / invite / unban / key on the channels it is bound to
+     * (user_flags plan U7), chkey for its own key, help */
+    if (strcasecmp(command, "op") == 0 || strcasecmp(command, "invite") == 0 ||
+        strcasecmp(command, "unban") == 0 || strcasecmp(command, "key") == 0) {
+      char kind[8];
+      snprintf(kind, sizeof(kind), "%s", command);
+      for (char *k = kind; *k; k++) *k = (char)tolower((unsigned char)*k);
+      user_chan_command(state, nick, user_host, auth_user, kind, arg1);
     } else if (strcasecmp(command, "chkey") == 0) {
       /* Opers can only change their own key (refused under opt 'h', like
        * every other local mutation of a hub-authoritative record). */
@@ -2917,12 +3271,19 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         irc_printf(state, "PRIVMSG %s : | " BOT_NAME " " BOT_VERSION " help\r\n", nick);
         irc_printf(state, "PRIVMSG %s : +----------------------------------------------------------------------------\r\n", nick);
         irc_printf(state, "PRIVMSG %s : | \r\n", nick);
-        irc_printf(state, "PRIVMSG %s : |   op, chkey, help\r\n", nick);
+        irc_printf(state, "PRIVMSG %s : |   op, invite, unban, key, chkey, help\r\n", nick);
+        {
+          char cl[256];
+          access_user_chans(state, auth_user ? auth_user->uuid : "", cl, sizeof(cl));
+          irc_printf(state, "PRIVMSG %s : |   your channels: %s\r\n", nick,
+                     !cl[0] ? "none" : strcmp(cl, "*") == 0 ? "every channel" : cl);
+        }
         irc_printf(state, "PRIVMSG %s : |\r\n", nick);
         irc_printf(state, "PRIVMSG %s : `----------------------------------------------------------------------------\r\n", nick);
       } else {
-        if (strcasecmp(arg1, "op") == 0) {
-          irc_printf(state, "PRIVMSG %s :Syntax: op <#channel> - Get operator status on a channel.\r\n", nick);
+        if (strcasecmp(arg1, "op") == 0 || strcasecmp(arg1, "invite") == 0 ||
+            strcasecmp(arg1, "unban") == 0 || strcasecmp(arg1, "key") == 0) {
+          help_user_chan(state, nick, arg1);
         } else if (strcasecmp(arg1, "chkey") == 0) {
           irc_printf(state, "PRIVMSG %s :Syntax: chkey <yourname> <pubkey> - Replace your own public key.\r\n", nick);
           help_keypair(state, nick);

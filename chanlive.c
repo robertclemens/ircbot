@@ -421,7 +421,7 @@ bool chan_member_authorised(const bot_state_t *state, const chan_t *c,
     if (strcasecmp(c->roster[i].nick, nick) == 0) {
       if (found)
         *found = true;
-      return auth_is_authorised(state, c->roster[i].hostmask);
+      return auth_is_authorised(state, c->roster[i].hostmask, c->name);
     }
   }
   return false;

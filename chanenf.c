@@ -122,11 +122,11 @@ bool chanenf_nuh_authorised(const bot_state_t *state, const char *nuh) {
     return false;
   if (is_me(state, nick))
     return true;
-  return auth_is_authorised(state, nuh);
+  return auth_is_authorised(state, nuh, NULL);
 }
 
-/* What "authorised" depends on: the trusted bots, the user and mask records
- * (none of which has one change hook) and cfg_gen.  The records are hashed
+/* What "authorised" depends on: the trusted bots, the user, mask and oper
+ * binding records (none of which has one change hook) and cfg_gen.  The records are hashed
  * at most every 200 ms; a change bumps state->auth_gen, which retires every
  * roster entry's cached verdict at once. */
 static uint64_t fp_str(uint64_t h, const char *s) {
@@ -153,8 +153,14 @@ static unsigned auth_epoch(bot_state_t *state) {
     const user_record_t *u = &state->user_records[i];
     h = fp_str(h, u->uuid) + (uint64_t)u->is_active;
   }
+  /* an oper's standing is per channel (user_flags plan §6) */
+  for (int i = 0; i < state->uchan_record_count; i++) {
+    const uchan_record_t *r = &state->uchan_records[i];
+    h = fp_str(fp_str(h, r->uuid), r->chan) + (uint64_t)r->is_active;
+  }
   h = h * UINT64_C(1099511628211) + (uint64_t)state->trusted_bot_count * 3 +
-      (uint64_t)state->mask_record_count * 5 + (uint64_t)state->user_record_count;
+      (uint64_t)state->mask_record_count * 5 + (uint64_t)state->user_record_count +
+      (uint64_t)state->uchan_record_count * 7;
   if (!state->auth_gen || h != state->auth_fp ||
       state->auth_seen_cfg_gen != state->cfg_gen) {
     state->auth_fp = h;
@@ -177,13 +183,13 @@ static roster_entry_t *roster_cache(const roster_entry_t *e) {
 /* The verdict is cached in the entry (only its cache fields change, so the
  * const is dropped by roster_cache); every wildcard match against the bots /
  * masks is paid once per entry per auth_gen instead of once per ban x entry. */
-static bool entry_authorised(bot_state_t *state, const roster_entry_t *e) {
+static bool entry_authorised(bot_state_t *state, const char *chan, const roster_entry_t *e) {
   if (is_me(state, e->nick))
     return true;
   roster_entry_t *m = roster_cache(e);
   unsigned gen = auth_epoch(state);
   if (m->auth_gen != gen) {
-    m->authorised = auth_is_authorised(state, m->hostmask);
+    m->authorised = auth_is_authorised(state, m->hostmask, chan);
     m->auth_gen = gen;
   }
   return m->authorised;
@@ -199,8 +205,8 @@ bool chanenf_chan_nuh_authorised(bot_state_t *state, const chan_t *c,
   int ri = c ? rindex_of(c, nick) : -1;
   const roster_entry_t *e = ri < 0 ? NULL : &c->roster[ri];
   if (e && strcasecmp(e->hostmask, nuh) == 0)
-    return entry_authorised(state, e);
-  return auth_is_authorised(state, nuh);
+    return entry_authorised(state, c->name, e);
+  return auth_is_authorised(state, nuh, c ? c->name : NULL);
 }
 
 bool chanenf_roster_set(chan_t *c, const char *nick, const char *hostmask,
@@ -469,7 +475,7 @@ static bool allowed_members(bot_state_t *state, const chan_t *c,
     return true;
   for (int i = 0; i < c->roster_count; i++) {
     const roster_entry_t *e = &c->roster[i];
-    if (entry_authorised(state, e) && auth_wildcard_match(mask, e->hostmask)) {
+    if (entry_authorised(state, c->name, e) && auth_wildcard_match(mask, e->hostmask)) {
       if (who && who_size)
         snprintf(who, who_size, "member %s", e->nick);
       return false;
@@ -487,7 +493,7 @@ bool chanenf_ban_allowed(bot_state_t *state, const chan_t *c, const char *mask,
   }
   if (!allowed_members(state, c, mask, who, who_size))
     return false;
-  return !auth_mask_overlaps_authorised(state, mask, who, who_size);
+  return !auth_mask_overlaps_authorised(state, mask, c ? c->name : NULL, who, who_size);
 }
 
 bool chanenf_auto_ban_mask(bot_state_t *state, const chan_t *c, const char *nuh,
@@ -654,7 +660,7 @@ static void act_deop(bot_state_t *state, chan_t *c, const char *nick,
   if (!c->i_am_opped || !valid_nick(state, nick))
     return;
   roster_entry_t *e = rfind(c, nick);
-  if (!e || (half ? !e->is_halfop : !e->is_op) || entry_authorised(state, e))
+  if (!e || (half ? !e->is_halfop : !e->is_op) || entry_authorised(state, c->name, e))
     return;
   char nk[MAX_MEMBER_NICK]; /* irc_printf can drop the link: no use of e after */
   snprintf(nk, sizeof(nk), "%s", e->nick);
@@ -669,7 +675,7 @@ static void act_reop(bot_state_t *state, chan_t *c, const char *nick,
   if (!c->i_am_opped || !valid_nick(state, nick))
     return;
   roster_entry_t *e = rfind(c, nick);
-  if (!e || e->is_op || is_me(state, e->nick) || !entry_authorised(state, e))
+  if (!e || e->is_op || is_me(state, e->nick) || !entry_authorised(state, c->name, e))
     return;
   char nk[MAX_MEMBER_NICK];
   snprintf(nk, sizeof(nk), "%s", e->nick);
@@ -684,7 +690,7 @@ static void act_kick(bot_state_t *state, chan_t *c, const char *nick,
   if (!c->i_am_opped || !valid_nick(state, nick))
     return;
   roster_entry_t *e = rfind(c, nick);
-  if (!e || entry_authorised(state, e))
+  if (!e || entry_authorised(state, c->name, e))
     return;
   char nk[MAX_MEMBER_NICK];
   snprintf(nk, sizeof(nk), "%s", e->nick);
@@ -720,7 +726,7 @@ static void act_ban(bot_state_t *state, chan_t *c, const char *mask_in,
     return;
   }
   if (now - t->checked_at >= 60) {
-    t->overlap_ok = !auth_mask_overlaps_authorised(state, mask, who, sizeof(who));
+    t->overlap_ok = !auth_mask_overlaps_authorised(state, mask, c->name, who, sizeof(who));
     t->checked_at = now;
     if (!t->overlap_ok)
       log_message(L_INFO, state, "[BAN] Not setting %s in %s: it overlaps %s\n",
@@ -765,7 +771,7 @@ static void exec_ban_nuh(bot_state_t *state, chan_t *c, const char *nuh,
   if (!nuh_nick(nuh, nick, sizeof(nick)) || !c->i_am_opped)
     return;
   roster_entry_t *e = rfind(c, nick);
-  if ((e && entry_authorised(state, e)) ||
+  if ((e && entry_authorised(state, c->name, e)) ||
       chanenf_chan_nuh_authorised(state, c, nuh))
     return;
   char mask[BAN_MASK_MAX + 1];
@@ -1008,7 +1014,7 @@ void chanenf_on_kick(bot_state_t *state, const char *chan, const char *prefix,
   if (!c || c->status != C_IN || !victim || is_me(state, victim))
     return;
   roster_entry_t *e = rfind(c, victim);
-  bool victim_auth = e && entry_authorised(state, e);
+  bool victim_auth = e && entry_authorised(state, chan, e);
   recent_ack(state, c, "kick", victim);
   rremove(c, victim);
   c->enf_dirty = true;
@@ -1062,7 +1068,7 @@ void chanenf_on_nick(bot_state_t *state, const char *old_nick,
 static bool ban_hits_authorised(bot_state_t *state, const chan_t *c,
                                 const char *mask) {
   for (int i = 0; i < c->roster_count; i++)
-    if (entry_authorised(state, &c->roster[i]) &&
+    if (entry_authorised(state, c->name, &c->roster[i]) &&
         auth_wildcard_match(mask, c->roster[i].hostmask))
       return true;
   return false;
@@ -1117,7 +1123,7 @@ static void on_mode(bot_state_t *state, const char *chan, const char *prefix,
     if (user_src && !adding && ch == 'o' && a && valid_nick(state, a)) {
       roster_entry_t *ve = rfind(c, a);
       chanflood_event(state, c->name, prefix, FL_DEOP,
-                      ve && (is_me(state, ve->nick) || entry_authorised(state, ve)));
+                      ve && (is_me(state, ve->nick) || entry_authorised(state, chan, ve)));
     } else if (user_src && adding && ch == 'b' && a &&
                safe_token(a, BAN_MASK_MAX)) {
       chanflood_event(state, c->name, prefix, FL_BAN,
@@ -1127,7 +1133,7 @@ static void on_mode(bot_state_t *state, const char *chan, const char *prefix,
       roster_entry_t *e = rfind(c, a);
       if (!e || is_me(state, e->nick))
         continue;
-      bool auth = entry_authorised(state, e);
+      bool auth = entry_authorised(state, chan, e);
       if (adding && !auth) {
         if (bitch)
           job_submit(state, c, JA_DEOP, e->nick, "bitch");
@@ -1143,7 +1149,7 @@ static void on_mode(bot_state_t *state, const char *chan, const char *prefix,
       }
     } else if (ch == 'h' && adding && has_h && a && valid_nick(state, a)) {
       roster_entry_t *e = rfind(c, a);
-      if (bitch && e && !is_me(state, e->nick) && !entry_authorised(state, e))
+      if (bitch && e && !is_me(state, e->nick) && !entry_authorised(state, chan, e))
         job_submit(state, c, JA_DEHALF, e->nick, "bitch");
     } else if (ch == 'b') {
       bans_changed = true;
@@ -1198,7 +1204,7 @@ static int unauth_match(bot_state_t *state, const chan_t *c, const char *mask,
     *auth_hit = false;
   for (int i = 0; i < c->roster_count; i++) {
     const roster_entry_t *e = &c->roster[i];
-    if (entry_authorised(state, e)) {
+    if (entry_authorised(state, c->name, e)) {
       if (auth_hit && !*auth_hit && auth_wildcard_match(mask, e->hostmask))
         *auth_hit = true;
       continue;
@@ -1284,8 +1290,11 @@ static void ban_sweep(bot_state_t *state, chan_t *c, time_t now) {
     const roster_entry_t *hits[MAX_ROSTER_SIZE];
     int nhit = unauth_match(state, c, bm, hits, MAX_ROSTER_SIZE, NULL);
     bool match = nhit > 0;
-    if (match)
+    if (match) {
       t->last_match = now;
+      if (!sticky)
+        chancfg_ban_mark_used(state, r->chan, r->mask, now);
+    }
     bool keep = sticky || !dyn;
     if (keep && !live) {
       if (sticky || room > 0) {
@@ -1369,7 +1378,7 @@ static void chan_sweep(bot_state_t *state, chan_t *c, time_t now) {
       for (int i = 0; i < c->roster_count; i++) {
         const roster_entry_t *e = &c->roster[i];
         char nk[MAX_MEMBER_NICK];
-        if (entry_authorised(state, e))
+        if (entry_authorised(state, c->name, e))
           continue;
         snprintf(nk, sizeof(nk), "%s", e->nick);
         if (e->is_op)

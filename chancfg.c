@@ -422,7 +422,10 @@ static bool ban_store(bot_state_t *state, const cfg_ban_t *in) {
       return false;
     if (in->active && !b->active && !ban_active_room(state, in->chan))
       return false;
+    time_t last_used = b->last_used, act_pending = b->act_pending;
     *b = *in;
+    b->last_used = last_used; /* runtime activity outlives a record update */
+    b->act_pending = act_pending;
     state->cfg_gen++;
     return true;
   }
@@ -497,6 +500,19 @@ bool chancfg_apply_b_line(bot_state_t *state, const char *data) {
   b.ts = (time_t)ts;
   b.active = add;
   return ban_store(state, &b);
+}
+
+void chancfg_ban_mark_used(bot_state_t *state, const char *chan, const char *mask,
+                           time_t now) {
+  cfg_ban_t *b = ban_find(state, chan, mask);
+  if (!b || !b->active || strchr(b->flags, 's') || now <= b->last_used)
+    return;
+  bool new_bucket = b->last_used / ACTIVITY_BUCKET < now / ACTIVITY_BUCKET;
+  b->last_used = now;
+  if (new_bucket) {
+    b->act_pending = now;
+    hub_client_send_activity(state);
+  }
 }
 
 int chancfg_format_b_line(const cfg_ban_t *b, char *buf, size_t len) {
@@ -728,7 +744,7 @@ const char *chancfg_item_name(int idx, bool net) {
 
 /* What item idx does, in the same index space as chancfg_item_name (the
  * hub console's help channel set / network set say the same). */
-static const char *const ITEM_WHAT[CS_COUNT + FL_COUNT] = {
+static const char *const ITEM_WHAT[(int)CS_COUNT + (int)FL_COUNT] = {
   "put back any change away from the stored modes",
   "only authorised users and bots may hold ops",
   "re-op an authorised member someone deopped; lift bans on one",

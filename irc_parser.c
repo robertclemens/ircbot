@@ -658,9 +658,20 @@ void parser_handle_line(bot_state_t *state, char *line) {
         state->last_op_request_sent = now;
         c->op_request_retry_count++;
       } else {
+        /* Another channel just asked.  Book the next free slot instead of
+         * sitting out the 60 s pending timeout: back-date the request so
+         * channel_manager's timeout re-WHOs this channel the moment its slot
+         * opens.  Slots are MIN_INTERVAL + 1 apart so the WHO round trip
+         * cannot land a request inside the previous one's window. */
+        time_t slot = state->last_op_request_sent + OP_REQUEST_MIN_INTERVAL;
+        if (state->op_request_next_slot > slot)
+          slot = state->op_request_next_slot;
+        state->op_request_next_slot = slot + OP_REQUEST_MIN_INTERVAL + 1;
+        c->last_op_request_time = slot - 61;
         log_message(L_DEBUG, state,
-                    "[OP-REQ] Rate limited in %s; will retry (attempt %d pending)\n",
-                    c->name, c->op_request_retry_count + 1);
+                    "[OP-REQ] Rate limited in %s; retry in %llds (attempt %d pending)\n",
+                    c->name, (long long)(slot - now),
+                    c->op_request_retry_count + 1);
       }
     } else {
       log_message(L_DEBUG, state,
