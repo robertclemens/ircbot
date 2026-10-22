@@ -161,7 +161,6 @@ static void hub_client_retire(bot_state_t *state) {
   ok = retire_wipe_file(CONFIG_FILE ".tmp") && ok;
   ok = retire_wipe_file(CONFIG_FILE UPGRADE_PREV_SUFFIX) && ok;
   ok = retire_wipe_file(PASS_FILE) && ok;
-  ok = retire_wipe_file(PASS_PREV_FILE) && ok;
   if (!ok)
     log_message(L_INFO, state, "[HUB] Could not wipe every config file; exiting anyway\n");
   hub_seal_frame(state, CMD_BOT_RETIRE_ACK, ok ? "1" : "0", 1);
@@ -616,7 +615,7 @@ static bool wire_tail(const char *s, int idx, char *dst, size_t cap) {
 static void hub_client_handle_upgrade_prepare(bot_state_t *state,
                                               const char *payload) {
   char id[64] = "", ver[64] = "", variant[8] = "", kind[8] = "";
-  char min_from[64] = "", base[512] = "";
+  char min_from[64] = "";
   if (!wire_field(payload, 0, id, sizeof(id)) ||
       !wire_field(payload, 1, ver, sizeof(ver)) || !id[0] || !ver[0]) {
     log_message(L_INFO, state, "[UPGRADE] Malformed UPGRADE_PREPARE\n");
@@ -625,23 +624,21 @@ static void hub_client_handle_upgrade_prepare(bot_state_t *state,
   wire_field(payload, 2, variant, sizeof(variant));
   wire_field(payload, 3, kind, sizeof(kind));
   wire_field(payload, 4, min_from, sizeof(min_from));
-  /* A bounded field, not the tail: a hub's peer-facing PREPARE appends the
-   * hubs' own target and base after it, and those are not the bot's. */
-  wire_field(payload, 5, base, sizeof(base));
+  /* Field 5 once carried a release base and is ignored: this bot reads only
+   * its own root, the one its pinned key verifies. */
 
   /* Everything COMMIT will need is checked now — including the signed
    * manifest for the wanted build — so a "ready" answer is one COMMIT can
    * keep. */
   char reason[320];
-  bool ready = updater_hub_prepare_check(state, ver, variant, min_from, base,
-                                         reason, sizeof(reason));
+  bool ready = updater_hub_prepare_check(state, ver, variant, min_from, reason,
+                                         sizeof(reason));
   if (ready) {
     /* Remember the plan: COMMIT repeats only the id and the version. */
     snprintf(state->upgrade_id, sizeof(state->upgrade_id), "%s", id);
     snprintf(state->upgrade_target, sizeof(state->upgrade_target), "%s", ver);
     snprintf(state->upgrade_variant, sizeof(state->upgrade_variant), "%s",
              variant[0] ? variant : updater_host_variant());
-    snprintf(state->upgrade_base, sizeof(state->upgrade_base), "%s", base);
     state->upgrade_prepared = time(NULL);
   }
   (void)kind; /* the artifact kind is chosen from the manifest at COMMIT */
@@ -685,7 +682,7 @@ static void hub_client_handle_upgrade_commit(bot_state_t *state,
   const char *err = NULL;
   if (!updater_hub_commit(state, id, ver,
                           variant[0] ? variant : state->upgrade_variant,
-                          state->upgrade_base, &err)) {
+                          &err)) {
     /* Nothing was changed on disk; stay on this build and say why. */
     log_message(L_INFO, state, "[UPGRADE] Commit %s refused: %s\n", id,
                 err ? err : "unknown error");
@@ -905,11 +902,11 @@ static int hub_client_hublist_line(const bot_state_t *state, char *out, size_t c
  * hl| (the hubs this bot dials)
  * Excludes: a|, o|, m| (hub-authoritative; pushed separately by
  * hub_client_push_admin_delta) and the local-only s|, u|, g|, l|, i|, k|
- * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted as well, except a
- * channel with enf_pending (a key/mode this bot learned and has not yet got
- * to a hub: enforcement is never gated, D43) and pending bot-written B|
- * lines: the bot refuses join/part locally, so other c| records can only be
- * the hub's own copy,
+ * K| (what this bot saw on IRC) goes out for every managed channel, under
+ * every opt (enforcement is never gated, D43).
+ * Under opt 'h' (OPT_HUB_ONLY_MUTATIONS) c| is omitted, as are all but the
+ * pending bot-written B| lines: the bot refuses join/part locally, so its
+ * c| records can only be the hub's own copy,
  * and irchub's process_bot_config_push rejects them by type before any
  * timestamp compare — pushing them would just log one REJECTED line per
  * record on every connect.  (The retired bot password p| is never sent.)
@@ -920,32 +917,28 @@ static void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   int written;
   const bool hub_only = is_opt_set(state, OPT_HUB_ONLY_MUTATIONS);
 
-  // Channels.  Under opt 'h' only a key / mode this bot learned and could
-  // not yet hand to a hub goes out (enforcement writes are never gated, D43).
-  {
-    for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-      if (hub_only && !c->enf_pending)
-        continue;
-      if (c->timestamp == 0 && !c->is_managed)
-        continue; /* known only from its C| line: no c| of its own yet */
-      const char *op = c->is_managed ? "add" : "del";
-      log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
-                  c->name, c->is_managed, op, (long)c->timestamp);
-      if (c->key[0] != '\0') {
-        written = snprintf(buffer + offset, (size_t)(max_len - offset),
-                           "c|%s|%s|%d|%s|%ld\n",
-                           c->name, c->key, (int)c->modes, op,
-                           (long)c->timestamp);
-      } else {
-        written = snprintf(buffer + offset, (size_t)(max_len - offset),
-                           "c|%s||%d|%s|%ld\n",
-                           c->name, (int)c->modes, op,
-                           (long)c->timestamp);
-      }
-      if (written < 0 || written >= max_len - offset)
-        break;
-      offset += written;
-    }
+  // Channels (c|: existence and the admin's key; none under opt 'h'), then
+  // what this bot saw on IRC (K|, every opt: enforcement, D43).
+  for (chan_t *c = state->chanlist; c != NULL && !hub_only; c = c->next) {
+    if (c->timestamp == 0 && !c->is_managed)
+      continue; /* known only from its C| line: no c| of its own yet */
+    const char *op = c->is_managed ? "add" : "del";
+    log_message(L_DEBUG, state, "[HUB-PUSH] Channel %s: is_managed=%d op=%s ts=%ld\n",
+                c->name, c->is_managed, op, (long)c->timestamp);
+    written = snprintf(buffer + offset, (size_t)(max_len - offset),
+                       "c|%s|%s|%d|%s|%ld\n", c->name, c->ckey, (int)c->modes, op,
+                       (long)c->timestamp);
+    if (written < 0 || written >= max_len - offset)
+      break;
+    offset += written;
+  }
+  for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+    if (!c->is_managed || c->l_ts == 0)
+      continue;
+    written = chan_format_l(c, buffer + offset, (size_t)(max_len - offset));
+    if (written < 0)
+      break;
+    offset += written;
   }
 
   /* Bot-written bans (automatic bans) the hub has not got yet -- written
@@ -971,12 +964,9 @@ static void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
    * The hub manages a|/o|/m| records via CMD_ADMIN_* commands only. */
 
   /* Protocol capability (passwordless.md §3.4), sent on every push and under
-   * every opt.  The hub records it on this connection only (a downgraded
-   * binary on the next connect is never mistaken for v2), answers the first
-   * v >= 2 with a fresh config in the new a|/o|/b| shapes, and until then
-   * sends legacy shapes with an empty password slot, which this bot also
-   * parses.  (Bot->hub push namespace — unrelated to the v| vhost line in the
-   * local config file.)  The timestamp field is unused. */
+   * every opt.  The hub records it on this connection only and refuses a bot
+   * below BOT_PROTO_USER_FLAGS.  (Bot->hub push namespace — unrelated to the
+   * v| vhost line in the local config file.)  The timestamp field is unused. */
   written = snprintf(buffer + offset, (size_t)(max_len - offset), "v|%d|%d\n",
                      BOT_PROTO_VERSION, 1);
   if (written > 0 && written < max_len - offset) {
@@ -1014,6 +1004,20 @@ static void hub_client_generate_config_payload(bot_state_t *state, char *buffer,
   buffer[offset] = '\0';
 }
 
+/* +bitch (D12) on CMD_OP_GRANT: the hub's op for a bot (OP_FORWARD) or an
+ * old-style fan-out is refused for a nick that may not hold ops here, as
+ * chan_elect_do refuses it.  A nick not in our roster is not vouched for
+ * (fail closed). */
+static bool op_grant_bitch_refuses(bot_state_t *state, chan_t *c, const char *nick) {
+  if (!chancfg_get(state, c, CS_BITCH)) return false;
+  bool found = false;
+  bool auth = chan_member_authorised(state, c, nick, &found);
+  if (found && auth) return false;
+  log_message(L_INFO, state, "[HUB] Not granting ops to %s in %s: +bitch and %s\n",
+              nick, c->name, found ? "not authorised" : "not in my roster");
+  return true;
+}
+
 /**
  * Our own +o landed: grant the OP_GRANTs held while we had none, for nicks
  * still in the channel and not opped.  Older than OP_GRANT_HOLD_SECS: dropped.
@@ -1025,7 +1029,8 @@ void hub_client_grant_held_ops(bot_state_t *state, chan_t *c) {
       continue;
     for (int k = 0; k < c->roster_count; k++) {
       if (strcasecmp(c->roster[k].nick, c->op_grant_held[i].nick) == 0) {
-        if (!c->roster[k].is_op) {
+        if (!c->roster[k].is_op &&
+            !op_grant_bitch_refuses(state, c, c->op_grant_held[i].nick)) {
           log_message(L_INFO, state,
                       "[HUB] Granting ops to %s in %s (held hub request)\n",
                       c->op_grant_held[i].nick, c->name);
@@ -1278,53 +1283,21 @@ void hub_client_push_config(bot_state_t *state) {
   }
 }
 
-/* Push a single channel entry to hub after a live MODE change */
+/* Push what this bot saw on a channel (K|) after a live MODE change or a
+ * key another bot handed over.  Never c|: that would move the channel's
+ * existence stamp, and a delete it races would be undone. */
 void hub_client_push_channel(bot_state_t *state, chan_t *chan) {
   if (state->hub_count == 0 || state->hub_fd == -1 ||
-      !state->hub_authenticated)
+      !state->hub_authenticated || !chan->is_managed || chan->l_ts == 0)
     return;
-
-  const char *op = chan->is_managed ? "add" : "del";
-  char payload[MAX_BUFFER];
-  int pay_len;
-
-  if (chan->key[0] != '\0') {
-    pay_len = snprintf(payload, sizeof(payload), "c|%s|%s|%d|%s|%ld\n",
-                       chan->name, chan->key, (int)chan->modes, op,
-                       (long)chan->timestamp);
-  } else {
-    pay_len = snprintf(payload, sizeof(payload), "c|%s||%d|%s|%ld\n",
-                       chan->name, (int)chan->modes, op,
-                       (long)chan->timestamp);
+  char payload[MAX_CHAN + MAX_KEY + 48];
+  int pay_len = chan_format_l(chan, payload, sizeof(payload));
+  if (pay_len > 0 && hub_send_frame(state, CMD_CONFIG_PUSH, payload, pay_len)) {
+    chan->enf_pending = false;
+    log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
+                chan->name, (int)chan->modes);
   }
-
-  if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
-    return;
-
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_CONFIG_PUSH;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
-      chan->enf_pending = false;
-      log_message(L_INFO, state, "[HUB] Pushed channel %s modes=%d to hub\n",
-                  chan->name, (int)chan->modes);
-    } else {
-      log_message(L_INFO, state, "[HUB] Failed to push channel %s\n", chan->name);
-      hub_client_disconnect(state);
-    }
-  }
+  secure_wipe(payload, sizeof(payload));
 }
 
 /* Complete record lines ("B|...\n") to the hub as one CMD_CONFIG_PUSH.  The
@@ -1438,7 +1411,10 @@ bool hub_client_chan_event(bot_state_t *state, const char *chan,
 }
 
 /* PURGE|<cutoff>: drop tombstones (unmanaged channels, inactive user and
- * mask records) stamped before cutoff; 0 drops them all.  The hub sends it as
+ * mask records) stamped before cutoff; 0 drops them all.  Orphans go at
+ * every purge, as on the hubs: live bans and oper bindings of a channel no
+ * one manages, masks whose user is gone (a channel's K| and C| live in its
+ * chan_t and go with it).  The hub sends it as
  * its own CMD_CONFIG_DATA frame after the purged full config.  Channel
  * tombstones are merged, not replaced, by a config push, so only this line
  * removes them.  Returns the number of entries dropped (saved when > 0). */
@@ -1475,8 +1451,12 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
   }
 
   for (int i = 0; i < state->mask_record_count; i++) {
-    if (!state->mask_records[i].is_active &&
-        (cutoff == 0 || state->mask_records[i].timestamp < cutoff)) {
+    /* a mask whose user is gone is an orphan (irchub purge) */
+    bool owned = false;
+    for (int u = 0; u < state->user_record_count && !owned; u++)
+      owned = strcmp(state->user_records[u].uuid, state->mask_records[i].uuid) == 0;
+    if (!owned || (!state->mask_records[i].is_active &&
+                   (cutoff == 0 || state->mask_records[i].timestamp < cutoff))) {
       memmove(&state->mask_records[i], &state->mask_records[i + 1],
               (size_t)(state->mask_record_count - i - 1) * sizeof(mask_record_t));
       state->mask_record_count--;
@@ -1495,6 +1475,90 @@ static int hub_client_apply_purge(bot_state_t *state, const char *arg) {
     config_write_with_state_pass(state);
   }
   return purged;
+}
+
+/* A hub config replaces the user / mask / flag / binding tables wholesale;
+ * these find a rebuilt record's twin in the copy taken before, so only a
+ * real difference counts as an update (and costs a config write).  Every
+ * full config re-sends every record: counting them all rewrote the .cnf
+ * (a 600k-round KDF) on each push. */
+static const user_record_t *saved_user_find(const user_record_t *saved, int n,
+                                            const char *uuid) {
+  for (int i = 0; i < n; i++)
+    if (strcmp(saved[i].uuid, uuid) == 0) return &saved[i];
+  return NULL;
+}
+
+/* Persisted fields only; last_seen is compared by the caller. */
+static bool user_rec_same(const user_record_t *a, const user_record_t *b) {
+  return strcmp(a->name, b->name) == 0 &&
+         strcmp(a->pubkey_b64, b->pubkey_b64) == 0 &&
+         a->has_pubkey == b->has_pubkey && a->type == b->type &&
+         a->is_active == b->is_active && a->timestamp == b->timestamp;
+}
+
+static const mask_record_t *saved_mask_find(const mask_record_t *saved, int n,
+                                            const char *uuid, const char *mask) {
+  for (int i = 0; i < n; i++)
+    if (strcmp(saved[i].uuid, uuid) == 0 && strcasecmp(saved[i].mask, mask) == 0)
+      return &saved[i];
+  return NULL;
+}
+
+/* Records that differ from (or are missing in) the saved table, plus saved
+ * ones the rebuild dropped. */
+static int user_table_changes(const bot_state_t *state, const user_record_t *saved,
+                              int n) {
+  int changes = 0, matched = 0;
+  for (int i = 0; i < state->user_record_count; i++) {
+    const user_record_t *u = &state->user_records[i];
+    const user_record_t *w = saved_user_find(saved, n, u->uuid);
+    if (w) matched++;
+    if (!w || !user_rec_same(w, u) || w->last_seen != u->last_seen) changes++;
+  }
+  return changes + (n - matched);
+}
+
+static int mask_table_changes(const bot_state_t *state, const mask_record_t *saved,
+                              int n) {
+  int changes = 0, matched = 0;
+  for (int i = 0; i < state->mask_record_count; i++) {
+    const mask_record_t *m = &state->mask_records[i];
+    const mask_record_t *w = saved_mask_find(saved, n, m->uuid, m->mask);
+    if (w) matched++;
+    if (!w || w->is_active != m->is_active || w->timestamp != m->timestamp ||
+        w->last_used != m->last_used)
+      changes++;
+  }
+  return changes + (n - matched);
+}
+
+static int access_table_changes(const bot_state_t *state,
+                                const uflag_record_t *sf, int nf,
+                                const uchan_record_t *sc, int nc) {
+  int changes = 0, matched = 0;
+  for (int i = 0; i < state->uflag_record_count; i++) {
+    const uflag_record_t *f = &state->uflag_records[i];
+    const uflag_record_t *w = NULL;
+    for (int j = 0; j < nf && !w; j++)
+      if (strcmp(sf[j].uuid, f->uuid) == 0) w = &sf[j];
+    if (w) matched++;
+    if (!w || strcmp(w->flags, f->flags) != 0 || w->timestamp != f->timestamp)
+      changes++;
+  }
+  changes += nf - matched;
+  matched = 0;
+  for (int i = 0; i < state->uchan_record_count; i++) {
+    const uchan_record_t *c = &state->uchan_records[i];
+    const uchan_record_t *w = NULL;
+    for (int j = 0; j < nc && !w; j++)
+      if (strcmp(sc[j].uuid, c->uuid) == 0 && strcasecmp(sc[j].chan, c->chan) == 0)
+        w = &sc[j];
+    if (w) matched++;
+    if (!w || w->is_active != c->is_active || w->timestamp != c->timestamp)
+      changes++;
+  }
+  return changes + (nc - matched);
 }
 
 static void hub_client_process_config_data(bot_state_t *state, const char *payload) {
@@ -1529,6 +1593,13 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   int saved_mask_count = state->mask_record_count;
   memcpy(saved_users, state->user_records, sizeof(user_record_t) * (size_t)saved_user_count);
   memcpy(saved_masks, state->mask_records, sizeof(mask_record_t) * (size_t)saved_mask_count);
+  /* Static like work_buf below: single-threaded, non-reentrant. */
+  static uflag_record_t saved_uflags[MAX_USER_FLAGS];
+  static uchan_record_t saved_uchans[MAX_CHAN_BINDS];
+  int saved_uflag_count = state->uflag_record_count;
+  int saved_uchan_count = state->uchan_record_count;
+  memcpy(saved_uflags, state->uflag_records, sizeof(uflag_record_t) * (size_t)saved_uflag_count);
+  memcpy(saved_uchans, state->uchan_records, sizeof(uchan_record_t) * (size_t)saved_uchan_count);
   if (has_user_lines) state->user_record_count = 0;
   if (has_mask_lines) state->mask_record_count = 0;
   /* uf| / uc| (user_flags plan): the hub's set replaces ours like a|/o|/m|.
@@ -1573,11 +1644,9 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
 
     /* uf| / uc|: admin flags and oper channel bindings (access.c) */
     if (line[0] == 'u' && (line[1] == 'f' || line[1] == 'c') && line[2] == '|') {
-      bool changed = false;
-      if (!access_ingest(state, line[1], line + 3, false, &changed))
+      /* counted against the saved tables after the parse */
+      if (!access_ingest(state, line[1], line + 3, false, NULL))
         log_message(L_DEBUG, state, "[HUB-SYNC] Malformed %.2s| record ignored\n", line);
-      else if (changed)
-        updates++;
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -1633,16 +1702,13 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
           // New channel from hub
           c = channel_add(state, chan);
           if (c) {
-            if (key[0]) {
-              size_t len = strlen(key);
-              if (len >= MAX_KEY)
-                len = MAX_KEY - 1;
-              memcpy(c->key, key, len);
-              c->key[len] = '\0';
-            }
-            c->modes = (chan_mode_t)modes_val;
+            /* c| is existence and the admin's key; what the bots saw comes
+             * as K| (a 2.5.0 hub's modes field is still taken). */
+            snprintf(c->ckey, sizeof(c->ckey), "%s", key);
+            c->modes = (chan_mode_t)(modes_val & (M_K | M_I));
             c->is_managed = true;
             c->timestamp = ts;
+            chan_key_refresh(c);
             updates++;
             log_message(L_INFO, state, "[HUB] Added channel: %s\n", chan);
           }
@@ -1650,17 +1716,14 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
           // Compare timestamps (a same-second del beats an add: lww_accepts)
           if (lww_accepts((time_t)ts, is_add, c->timestamp, c->is_managed)) {
             // Hub has newer data
-            if (key[0]) {
-              size_t len = strlen(key);
-              if (len >= MAX_KEY)
-                len = MAX_KEY - 1;
-              memcpy(c->key, key, len);
-              c->key[len] = '\0';
-            }
-            c->modes = (chan_mode_t)modes_val;
+            snprintf(c->ckey, sizeof(c->ckey), "%s", key);
+            if (c->l_ts == 0) c->modes = (chan_mode_t)(modes_val & (M_K | M_I));
             bool was_managed = c->is_managed;
             c->is_managed = is_add;
             c->timestamp = ts;
+            /* what the bots saw goes with a deleted channel (no tombstone) */
+            if (!is_add) chan_learned_forget(c);
+            chan_key_refresh(c);
             updates++;
             log_message(L_INFO, state, "[HUB] Updated channel: %s (%s)\n", chan,
                         op);
@@ -1727,15 +1790,18 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
             found_m->is_active = is_active;
             if (last_used > found_m->last_used) found_m->last_used = last_used;
             found_m->timestamp = ts;
-            updates++;
-            log_message(L_INFO, state, "[HUB] Synced mask %s (%s)\n", mask_s, act);
+            /* counted after the parse; logged only when it changed */
+            const mask_record_t *was = saved_mask_find(saved_masks, saved_mask_count,
+                                                       uuid, mask_s);
+            if (!was || was->is_active != is_active || was->timestamp != ts)
+              log_message(L_INFO, state, "[HUB] Synced mask %s (%s)\n", mask_s, act);
           }
         }
       }
     } break;
 
-    case 'o': // Oper user record  } config_parse_user_line: new, or legacy
-    case 'a': // Admin user record }  (password slot dropped, key from field 7)
+    case 'o': // Oper user record  } config_parse_user_line
+    case 'a': // Admin user record }
     {
       user_line_t ul;
       if (!config_parse_user_line(data, &ul)) {
@@ -1765,10 +1831,13 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
         found_u->is_active = ul.is_active;
         if (ul.last_seen > found_u->last_seen) found_u->last_seen = ul.last_seen;
         found_u->timestamp = ul.timestamp;
-        updates++;
-        log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s%s)\n", ul.name,
-                    type, ul.is_active ? "add" : "del",
-                    ul.has_pubkey ? "" : ", no key");
+        /* counted after the parse; logged only when it changed */
+        const user_record_t *was = saved_user_find(saved_users, saved_user_count,
+                                                   ul.uuid);
+        if (!was || !user_rec_same(was, found_u))
+          log_message(L_INFO, state, "[HUB] Synced user %s (%c/%s%s)\n", ul.name,
+                      type, ul.is_active ? "add" : "del",
+                      ul.has_pubkey ? "" : ", no key");
       }
     } break;
 
@@ -1803,6 +1872,15 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
       }
     } break;
 
+    /* K|: what the bots saw on IRC.  Never existence: chan_learned_ingest
+     * takes it only for a channel managed here. */
+    case 'K':
+      if (chan_learned_ingest(state, data)) {
+        updates++;
+        log_message(L_DEBUG, state, "[HUB-SYNC] Learned channel state updated\n");
+      }
+      break;
+
     /* modes.md records.  Each is bounded and validated in chancfg.c; a line
      * that does not parse is dropped, one this build cannot use is kept. */
     case 'C':
@@ -1824,11 +1902,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
       }
       break;
 
-    case 'p': // Retired bot password (pre-passwordless hub): ignored
-      log_message(L_DEBUG, state, "[HUB-SYNC] Ignored retired p| line\n");
-      break;
-
-    case 'b': // Trusted bot: b|mask|uuid|pubkey|ts (legacy b|mask|uuid|ts)
+    case 'b': // Trusted bot: b|mask|uuid|pubkey|ts
     {
       trusted_bot_t in;
       if (!config_parse_bot_line(data, &in)) {
@@ -1872,13 +1946,12 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
         trusted_bot_t *ex = &state->trusted_bots[existing_idx];
         bool key_is_new = in.has_pub &&
             (!ex->has_pub || memcmp(ex->pub, in.pub, HUB_KEY_RAW_LEN) != 0);
-        /* ts = max(hostmask ts, key ts) on the hub, so a rekey alone bumps it;
-         * the equal-ts case covers a legacy-shaped line (no key) having been
-         * applied first under the same hostmask ts. */
+        /* ts = max(hostmask ts, key ts) on the hub, so a rekey alone bumps
+         * it; the equal-ts case takes a key that arrived after a keyless line
+         * under the same hostmask ts. */
         if (in.ts > ex->ts || (in.ts == ex->ts && key_is_new)) {
           if (!in.has_pub && ex->has_pub && strcmp(ex->uuid, in.uuid) == 0) {
-            /* Legacy-shaped line from a hub that has not seen our v|2 yet:
-             * it carries no key — keep the one we have. */
+            /* A keyless line for a bot whose key we hold: keep the key. */
             in.has_pub = true;
             memcpy(in.pub, ex->pub, HUB_KEY_RAW_LEN);
           }
@@ -1929,34 +2002,36 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   }
 
   /* Flags / bindings of users this payload dropped go; a user it brought
-   * without any (an older hub, an older bot's +admin / +oper) gets what it
-   * could do before flags (access_migrate). */
+   * without any gets what it could do before flags (access_migrate). */
   access_prune(state);
-  if (access_migrate(state) > 0) updates++;
+  access_migrate(state);
 
   /* Restore locally-updated last_seen / last_used timestamps that are newer
-   * than what the hub sent (e.g. from recent auths not yet flushed to hub). */
+   * than what the hub sent (e.g. from recent auths not yet flushed to hub),
+   * and the runtime-only fields the rebuild zeroed: an unsent CMD_ACTIVITY
+   * time and the ~A2K rate limit. */
   for (int i = 0; i < state->user_record_count; i++) {
     user_record_t *u = &state->user_records[i];
-    for (int j = 0; j < saved_user_count; j++) {
-      if (strcmp(saved_users[j].uuid, u->uuid) == 0) {
-        if (saved_users[j].last_seen > u->last_seen)
-          u->last_seen = saved_users[j].last_seen;
-        break;
-      }
-    }
+    const user_record_t *w = saved_user_find(saved_users, saved_user_count, u->uuid);
+    if (!w) continue;
+    if (w->last_seen > u->last_seen) u->last_seen = w->last_seen;
+    u->act_pending = w->act_pending;
+    u->last_auth_reply = w->last_auth_reply;
   }
   for (int i = 0; i < state->mask_record_count; i++) {
     mask_record_t *m = &state->mask_records[i];
-    for (int j = 0; j < saved_mask_count; j++) {
-      if (strcmp(saved_masks[j].uuid, m->uuid) == 0 &&
-          strcasecmp(saved_masks[j].mask, m->mask) == 0) {
-        if (saved_masks[j].last_used > m->last_used)
-          m->last_used = saved_masks[j].last_used;
-        break;
-      }
-    }
+    const mask_record_t *w = saved_mask_find(saved_masks, saved_mask_count,
+                                             m->uuid, m->mask);
+    if (!w) continue;
+    if (w->last_used > m->last_used) m->last_used = w->last_used;
+    m->act_pending = w->act_pending;
   }
+
+  /* Only what differs from before the replace is an update. */
+  updates += user_table_changes(state, saved_users, saved_user_count);
+  updates += mask_table_changes(state, saved_masks, saved_mask_count);
+  updates += access_table_changes(state, saved_uflags, saved_uflag_count,
+                                  saved_uchans, saved_uchan_count);
 
   if (updates > 0) {
     log_message(L_INFO, state, "[HUB] Applied %d config updates from hub\n",
@@ -2138,8 +2213,8 @@ static void user_chan_result(bot_state_t *state, const char *payload) {
   }
 }
 
-/* Requests the hub never answered (an older hub ignores the frame): ask the
- * trusted bots directly instead, once. */
+/* Requests the hub never answered (the link dropped, or the elected bot
+ * never reported): ask the trusted bots directly instead, once. */
 void hub_client_user_chan_tick(bot_state_t *state) {
   time_t now = time(NULL);
   for (int i = 0; i < USER_CHAN_PENDING; i++) {
@@ -2230,7 +2305,9 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       // Check if we're in that channel and have ops
       chan_t *c = channel_find(state, channel);
       if (c && c->status == C_IN) {
-        if (c->i_am_opped) {
+        if (op_grant_bitch_refuses(state, c, nick)) {
+          /* logged; not held either */
+        } else if (c->i_am_opped) {
           log_message(L_INFO, state,
                       "[HUB] Granting ops to %s in %s (hub request)\n", nick,
                       channel);
@@ -2752,7 +2829,7 @@ void hub_client_process(bot_state_t *state) {
           /* Activity reports held while the hub was unreachable. */
           hub_client_send_activity(state);
           if (state->admin_delta_pending) {
-            /* After the config push (so the hub already knows v|2).  LWW
+            /* After the config push (so the hub already knows our v|).  LWW
              * on the hub: only records changed here since carry a newer
              * timestamp and win; the rest are no-ops. */
             log_message(L_INFO, state, "[HUB] Pushing user/mask changes made "

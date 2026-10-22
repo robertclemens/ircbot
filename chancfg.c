@@ -526,7 +526,10 @@ int chancfg_purge_bans(bot_state_t *state, time_t cutoff) {
   int removed = 0;
   for (int i = 0; i < state->cfg_ban_count; i++) {
     cfg_ban_t *b = &state->cfg_bans[i];
-    if (!b->active && (cutoff == 0 || b->ts < cutoff)) {
+    /* a live ban of a channel no one manages is an orphan (irchub purge) */
+    const chan_t *c = strcmp(b->chan, "*") == 0 ? NULL : channel_find(state, b->chan);
+    bool orphan = b->active && strcmp(b->chan, "*") != 0 && (!c || !c->is_managed);
+    if (orphan || (!b->active && (cutoff == 0 || b->ts < cutoff))) {
       state->cfg_bans[i] = state->cfg_bans[--state->cfg_ban_count];
       removed++;
       i--;

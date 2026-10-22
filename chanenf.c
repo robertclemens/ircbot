@@ -253,18 +253,6 @@ typedef struct {
   char     id[64];
 } elig_t;
 
-static bool bot_too_old(const bot_state_t *state, const char *id) {
-  for (int i = 0; i < state->bot_tree_count; i++) {
-    const bot_tree_row_t *r = &state->bot_tree[i];
-    if (r->kind == 'h' || strcmp(r->uuid, id) != 0)
-      continue;
-    /* version unknown (empty) = keep it in the deal */
-    if (r->version[0] && updater_version_cmp(r->version, JOB_MIN_VERSION) < 0)
-      return true;
-  }
-  return false;
-}
-
 static bool elig_add(elig_t *el, int *n, const char *lc_chan, const char *id) {
   for (int i = 0; i < *n; i++)
     if (strcmp(el[i].id, id) == 0)
@@ -312,8 +300,6 @@ int chanenf_deal_rank(bot_state_t *state, const chan_t *c, int job) {
     if (!tb)
       continue;
     const char *id = tb->uuid[0] ? tb->uuid : tb->mask;
-    if (bot_too_old(state, id))
-      continue;
     elig_add(el, &n, lc, id);
   }
   /* sort: n is tiny */

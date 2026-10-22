@@ -251,12 +251,6 @@ bool updater_hub_rollback(bot_state_t *state, const char *reason) {
     log_message(L_INFO, state,
                 "[UPGRADE] Could not restore %s; keeping the current one\n",
                 prev_cfg);
-  /* The pre-2.5.0 pass file, only if this process rewrote it (the old
-   * build cannot read the new one). */
-  if (state->pass_prev_saved && rename(PASS_PREV_FILE, PASS_FILE) != 0)
-    log_message(L_INFO, state,
-                "[UPGRADE] Could not restore %s; keeping the current one\n",
-                PASS_PREV_FILE);
   if (rename(prev_exe, state->executable_path) != 0) {
     log_message(L_INFO, state, "[UPGRADE] Could not restore %s\n", prev_exe);
     return false;
@@ -523,15 +517,36 @@ static bool sanitize_filename(const char *input, char *output, size_t output_siz
   return len > 0;
 }
 
-/* A non-empty IRCBOT_UPDATE_BASE overrides the compiled release base URL.  The
- * sandboxed testnet uses it to read a local ircbot-releases tree via a file://
- * URL with no outbound network.  When set, validate_url() also accepts URLs
- * that begin with this base; the Ed25519 signature and SHA-256 checks stay
- * fully active — only the github/https host allow-list is relaxed, and only for
- * this explicitly-configured local base. */
+/* Test hook, compiled in only with -DIRC_TEST_HOOKS (the testnet's builds;
+ * never a release or a plain `make`): a non-empty IRCBOT_UPDATE_BASE
+ * overrides the compiled release ROOT (BOT_UPDATE_BASE) so the sandbox can
+ * read a local ircbot-releases tree over file://, and IRCBOT_UPDATE_PUBKEY
+ * then names the throwaway key that signs it.  A production binary has no
+ * code that reads either: its root and key are the compiled-in ones, so
+ * nobody who can set the daemon's environment can point it at their own
+ * signed releases.  Nothing a hub sends can set or move the root either. */
+#ifdef IRC_TEST_HOOKS
 static const char *updater_env_base(void) {
   const char *b = getenv("IRCBOT_UPDATE_BASE");
   return (b && b[0]) ? b : NULL;
+}
+#else
+static const char *updater_env_base(void) { return NULL; }
+#endif
+
+/* The release tree <root>/<variant> the next manifest read uses; "" = this
+ * build's own variant.  A hub-driven run or -checkupdate names the variant
+ * (updater_set_tree); the root is never the hub's to choose. */
+static char g_update_tree[600];
+
+static bool updater_set_tree(const char *variant) {
+  const char *root = updater_env_base();
+  if (!root) root = BOT_UPDATE_BASE;
+  if (!variant || !variant[0] || strlen(variant) > 7 ||
+      strpbrk(variant, "/;|&`$ \t\r\n"))
+    return false;
+  return snprintf(g_update_tree, sizeof(g_update_tree), "%s/%s", root,
+                  variant) < (int)sizeof(g_update_tree);
 }
 
 static bool validate_url(const char *url) {
@@ -566,14 +581,16 @@ static bool validate_url(const char *url) {
 static char *fetch_verified_manifest(const char **err) {
   *err = NULL;
 
-  /* Pinned key, unless the local-source override is active AND a test key is
-   * provided (sandbox only): IRCBOT_UPDATE_PUBKEY is honored solely when
-   * IRCBOT_UPDATE_BASE is set, so production always uses the compiled key. */
+  /* Pinned key.  Only a test-hooks build (see updater_env_base) takes a
+   * throwaway key from IRCBOT_UPDATE_PUBKEY, and only alongside
+   * IRCBOT_UPDATE_BASE. */
   const char *pubkey_b64 = BOT_UPDATE_PUBKEY_B64;
+#ifdef IRC_TEST_HOOKS
   if (updater_env_base()) {
     const char *ep = getenv("IRCBOT_UPDATE_PUBKEY");
     if (ep && ep[0]) pubkey_b64 = ep;
   }
+#endif
 
   /* Empty pinned key = updater intentionally disabled. */
   if (pubkey_b64[0] == '\0') {
@@ -594,15 +611,14 @@ static char *fetch_verified_manifest(const char **err) {
   http_response_t man;
   man.buffer = NULL;
   man.size = 0;
-  const char *ebase = updater_env_base();
-  char man_url[1024], sig_url[1024];
-  if (ebase) {
-    snprintf(man_url, sizeof(man_url), "%s/releases.txt", ebase);
-    snprintf(sig_url, sizeof(sig_url), "%s/releases.sig", ebase);
-  } else {
-    snprintf(man_url, sizeof(man_url), "%s", BOT_UPDATE_URL);
-    snprintf(sig_url, sizeof(sig_url), "%s", BOT_UPDATE_SIG_URL);
+  if (!g_update_tree[0] && !updater_set_tree(updater_host_variant())) {
+    free(pub);
+    *err = "release base URL too long";
+    return NULL;
   }
+  char man_url[1024], sig_url[1024];
+  snprintf(man_url, sizeof(man_url), "%s/releases.txt", g_update_tree);
+  snprintf(sig_url, sizeof(sig_url), "%s/releases.sig", g_update_tree);
   if (!fetch_url(man_url, &man)) {
     free(pub);
     if (man.buffer) free(man.buffer);
@@ -731,16 +747,15 @@ int updater_check_cli(const char *variant) {
     printf("checkupdate: FAIL malformed variant\n");
     return 1;
   }
-  if (!updater_env_base()) {
-    char tree[600];
-    snprintf(tree, sizeof(tree), "%s/%s", BOT_UPDATE_BASE, want);
-    setenv("IRCBOT_UPDATE_BASE", tree, 1);
+  if (!updater_set_tree(want)) {
+    printf("checkupdate: FAIL release base URL too long\n");
+    return 1;
   }
   const char *verr = NULL;
   char *manifest = fetch_verified_manifest(&verr);
   if (!manifest) {
     printf("checkupdate: FAIL %s (%s)\n", verr ? verr : "manifest fetch failed",
-           getenv("IRCBOT_UPDATE_BASE"));
+           g_update_tree);
     return 1;
   }
   int rows = 0;
@@ -1279,26 +1294,16 @@ static bool hub_local_check(const bot_state_t *state, const char *target_ver,
 }
 
 /* Point the updater at the tree a hub-driven run names: <root>/<variant>.
- * It travels the way the operator's env override does, so signature and
- * hash checks are unchanged — see updater_env_base(). */
-static bool hub_set_tree(const char *base, const char *want_variant,
-                         char *reason, size_t reason_size) {
-  /* The hub names the release tree ROOT; the variant picks the subtree.
-   * That is what lets one network-wide run leave each node on its own kind
-   * of build — and lets an admin move a node from the C build to the Rust
-   * one by naming the other variant. */
-  const char *root = (base && base[0]) ? base : BOT_UPDATE_BASE;
-  if (strlen(root) >= 512 || strpbrk(root, ";|&`$ \t\r\n")) {
-    snprintf(reason, reason_size, "rejected malformed manifest base from hub");
+ * The run picks only the variant — that is what lets one network-wide run
+ * leave each node on its own kind of build, and lets an admin move a node
+ * from the C build to the Rust one.  The root is this build's own (or the
+ * operator's env override): the only tree its pinned key can verify. */
+static bool hub_set_tree(const char *want_variant, char *reason,
+                         size_t reason_size) {
+  if (!updater_set_tree(want_variant)) {
+    snprintf(reason, reason_size, "rejected malformed release variant");
     return false;
   }
-  char tree[600];
-  if (snprintf(tree, sizeof(tree), "%s/%s", root, want_variant) >=
-      (int)sizeof(tree)) {
-    snprintf(reason, reason_size, "manifest base too long");
-    return false;
-  }
-  setenv("IRCBOT_UPDATE_BASE", tree, 1);
   return true;
 }
 
@@ -1309,14 +1314,13 @@ static bool hub_set_tree(const char *base, const char *want_variant,
  * asked in full up front. */
 bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                                const char *variant, const char *min_from,
-                               const char *base, char *reason,
-                               size_t reason_size) {
+                               char *reason, size_t reason_size) {
   reason[0] = '\0';
   const char *want_variant = (variant && variant[0]) ? variant
                                                      : updater_host_variant();
   if (!hub_local_check(state, target_ver, want_variant, min_from, reason,
                        reason_size) ||
-      !hub_set_tree(base, want_variant, reason, reason_size))
+      !hub_set_tree(want_variant, reason, reason_size))
     return false;
   const char *verr = NULL;
   g_fetch_quick = UPGRADE_QUICK_TIMEOUT;
@@ -1337,7 +1341,7 @@ bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
     const char *other = strcmp(want_variant, "c") == 0 ? "rs" : "c";
     char why_other[320] = "";
     if (strncmp(reason, "this CPU lacks ", 15) == 0 &&
-        hub_set_tree(base, other, why_other, sizeof(why_other))) {
+        hub_set_tree(other, why_other, sizeof(why_other))) {
       g_fetch_quick = UPGRADE_QUICK_TIMEOUT;
       char *om = fetch_verified_manifest(&verr);
       g_fetch_quick = 0;
@@ -1355,7 +1359,7 @@ bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                    other);
         }
       }
-      hub_set_tree(base, want_variant, why_other, sizeof(why_other));
+      hub_set_tree(want_variant, why_other, sizeof(why_other));
     }
     g_select_variant = NULL;
     return false;
@@ -1580,7 +1584,7 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
  * replaced and reports in after the restart. */
 bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
                         const char *target_ver, const char *variant,
-                        const char *base, const char **err) {
+                        const char **err) {
   *err = NULL;
   if (!state || !upgrade_id || !target_ver) {
     *err = "malformed upgrade command";
@@ -1592,7 +1596,7 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   static char why_local[320];
   if (!hub_local_check(state, target_ver, want_variant, "", why_local,
                        sizeof(why_local)) ||
-      !hub_set_tree(base, want_variant, why_local, sizeof(why_local))) {
+      !hub_set_tree(want_variant, why_local, sizeof(why_local))) {
     *err = why_local;
     return false;
   }
@@ -1649,10 +1653,13 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
 
   /* Run the NEW binary's -selftest before anything is swapped: CPU, libraries
    * and this very config, checked by the build that would have to run on
-   * them.  A target older than -selftest would take the flag for a normal
-   * start, so it is never run; a source build is checked by the script. */
-  bool can_selftest = updater_version_cmp(target_ver, UPGRADE_SELFTEST_MIN) >= 0;
-  if (can_selftest && strcasecmp(row.kind, "bin") == 0) {
+   * them; a source build is checked by the script. */
+  if (updater_version_cmp(target_ver, UPGRADE_TARGET_MIN) < 0) {
+    remove(archive);
+    *err = "target predates " UPGRADE_TARGET_MIN " and cannot read this config";
+    return false;
+  }
+  if (strcasecmp(row.kind, "bin") == 0) {
     static char st_err[320];
     if (!staged_selftest(archive, st_err, sizeof(st_err))) {
       remove(archive);
@@ -1701,7 +1708,7 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   }
   if (!upgrade_marker_write(upgrade_id, target_ver, want_variant, ops) ||
       !write_hub_upgrade_script(state, row.kind, archive, prev_exe,
-                                can_selftest)) {
+                                true)) {
     remove(UPGRADE_MARKER_FILE);
     rename(prev_exe, state->executable_path);
     remove(prev_cfg);
@@ -1744,17 +1751,16 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
 
 bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                                const char *variant, const char *min_from,
-                               const char *base, char *reason,
-                               size_t reason_size) {
-  (void)state; (void)target_ver; (void)variant; (void)min_from; (void)base;
+                               char *reason, size_t reason_size) {
+  (void)state; (void)target_ver; (void)variant; (void)min_from;
   snprintf(reason, reason_size, "bot compiled without curl support");
   return false;
 }
 
 bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
                         const char *target_ver, const char *variant,
-                        const char *base, const char **err) {
-  (void)state; (void)upgrade_id; (void)target_ver; (void)variant; (void)base;
+                        const char **err) {
+  (void)state; (void)upgrade_id; (void)target_ver; (void)variant;
   *err = "bot compiled without curl support";
   return false;
 }

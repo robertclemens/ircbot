@@ -444,9 +444,12 @@ void chan_access_accept_key(bot_state_t *state, const char *channel,
   }
   if (strcmp(c->key, key) == 0)
     return;
-
-  snprintf(c->key, sizeof(c->key), "%s", key);
-  c->timestamp = lww_next_ts(c->timestamp);
+  /* learned, never existence (K|): the c| stamp stays, so a delete this
+   * races is not undone */
+  if (!chan_learn(c, key, (int)c->modes | M_K)) {
+    log_message(L_INFO, state, "[CHANREQ] Malformed key for %s ignored\n", channel);
+    return;
+  }
   log_message(L_INFO, state, "[CHANREQ] Learned key for %s; retrying join\n",
               channel);
   hub_client_push_channel(state, c);
@@ -454,4 +457,84 @@ void chan_access_accept_key(bot_state_t *state, const char *channel,
 
   /* Go straight back in rather than waiting out JOIN_RETRY_TIME. */
   c->last_join_attempt = 0;
+}
+
+/* ---- K|: learned channel state ------------------------------------------ */
+void chan_key_refresh(chan_t *c) {
+  snprintf(c->key, sizeof(c->key), "%s", c->l_ts > c->timestamp ? c->lkey : c->ckey);
+}
+
+static bool learned_key_ok(const char *k) {
+  if (strlen(k) >= MAX_KEY) return false;
+  for (const unsigned char *p = (const unsigned char *)k; *p; p++)
+    if (*p <= 0x20 || *p == ',' || *p == '|' || *p >= 0x7f) return false;
+  return true;
+}
+
+bool chan_learn(chan_t *c, const char *key, int modes) {
+  if (!key || !learned_key_ok(key)) return false;
+  modes &= (M_K | M_I);
+  if (c->l_ts > 0 && strcmp(c->key, key) == 0 && (int)c->modes == modes) return false;
+  /* past the c| stamp as well: what was just seen is the key in use */
+  c->l_ts = lww_next_ts(c->l_ts > c->timestamp ? c->l_ts : c->timestamp);
+  snprintf(c->lkey, sizeof(c->lkey), "%s", key);
+  c->modes = (chan_mode_t)modes;
+  chan_key_refresh(c);
+  return true;
+}
+
+void chan_learned_forget(chan_t *c) {
+  secure_wipe(c->lkey, sizeof(c->lkey));
+  c->l_ts = 0;
+  c->modes = M_NONE;
+  chan_key_refresh(c);
+}
+
+bool chan_learned_ingest(bot_state_t *state, const char *body) {
+  char buf[MAX_CHAN + MAX_KEY + 48];
+  if (!body || strlen(body) >= sizeof(buf)) return false;
+  snprintf(buf, sizeof(buf), "%s", body);
+  bool ok = false;
+  char *f[4], *p = buf, *end = NULL;
+  for (int n = 0; n < 4; n++) {
+    f[n] = p;
+    char *bar = strchr(p, '|');
+    if (n < 3) {
+      if (!bar) goto out;
+      *bar = '\0';
+      p = bar + 1;
+    } else if (bar) {
+      goto out;
+    }
+  }
+  long modes = strtol(f[2], &end, 10);
+  if (end == f[2] || *end || modes < 0 || (modes & ~(long)(M_K | M_I))) goto out;
+  long long ts = strtoll(f[3], &end, 10);
+  if (end == f[3] || *end || ts <= 0 || !learned_key_ok(f[1])) goto out;
+  chan_t *c = channel_find(state, f[0]);
+  /* never existence: only for a channel managed here */
+  if (!c || !c->is_managed || (time_t)ts < c->l_ts) goto out;
+  if ((time_t)ts == c->l_ts) {
+    char in[MAX_KEY + 16], cur[MAX_KEY + 16];
+    snprintf(in, sizeof(in), "%s|%ld", f[1], modes);
+    snprintf(cur, sizeof(cur), "%s|%d", c->lkey, (int)c->modes);
+    bool newer = strcmp(in, cur) > 0;
+    secure_wipe(in, sizeof(in));
+    secure_wipe(cur, sizeof(cur));
+    if (!newer) goto out;
+  }
+  snprintf(c->lkey, sizeof(c->lkey), "%s", f[1]);
+  c->modes = (chan_mode_t)modes;
+  c->l_ts = (time_t)ts;
+  chan_key_refresh(c);
+  ok = true;
+out:
+  secure_wipe(buf, sizeof(buf));
+  return ok;
+}
+
+int chan_format_l(const chan_t *c, char *buf, size_t cap) {
+  int w = snprintf(buf, cap, "K|%s|%s|%d|%ld\n", c->name, c->lkey, (int)c->modes,
+                   (long)c->l_ts);
+  return (w < 0 || (size_t)w >= cap) ? -1 : w;
 }

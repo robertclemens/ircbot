@@ -224,8 +224,7 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   uuid[ul] = '\0';
   if (strncmp(bar + 1, "~B2 ", 4) != 0) {
     log_message(L_CMD, state,
-                "[BOT-COMM] Relayed frame from %s is not ~B2 (pre-passwordless "
-                "sender?); dropped\n", uuid);
+                "[BOT-COMM] Relayed frame from %s is not ~B2; dropped\n", uuid);
     return;
   }
   trusted_bot_t *tb = auth_trusted_bot_by_uuid(state, uuid);

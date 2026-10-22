@@ -698,8 +698,7 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
   /* --- Block 2: admin/oper (irchub/docs/passwordless.md §4) ---
    * ~A2A is the auth request, answered with a ~A2K lockbox and nothing else;
    * ~A2 / ~A2S carry a sealed command (~A2S: sealed replies).  Anything else
-   * — including the retired password formats ~A1 / ~A1c — is
-   * unauthenticated and dropped below. */
+   * is unauthenticated and dropped below. */
   /* §9.1: a host the msg / ctcp flood ignores (or quiet mode) gets nothing
    * from here on -- no auth reply, no command.  Authorised hosts never are. */
   if (botflood_host_ignored(state, user_host))
@@ -723,10 +722,6 @@ void commands_handle_private_message(bot_state_t *state, const char *nick,
     auth_user = a2_open_command(state, nick, user_host, dest, NULL,
                                 message + (sealed ? 5 : 4), sealed ? rk : NULL,
                                 cmd_plaintext, &cmd_line);
-  } else if (strncmp(message, "~A1", 3) == 0) {
-    log_message(L_CMD, state,
-                "[CMD] Retired password frame (~A1/~A1c) from %s; the client "
-                "script needs updating to the key-based ~A2\n", user_host);
   }
   /* Nothing past this point may run for an unauthenticated sender. */
   if (auth_user && cmd_line)
@@ -1518,9 +1513,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       }
       if (c) {
         if (arg2)
-          snprintf(c->key, MAX_KEY, "%s", arg2);
+          snprintf(c->ckey, MAX_KEY, "%s", arg2);
         c->is_managed = true;      // Mark as managed for syncing
-        c->timestamp = lww_next_ts(prev_ts);
+        c->timestamp = lww_next_ts(prev_ts > c->l_ts ? prev_ts : c->l_ts);
+        chan_key_refresh(c);
         log_message(L_DEBUG, state, "[JOIN] Channel %s: re-enabled ts=%ld\n",
                     channel_name, (long)c->timestamp);
       }
@@ -1543,7 +1539,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       if (c) {
         // Soft delete - mark as unmanaged instead of removing
         c->is_managed = false;
-        c->timestamp = lww_next_ts(c->timestamp);
+        c->timestamp = lww_next_ts(c->timestamp > c->l_ts ? c->timestamp : c->l_ts);
+        chan_learned_forget(c); /* what it saw goes with it (no tombstone) */
         /* its oper bindings go too, at the same stamp (user_flags U6) */
         access_chan_cascade(state, channel_name, c->timestamp);
         log_message(L_DEBUG, state, "[PART-OP] Channel %s: soft delete ts=%ld\n",

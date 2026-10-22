@@ -296,8 +296,8 @@ static bool passfile_create(const char *path, const char *password) {
     goto done;
   }
 
-  /* Written beside it and renamed over it, so a rewrite (-p, or the
-   * PBKDF2 migration at start) never leaves a half-written pass file. */
+  /* Written beside it and renamed over it, so a rewrite (-p) never leaves
+   * a half-written pass file. */
   char tmp[PATH_MAX];
   if (snprintf(tmp, sizeof(tmp), "%s.tmp", path) >= (int)sizeof(tmp)) {
     free(enc_buf);
@@ -323,40 +323,9 @@ done:
   return ok;
 }
 
-/* The deferred rewrite of a pre-2.5.0 pass file on an upgrade start (see
- * UPGRADE_PASS_REWRITE_SECS).  The old file is hard-linked to PASS_PREV_FILE
- * first; passfile_create() renames a new one over PASS_FILE, so the link keeps
- * the old bytes and mode.  One attempt: on failure the file stays readable as
- * it is and the next ordinary start rewrites it. */
-static void passfile_upgrade_tick(bot_state_t *s) {
-  if (!s->pass_rewrite_due || time(NULL) < s->pass_rewrite_due) return;
-  s->pass_rewrite_due = 0;
-  char pass[MAX_PASS];
-  bot_get_startup_pass(s, pass);
-  remove(PASS_PREV_FILE);
-  if (!pass[0] || link(PASS_FILE, PASS_PREV_FILE) != 0) {
-    log_message(L_INFO, s, "[CFG] %s kept at PBKDF2 %dk: could not keep a "
-                "copy for rollback\n", PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
-  } else if (passfile_create(PASS_FILE, pass)) {
-    s->pass_prev_saved = true;
-    log_message(L_INFO, s, "[CFG] %s rewritten with PBKDF2 %dk (old copy in "
-                "%s until the next ordinary start)\n", PASS_FILE,
-                PBKDF2_ITERATIONS / 1000, PASS_PREV_FILE);
-  } else {
-    remove(PASS_PREV_FILE);
-    log_message(L_INFO, s, "[CFG] %s kept at PBKDF2 %dk: rewrite failed\n",
-                PASS_FILE, PBKDF2_ITERATIONS_LEGACY / 1000);
-  }
-  secure_wipe(pass, sizeof(pass));
-}
-
-/* *legacy is set when the file only opened under PBKDF2_ITERATIONS_LEGACY
- * (written before 2.5.0); main() then rewrites it under the current count. */
-static bool passfile_load(const char *path, char *out_pass, size_t out_len,
-                          bool *legacy) {
+static bool passfile_load(const char *path, char *out_pass, size_t out_len) {
   struct stat st;
   bool ok = false;
-  if (legacy) *legacy = false;
 
   if (stat(path, &st) != 0) return false;
 
@@ -401,17 +370,13 @@ static bool passfile_load(const char *path, char *out_pass, size_t out_len,
   int dec_len = -1;
   if (passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS, key))
     dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
-  if (dec_len <= 0 &&
-      passfile_derive_key(ctx, salt, PBKDF2_ITERATIONS_LEGACY, key)) {
-    dec_len = crypto_aes_gcm_decrypt(enc_blk, enc_len, key, plain, tag);
-    if (dec_len > 0 && legacy) *legacy = true;
-  }
   if (dec_len > 0 && (size_t)dec_len < out_len) {
     plain[dec_len] = 0;
     memcpy(out_pass, plain, (size_t)dec_len + 1);
     ok = true;
   } else {
-    fprintf(stderr, "[WARN] %s: decryption failed (wrong machine or tampered file).\n", path);
+    fprintf(stderr, "[WARN] %s: decryption failed (wrong machine, tampered, or "
+            "written before 2.5.0).\n", path);
   }
 
   memset(plain, 0, (size_t)enc_len);
@@ -877,8 +842,12 @@ static int run_selftest(void) {
   }
   char pw[MAX_PASS];
   memset(pw, 0, sizeof(pw));
-  if (!passfile_load(PASS_FILE, pw, sizeof(pw), NULL)) {
-    printf("selftest: FAIL cannot read %s\n", PASS_FILE);
+  if (!passfile_load(PASS_FILE, pw, sizeof(pw))) {
+    /* 2.5.1 reads only the 600k key; a pass file 2.5.0 never got to rewrite
+     * (no ordinary start, or its deferred rewrite failed) is refused here so
+     * the upgrade reports it instead of leaving a bot that cannot start. */
+    printf("selftest: FAIL cannot read %s (written before 2.5.0? restart once "
+           "on 2.5.0, or rewrite it with -p)\n", PASS_FILE);
     return 1;
   }
   bot_state_t *st = calloc(1, sizeof(*st));
@@ -1013,9 +982,7 @@ int main(int argc, char *argv[]) {
   char startup_password[MAX_PASS];
   memset(startup_password, 0, sizeof(startup_password));
 
-  bool pass_legacy = false;
-  if (!passfile_load(PASS_FILE, startup_password, sizeof(startup_password),
-                     &pass_legacy)) {
+  if (!passfile_load(PASS_FILE, startup_password, sizeof(startup_password))) {
     get_password("Config Password", startup_password, sizeof(startup_password));
     if (!startup_password[0]) {
       fprintf(stderr, "No password provided.\n");
@@ -1025,25 +992,9 @@ int main(int argc, char *argv[]) {
 
   if (do_identity) return run_identity(startup_password);
 
-  /* A pre-2.5.0 pass file moves to the current PBKDF2 count on an ordinary
-   * start.  On the start a hub-driven upgrade made (its marker is still
-   * here) it waits UPGRADE_PASS_REWRITE_SECS, until the old build's watchdog
-   * is done with this process, and keeps the old copy for a rollback (see
-   * passfile_upgrade_tick).  An ordinary start drops any such copy left by an
-   * earlier run: a hub rollback is only ever for the process that made it. */
-  bool upgrade_start = (access(UPGRADE_MARKER_FILE, F_OK) == 0);
-  if (!upgrade_start) remove(PASS_PREV_FILE);
-  if (pass_legacy) {
-    if (upgrade_start)
-      printf("%s: rewritten with PBKDF2 %dk in %ds (upgrade in progress)\n",
-             PASS_FILE, PBKDF2_ITERATIONS / 1000, UPGRADE_PASS_REWRITE_SECS);
-    else if (passfile_create(PASS_FILE, startup_password))
-      printf("%s: rewritten with PBKDF2 %dk\n", PASS_FILE,
-             PBKDF2_ITERATIONS / 1000);
-    else
-      fprintf(stderr, "%s: could not rewrite with PBKDF2 %dk; still readable "
-              "as it is\n", PASS_FILE, PBKDF2_ITERATIONS / 1000);
-  }
+  /* The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
+   * it any more. */
+  remove(PASS_PREV_FILE);
 
   printf("%s %s\n", BOT_NAME, BOT_VERSION);
   fflush(stdout); /* or the buffered lines are written again by the fork */
@@ -1101,8 +1052,6 @@ int main(int argc, char *argv[]) {
   bot_set_startup_pass(&state, startup_password);
   memset(startup_password, 0, sizeof(startup_password));
   state.server_list[state.server_count] = NULL;
-  if (pass_legacy && upgrade_start)
-    state.pass_rewrite_due = time(NULL) + UPGRADE_PASS_REWRITE_SECS;
 
   // --- MAIN LOOP ---
   while (!(state.status & S_DIE) && !g_shutdown_flag) {
@@ -1111,7 +1060,6 @@ int main(int argc, char *argv[]) {
     commands_activity_tick(&state, time(NULL));
     chanenf_tick(&state);
     hub_client_upgrade_report_tick(&state);
-    passfile_upgrade_tick(&state);
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin

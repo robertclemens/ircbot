@@ -37,20 +37,17 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.5.0"
+#define BOT_VERSION "2.5.1"
 #endif
 
 // Only edit this section
 // #define DEFAULT_USER "ircbot"         // Default bot user
 #define VHOST "NULL" // NULL for default host, set for alternate
 #define PASS_FILE ".ircbot.pass"        // Machine-bound password file
-/* PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys.
- * 2.5.0 raised them from 100k (PBKDF2_ITERATIONS_LEGACY, OWASP's 2023 figure
- * is 600k).  A file still under the legacy count is read and rewritten once
- * (config_load / passfile_load); releases after 2.5.0 carry min_from 2.5.0 so
- * no node skips that rewrite. */
+/* PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
+ * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
+ * after it carry min_from 2.5.0, so only this count is read. */
 #define PBKDF2_ITERATIONS 600000
-#define PBKDF2_ITERATIONS_LEGACY 100000
 #define VERSION_RESPONSE                                                       \
   "A robot may not injure a human being" // This is the response to a CTCP
                                          // Version
@@ -65,7 +62,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Retained previous binary/config, kept (not deleted) after a hub-driven
  * upgrade so CMD_UPGRADE_ABORT can put the node back. */
 #define UPGRADE_PREV_SUFFIX ".prev"
-#define PASS_PREV_FILE PASS_FILE UPGRADE_PREV_SUFFIX /* the pre-2.5.0 pass kept for a rollback */
+#define PASS_PREV_FILE PASS_FILE UPGRADE_PREV_SUFFIX /* 2.5.0's rollback copy: removed at start */
 /* How long a CMD_UPGRADE_PREPARE stays commitable.  A hub that stalls
  * mid-roll has to ask again rather than commit against a stale plan. */
 #define UPGRADE_PREPARE_TTL 900
@@ -78,14 +75,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* The upgrade script's startup watchdog: how long the new build's daemon has
  * to be up before the script keeps it (mirrors irchub). */
 #define UPGRADE_WATCH_SECS 20
-/* A pre-2.5.0 PASS_FILE found on the start a hub-driven upgrade made is
- * rewritten at PBKDF2_ITERATIONS this long after that start: past the old
- * build's watchdog, which restores <exe>.prev and the config but not this
- * file.  The old copy stays as PASS_FILE UPGRADE_PREV_SUFFIX until the next
- * ordinary start, for this process's own hub-ordered rollback to put back. */
-#define UPGRADE_PASS_REWRITE_SECS 120
-_Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
-               "the pass rewrite must wait out the old build's watchdog");
 /* After an upgrade restart the bot holds its "ok" RESULT until it is back on
  * IRC and re-opped in every channel it was opped in before (the marker's ops
  * line), or this many seconds have passed — the hub refills its wave only
@@ -93,9 +82,9 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
 #define UPGRADE_OPS_WAIT 180
 /* The staged new binary's -selftest must finish within this many seconds. */
 #define UPGRADE_SELFTEST_SECS 15
-/* The first ircbot release that knows -selftest: an older target would take
- * the flag for a normal start, so its staged binary is never run. */
-#define UPGRADE_SELFTEST_MIN "2.4.5"
+/* The oldest upgrade target: an older build cannot read this config or pass
+ * file (PBKDF2 600k since 2.5.0). */
+#define UPGRADE_TARGET_MIN "2.5.0"
 /* Marker ops line capacity: channel names, space-separated. */
 #define UPGRADE_OPS_MAX 1024
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
@@ -110,11 +99,12 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
  * <maxbytes>'): same range the hub takes for CMD_ADMIN_SET_LOG_SIZE. */
 #define BOT_LOG_SIZE_MIN 1024L
 #define BOT_LOG_SIZE_MAX (1024L * 1024 * 1024)
-// Signed-release channel (ircbot-releases).  All of these are -D-overridable
-// (the testnet injects a throwaway signing key), and at RUNTIME the
-// IRCBOT_UPDATE_BASE env var repoints the updater at a local ircbot-releases
-// tree (see updater_env_base() in utils.c).  Empty pubkey DISABLES updates
-// (fail-closed).
+// Signed-release channel (ircbot-releases).  All of these are -D-overridable.
+// Empty pubkey DISABLES updates (fail-closed).  A hub-driven run never names a
+// base: a different release site means a different build with its own key and
+// root.  Only a -DIRC_TEST_HOOKS build (the testnet's) reads the
+// IRCBOT_UPDATE_BASE / IRCBOT_UPDATE_PUBKEY env overrides; see
+// updater_env_base() in utils.c.
 //
 // BOT_UPDATE_BASE is the tree ROOT; one variant subdirectory below it holds
 // that build's manifest.  Keeping the root separate is what lets a hub-driven
@@ -210,7 +200,7 @@ _Static_assert(UPGRADE_PASS_REWRITE_SECS > 3 * UPGRADE_WATCH_SECS,
  * ========================================================================== */
 #define CFG_GLOBAL_LINE_MAX 1088  /* key[32]+value[1024]+ts+seps */
 #define CFG_BOT_FIELD_LINE  320   /* per-bot line: capped value */
-#define CFG_USER_LINE_MAX   384   /* a|/o|: uuid+name+pubkey (legacy: +password) */
+#define CFG_USER_LINE_MAX   384   /* a|/o|: uuid+name+pubkey+stamps */
 #define CFG_MASK_LINE_MAX   352   /* m|: uuid+MAX_MASK_LEN */
 #define CFG_UF_LINE_MAX     96    /* uf|<uuid>|<flags>|<ts> */
 #define CFG_UC_LINE_MAX     160   /* uc|<uuid>|<chan>|add/del|<ts> */
@@ -511,8 +501,8 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  * re-checks the user and runs the channel-request election.
  *   CMD_USER_CHAN_REQUEST bot->hub  rid|kind|#chan|user_uuid|nick|nick!user@host
  *   CMD_USER_CHAN_RESULT  hub->bot  rid|ok|detail  or  rid|fail|detail
- * No answer within USER_CHAN_REPLY_WAIT (an older hub ignores the frame) and
- * the bot asks its trusted bots directly over ~B2 instead.  Mirrors
+ * No answer within USER_CHAN_REPLY_WAIT (the request was lost) and the bot
+ * asks its trusted bots directly over ~B2 instead.  Mirrors
  * irchub/hub.h. */
 #define CMD_USER_CHAN_REQUEST 0x7D
 #define CMD_USER_CHAN_RESULT  0x7E
@@ -604,8 +594,8 @@ typedef struct {
   /* Per-user Curve25519 combined pubkey (Ed25519 + X25519), base64-encoded
    * (88 chars + NUL) — the user's only credential: ~A2A signatures verify
    * against the Ed25519 half, ~A2 commands open with the X25519 half.  Empty
-   * (has_pubkey false) for a legacy record that has not been given a key yet;
-   * such a user can authenticate nowhere. */
+   * (has_pubkey false) for a user not given a key yet; such a user can
+   * authenticate nowhere. */
   char   pubkey_b64[COMBINED_KEY_B64 + 1];
   bool   has_pubkey;
   char   type;         /* 'a' = admin, 'o' = oper */
@@ -616,22 +606,20 @@ typedef struct {
   time_t act_pending;     /* runtime only: CMD_ACTIVITY time not yet sent */
 } user_record_t;
 
-/* Parsed a|/o| line body (config file, hub sync, bot push).  legacy is true
- * when the line carried a password in field 3 — it has already been wiped. */
+/* Parsed a|/o| line body (config file, hub sync, bot push). */
 typedef struct {
   char   uuid[37];
   char   name[64];
   char   pubkey_b64[COMBINED_KEY_B64 + 1];
   bool   has_pubkey;
   bool   is_active;
-  bool   legacy;
   time_t last_seen;
   time_t timestamp;
 } user_line_t;
 
 /* One trusted peer bot (b| line).  pub is the peer's combined Curve25519 key
  * (Ed25519 || X25519) used for ~B2; has_pub is false for entries that arrived
- * without one (a pre-passwordless hub, or a bare hand-typed mask). */
+ * without one (a bot not given a key yet). */
 typedef struct {
   char   mask[MAX_MASK_LEN];
   char   uuid[37];
@@ -864,7 +852,6 @@ typedef struct {
 #define JOB_COUNT  5
 #define JOB_STEP_MS        1500   /* backup delay = backup index x this */
 #define MAX_PENDING_JOBS   32
-#define JOB_MIN_VERSION    "2.4.7" /* older bots are left out of the deal */
 #define JOB_MAX_AGE_MS     30000   /* a pending job older than this is dropped */
 #define ENF_SWEEP_SECS     5       /* per-channel state sweep when nothing happened */
 /* Idle clocks (ban_track, heap): one per channel x listed ban, so a network
@@ -914,11 +901,19 @@ typedef struct { char key[MAX_CHAN + 8 + MAX_MASK_LEN]; long long when_ms; } enf
 
 struct chan_t {
   char name[MAX_CHAN];
+  /* The key the bot joins with: ckey (c|, the admin's) or lkey (K|, learned
+   * on IRC), whichever is newer -- chan_key_refresh() keeps it so. */
   char key[MAX_KEY];
   chan_status_t status;
-  chan_mode_t modes;
+  chan_mode_t modes;           /* K|: the +k/+i the bots saw */
   bool is_managed;
-  time_t timestamp;
+  time_t timestamp;            /* c| stamp: existence + ckey */
+  char ckey[MAX_KEY];
+  /* K| (irchub docs/plans/2026-10-20_learned_state_purge_plan.md): what
+   * the bots saw on IRC.  Never existence: a learned change never moves
+   * `timestamp`, so a delete it races is not undone.  l_ts 0 = none. */
+  char lkey[MAX_KEY];
+  time_t l_ts;
   time_t last_who_request;
   roster_entry_t roster[MAX_ROSTER_SIZE];
   int roster_count;
@@ -961,8 +956,7 @@ struct chan_t {
   bool   ban_list_known;       /* a full list was received */
   bool   ban_overflow_logged;
   bool   who_done;             /* the channel WHO finished (315) this stay */
-  /* A key / mode this bot learned and has not yet got to a hub: pushed in a
-   * full config push even under opt 'h' (D43). */
+  /* A key / mode this bot learned (K|) and has not yet got to a hub. */
   bool   enf_pending;
   /* chanflood.c: per-source flood windows, heap, MAX_FLOOD_TRACK slots,
    * allocated on the first counted event and freed by channel_live_reset. */
@@ -1272,18 +1266,12 @@ struct bot_state {
   char   upgrade_id[64];
   char   upgrade_target[64];
   char   upgrade_variant[8];
-  char   upgrade_base[512];
   time_t upgrade_prepared;
   /* The run whose build this process IS: read from UPGRADE_MARKER_FILE when
    * the upgraded binary first reports in.  An ABORT rolls back to <exe>.prev
    * only for this run — .prev otherwise holds the build from before some
    * earlier, completed run, and a bot that refused a COMMIT never moved. */
   char   upgrade_installed_id[64];
-  /* UPGRADE_PASS_REWRITE_SECS: when the deferred pass rewrite is due (0 =
-   * none), and whether this process saved PASS_FILE UPGRADE_PREV_SUFFIX —
-   * updater_hub_rollback() restores it only then, never a stale copy. */
-  time_t pass_rewrite_due;
-  bool   pass_prev_saved;
   /* The "ok" RESULT this restarted build owes its hub, held until it is back
    * where it was (see UPGRADE_OPS_WAIT): "" = nothing owed. */
   char   upgrade_report_id[64];
@@ -1372,6 +1360,16 @@ void config_notify_hub_if_changed(bot_state_t *state);
 chan_t *channel_add(bot_state_t *state, const char *name);
 bool channel_remove(bot_state_t *state, const char *name);
 chan_t *channel_find(const bot_state_t *state, const char *name);
+/* K| -- learned channel state (channel.c).  refresh: key = the newer of
+ * ckey@timestamp and lkey@l_ts (a tie keeps ckey).  learn: a key / +k+i this
+ * bot saw, stamped past both (false when nothing changed or the key is
+ * malformed).  forget: the channel went.  ingest: one "chan|key|modes|ts"
+ * body from a hub or the config (managed channels only).  format: the line. */
+void chan_key_refresh(chan_t *c);
+bool chan_learn(chan_t *c, const char *key, int modes);
+void chan_learned_forget(chan_t *c);
+bool chan_learned_ingest(bot_state_t *state, const char *body);
+int chan_format_l(const chan_t *c, char *buf, size_t cap);
 void channel_list_destroy(bot_state_t *state);
 void channel_list_reset_status(bot_state_t *state);
 void channel_manager_check_joins(bot_state_t *state);
@@ -1653,7 +1651,7 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
  * and reports the outcome after the restart. */
 bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
                         const char *target_ver, const char *variant,
-                        const char *base, const char **err);
+                        const char **err);
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / <config>.prev and restart onto
  * them.  Returns false when there is nothing retained to go back to. */
 bool updater_hub_rollback(bot_state_t *state, const char *reason);
@@ -1662,12 +1660,11 @@ bool updater_hub_rollback(bot_state_t *state, const char *reason);
  * artifact, min_from, unattended restart).  False with `reason` filled in. */
 bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                                const char *variant, const char *min_from,
-                               const char *base, char *reason,
-                               size_t reason_size);
+                               char *reason, size_t reason_size);
 bool upgrade_marker_write(const char *upgrade_id, const char *target_ver,
                           const char *variant, const char *ops);
 /* Reads and removes the hand-off marker left by updater_hub_commit():
- * id|version|variant ("" variant from an older build's two-field marker). */
+ * id|version|variant (variant may be empty). */
 bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
                                   size_t ver_size, char *variant_out,
                                   size_t variant_size, char *ops_out,
@@ -1706,8 +1703,7 @@ int crypto_hkdf_sha256(const unsigned char *ikm, size_t ikm_len,
                        const unsigned char *info, size_t info_len,
                        unsigned char *out, size_t out_len);
 /* Derive a 32-byte AES-256-GCM key from a password using PBKDF2-HMAC-SHA256
- * with the given rounds (PBKDF2_ITERATIONS, or PBKDF2_ITERATIONS_LEGACY to
- * read a pre-2.5.0 file). Returns true on success. */
+ * with the given rounds (PBKDF2_ITERATIONS). Returns true on success. */
 bool crypto_derive_config_key(const char *password, const unsigned char *salt,
                               int iterations, unsigned char out_key[32]);
 bool crypto_generate_combined_keypair(unsigned char priv_out[HUB_KEY_RAW_LEN],

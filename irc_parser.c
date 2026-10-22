@@ -57,12 +57,17 @@ static bool find_uuid_for_helper(const bot_state_t *state,
   return false;
 }
 
-// [UPDATED] Helper to handle mode changes securely + immediate Op Recovery
-static void channel_handle_mode_change(bot_state_t *state, const char *channel,
+// [UPDATED] Helper to handle mode changes securely + immediate Op Recovery.
+// True when a managed channel's learned key / +k+i changed (K|, to be pushed).
+static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
                                        const char *modes, char *args) {
   chan_t *c = channel_find(state, channel);
   if (!c)
-    return;
+    return false;
+  /* What this MODE shows of the key and +k/+i: learned (K|) at the end. */
+  char seen_key[MAX_KEY];
+  snprintf(seen_key, sizeof(seen_key), "%s", c->key);
+  int seen_modes = (int)c->modes;
 
   /* Live modes, key, limit, ban list and halfop/voice flags (chanlive.c) on
    * their own copy of the arguments: this function tokenises args in place. */
@@ -157,16 +162,15 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
       if (key_managed) {
         /* the mode job puts the stored key back; learn nothing */
       } else if (adding && current_arg) {
-        /* Store key and set M_K flag */
         size_t klen = strlen(current_arg);
         if (klen >= MAX_KEY) klen = MAX_KEY - 1;
-        memcpy(c->key, current_arg, klen);
-        c->key[klen] = '\0';
-        c->modes |= M_K;
+        memcpy(seen_key, current_arg, klen);
+        seen_key[klen] = '\0';
+        seen_modes |= M_K;
       } else if (!adding) {
         /* -k clears the key regardless of arg */
-        c->key[0] = '\0';
-        c->modes = (chan_mode_t)(c->modes & ~(unsigned)M_K);
+        seen_key[0] = '\0';
+        seen_modes &= ~M_K;
       }
       if (current_arg)
         current_arg = strtok_r(NULL, " ", &saveptr);
@@ -177,12 +181,17 @@ static void channel_handle_mode_change(bot_state_t *state, const char *channel,
       }
     } else if (mode == 'i') {
       if (adding)
-        c->modes |= M_I;
+        seen_modes |= M_I;
       else
-        c->modes = (chan_mode_t)(c->modes & ~(unsigned)M_I);
+        seen_modes &= ~M_I;
     }
     // --- Modes that NEVER take an argument (t, s, n, m, p, etc) ---
   }
+  /* Learned, never existence: the c| stamp stays, so a delete this MODE
+   * races is not undone (an unmanaged channel learns nothing). */
+  bool learned = c->is_managed && chan_learn(c, seen_key, seen_modes);
+  secure_wipe(seen_key, sizeof(seen_key));
+  return learned;
 }
 
 /* Record the bot's own hostmask.  Only two things may call this, and both hand
@@ -468,17 +477,15 @@ void parser_handle_line(bot_state_t *state, char *line) {
       char enf_args[1024];
       bool enf_ok = !args || strlen(args) < sizeof(enf_args);
       snprintf(enf_args, sizeof(enf_args), "%s", args ? args : "");
-      channel_handle_mode_change(state, target, modes, args);
+      bool learned = channel_handle_mode_change(state, target, modes, args);
       if (enf_ok)
         chanenf_on_mode(state, target, prefix, modes, enf_args);
-      /* Push key/invite-only changes to hub, and to our own config: with no
-       * hub to echo them back, a key we learned and saved must not outlive
+      /* Push key/invite-only changes to hub (K|), and to our own config: with
+       * no hub to echo them back, a key we learned and saved must not outlive
        * a -k. */
-      if (strchr(modes, 'k') || strchr(modes, 'i')) {
+      if (learned) {
         chan_t *mc = channel_find(state, target);
-        if (mc && mc->is_managed &&
-            (strchr(modes, 'i') || !chanenf_key_managed(state, mc))) {
-          mc->timestamp = lww_next_ts(mc->timestamp);
+        if (mc) {
           mc->enf_pending = true; /* cleared once a hub has it (D43) */
           hub_client_push_channel(state, mc);
           config_write_with_state_pass(state);

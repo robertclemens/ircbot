@@ -203,23 +203,27 @@ void chancmd_chanmode(bot_state_t *state, const char *nick,
     return;
   }
 
+  /* An admin's key is c|'s (compared with the key in use, learned or not). */
   bool key_changed = false;
   char old_key[MAX_KEY];
-  snprintf(old_key, sizeof(old_key), "%s", c->key);
+  snprintf(old_key, sizeof(old_key), "%s", c->ckey);
   if (key && strcmp(c->key, key) != 0) {
-    snprintf(c->key, sizeof(c->key), "%s", key);
+    snprintf(c->ckey, sizeof(c->ckey), "%s", key);
     key_changed = true;
-  } else if (key_clear && c->key[0]) {
-    c->key[0] = '\0';
+  } else if (key_clear && (c->key[0] || c->ckey[0])) {
+    /* -k also drops a stored key an operator's -k already made stale */
+    c->ckey[0] = '\0';
     key_changed = true;
   }
   if (!chancfg_local_c(state, c, stored, c->cfg_settings)) {
-    snprintf(c->key, sizeof(c->key), "%s", old_key);
+    snprintf(c->ckey, sizeof(c->ckey), "%s", old_key);
+    secure_wipe(old_key, sizeof(old_key));
     say(state, nick, "Error: could not store the modes.");
     return;
   }
   if (key_changed) {
-    c->timestamp = lww_next_ts(c->timestamp);
+    c->timestamp = lww_next_ts(c->timestamp > c->l_ts ? c->timestamp : c->l_ts);
+    chan_key_refresh(c);
     hub_client_push_config(state);
   }
   secure_wipe(old_key, sizeof(old_key));

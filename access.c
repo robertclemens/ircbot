@@ -301,6 +301,14 @@ int access_purge(bot_state_t *state, time_t cutoff) {
       dropped++;
       continue;
     }
+    /* a live binding to a channel no one manages is an orphan (irchub) */
+    if (r->is_active && strcmp(r->chan, "*") != 0) {
+      const chan_t *c = channel_find(state, r->chan);
+      if (!c || !c->is_managed) {
+        dropped++;
+        continue;
+      }
+    }
     state->uchan_records[o++] = *r;
   }
   state->uchan_record_count = o;
