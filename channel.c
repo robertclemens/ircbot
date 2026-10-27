@@ -7,6 +7,19 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
   if (channel_find(state, name)) {
     return NULL;
   }
+  /* A name that is not one channel ("#a,0" -- 0 parts every channel on most
+   * servers -- or one with a blank) never reaches a JOIN line. */
+  if (!valid_chan_name(name, strlen(name))) {
+    log_message(L_INFO, state, "[CHAN] Not a channel name, not added\n");
+    return NULL;
+  }
+  /* The hub holds at most this many channel rows (tombstones included); each
+   * chan_t is large, so an uncapped list let one config frame use up memory. */
+  if (state->chan_count >= CFG_MAX_CHANNELS) {
+    log_message(L_INFO, state, "[CHAN] Channel table full (%d): %s not added\n",
+                CFG_MAX_CHANNELS, name);
+    return NULL;
+  }
   chan_t *new_chan = calloc(1, sizeof(chan_t));
   if (!new_chan)
     handle_fatal_error("calloc failed");

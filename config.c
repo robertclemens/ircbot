@@ -7,6 +7,7 @@
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
 
@@ -130,6 +131,29 @@ static void gen_uuid_v4(char out[37]) {
  * migrate that config out from under the build that is still running. */
 bool g_config_readonly = false;
 
+/* Review 23: the config key, derived once per process (the first load or
+ * write) and reused.  A 600k-round PBKDF2 on every write froze the bot for
+ * ~0.5 s, and any chanop toggling +k/-k could trigger one.  The key is bound
+ * to the salt it was derived with, which every later write reuses under a
+ * fresh IV.  A process has one password (the startup one), so nothing else
+ * invalidates it; mlock'd like that password, wiped at shutdown. */
+static struct {
+  bool set;
+  unsigned char salt[SALT_SIZE];
+  unsigned char key[32];
+} g_cfg_key;
+
+static void cfg_key_keep(const unsigned char *salt, const unsigned char *key) {
+  if (!g_cfg_key.set) mlock(&g_cfg_key, sizeof(g_cfg_key));
+  memcpy(g_cfg_key.salt, salt, SALT_SIZE);
+  memcpy(g_cfg_key.key, key, sizeof(g_cfg_key.key));
+  g_cfg_key.set = true;
+}
+
+void config_key_forget(void) {
+  secure_wipe(&g_cfg_key, sizeof(g_cfg_key));
+}
+
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename) {
   struct stat cfg_st;
@@ -210,6 +234,7 @@ bool config_load(bot_state_t *state, const char *password,
       EVP_CIPHER_CTX_free(ctx);
     }
   }
+  if (final_rc > 0) cfg_key_keep(salt, key);
   secure_wipe(key, sizeof(key));
   free(ciphertext);
   if (final_rc <= 0) {
@@ -451,7 +476,9 @@ bool config_load(bot_state_t *state, const char *password,
                       "Curve25519 key. Re-run 'ircbot -setup' "
                       "to regenerate the bot's identity.\n");
         }
-        if (dec) { secure_wipe(dec, 64); free(dec); }
+        /* the decoded length, not 64: base64_decode allocates strlen(input),
+         * so a short k| value left a smaller buffer than the wipe */
+        if (dec) { if (dec_len > 0) secure_wipe(dec, (size_t)dec_len); free(dec); }
         break;
       }
 
@@ -756,9 +783,17 @@ static void config_write_file(const bot_state_t *state, const char *password) {
   unsigned char salt[SALT_SIZE];
   unsigned char key[32];
   unsigned char iv[GCM_IV_LEN];
-  if (RAND_bytes(salt, sizeof(salt)) != 1 ||
-      !crypto_derive_config_key(password, salt, PBKDF2_ITERATIONS, key) ||
-      RAND_bytes(iv, sizeof(iv)) != 1) {
+  bool key_ok;
+  if (g_cfg_key.set) {
+    memcpy(salt, g_cfg_key.salt, sizeof(salt));
+    memcpy(key, g_cfg_key.key, sizeof(key));
+    key_ok = true;
+  } else {
+    key_ok = RAND_bytes(salt, sizeof(salt)) == 1 &&
+             crypto_derive_config_key(password, salt, PBKDF2_ITERATIONS, key);
+    if (key_ok) cfg_key_keep(salt, key);
+  }
+  if (!key_ok || RAND_bytes(iv, sizeof(iv)) != 1) {
     fprintf(stderr, "[CFG] RNG/KDF failure; aborting config write.\n");
     secure_wipe(key, sizeof(key));
     secure_wipe(plaintext_overrides, (size_t)cap);

@@ -11,6 +11,8 @@
 #include <sys/select.h>
 #include <unistd.h>
 
+#include <openssl/x509v3.h>
+
 #include "bot.h"
 
 /* ---- Server refusals (bans / throttles) ----------------------------------
@@ -319,7 +321,18 @@ static int irc_pick_server(bot_state_t *state, time_t now) {
   return -1;
 }
 
+/* Bytes of an incomplete line, kept between reads of one connection.  File
+ * scope so irc_disconnect can drop them: kept across a reconnect (a ping
+ * timeout), a fragment was glued onto the next server's first line. */
+static char read_buffer[MAX_BUFFER * 2];
+static int buffer_len = 0;
+
 void irc_disconnect(bot_state_t *state) {
+  irc_dial_abort(state); /* a dial in flight goes with it */
+  buffer_len = 0;
+  read_buffer[0] = '\0';
+  state->overlong_nick[0] = '\0';
+  state->overlong_since = 0;
   /* Last chance for queued lines (a parting PRIVMSG, a restart notice) to go
    * out on whatever credit is left; a write error here already disconnected. */
   if ((state->status & S_CONNECTED) && state->server_fd != -1) {
@@ -394,7 +407,12 @@ int irc_printf(bot_state_t *state, const char *format, ...) {
   }
   if (state->a2r.active) {
     int r = a2r_seal_reply(state, buffer, len);
-    if (r != A2R_NOT_A_REPLY) return r;
+    if (r != A2R_NOT_A_REPLY) {
+      /* the reply went out sealed: its plaintext is not left on the stack
+       * (review 2026-10-25 L1) */
+      secure_wipe(buffer, (size_t)len);
+      return r;
+    }
   }
   return irc_send_line(state, buffer, len);
 }
@@ -491,7 +509,7 @@ static int irc_send_line(bot_state_t *state, const char *buffer, int len) {
 int irc_write_raw(bot_state_t *state, const char *buffer, int len) {
   if (!(state->status & S_CONNECTED)) return -1;
   if (!HIDEPINGPONG || !irc_line_is_keepalive(buffer))
-    log_message(L_RAW, state, "[RAW_SEND] %s", buffer);
+    log_raw(state, "[RAW_SEND] ", buffer);
   if (state->is_ssl) {
     int sent = SSL_write(state->ssl, buffer, len);
     if (sent <= 0) {
@@ -520,8 +538,103 @@ int irc_write_raw(bot_state_t *state, const char *buffer, int len) {
   }
 }
 
+/* Review 16: the IRC dial in flight.  irc_connect picks the server and
+ * starts it: each address of each port (the configured one, else 6667 then
+ * 6697 with TLS) gets a non-blocking connect, and a TLS port then a
+ * non-blocking handshake, both driven from the main loop (irc_dial_fill_fds,
+ * irc_dial_process) and bounded per step (irc_dial_tick: 10 s a connect, 15 s TLS).
+ * The blocking connect froze the bot up to 10 s per dead address, and the
+ * blocking SSL_connect had no bound at all.  server_fd stays -1 until the
+ * link is up, so nothing else sees a half-open one.  (Name resolution is
+ * still getaddrinfo, which blocks.) */
+#define IRC_DIAL_TIMEOUT 10 /* the connect, per address */
+#define IRC_TLS_TIMEOUT 15  /* the TLS handshake (the Rust bot's bound too) */
+static struct {
+  int fd;                    /* -1: no dial in flight */
+  bool tls;                  /* in the TLS handshake (else the connect) */
+  bool want_read;            /* the handshake waits for input, else output */
+  bool have_cas;             /* CA certificates were loaded for the check */
+  time_t started;            /* of the current step */
+  int flags;                 /* fcntl flags before O_NONBLOCK */
+  char host[256];
+  char port_cfg[16];
+  const char *ports[3];
+  int port_idx;
+  struct addrinfo *res, *ai; /* the port's addresses, the next to try */
+  struct sockaddr_storage vhost;
+  int vhost_family;
+} g_dial = {.fd = -1};
+
+static void dial_connected(bot_state_t *state);
+static void dial_tls_step(bot_state_t *state);
+static void dial_up(bot_state_t *state, bool tls);
+
+/* Close the address in flight (and its half-done TLS session). */
+static void dial_drop(bot_state_t *state) {
+  if (g_dial.tls) {
+    SSL_free(state->ssl);
+    state->ssl = NULL;
+    SSL_CTX_free(state->ssl_ctx);
+    state->ssl_ctx = NULL;
+  }
+  if (g_dial.fd >= 0) close(g_dial.fd);
+  g_dial.fd = -1;
+  g_dial.tls = false;
+}
+
+/* Start a connect to the next address that takes one, resolving the next
+ * port when this one's run out; nothing left: the attempt is over. */
+static void dial_next(bot_state_t *state) {
+  for (;;) {
+    while (g_dial.ai) {
+      struct addrinfo *p = g_dial.ai;
+      g_dial.ai = p->ai_next;
+      if (g_dial.vhost_family != AF_UNSPEC && p->ai_family != g_dial.vhost_family)
+        continue;
+      int sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol);
+      if (sockfd < 0) continue;
+      if (g_dial.vhost_family != AF_UNSPEC) {
+        socklen_t addr_len = (g_dial.vhost_family == AF_INET) ? sizeof(struct sockaddr_in)
+                                                              : sizeof(struct sockaddr_in6);
+        if (bind(sockfd, (struct sockaddr *)&g_dial.vhost, addr_len) < 0) {
+          log_message(L_INFO, state, "[WARN] Failed to bind VHOST %s: %s\n",
+                      state->vhost, strerror(errno));
+          close(sockfd);
+          continue;
+        }
+      }
+      g_dial.flags = fcntl(sockfd, F_GETFL, 0);
+      if (g_dial.flags < 0 || fcntl(sockfd, F_SETFL, g_dial.flags | O_NONBLOCK) < 0) {
+        close(sockfd);
+        continue;
+      }
+      int r = connect(sockfd, p->ai_addr, p->ai_addrlen);
+      if (r == 0 || errno == EINPROGRESS) {
+        g_dial.fd = sockfd;
+        g_dial.tls = false;
+        g_dial.started = time(NULL);
+        if (r == 0) dial_connected(state); /* connected at once (rare) */
+        return;
+      }
+      close(sockfd);
+    }
+    if (g_dial.res) freeaddrinfo(g_dial.res);
+    g_dial.res = NULL;
+    if (++g_dial.port_idx >= 3 || !g_dial.ports[g_dial.port_idx]) return;
+    log_message(L_INFO, state, "[INFO] Attempting to connect to %s:%s...\n",
+                g_dial.host, g_dial.ports[g_dial.port_idx]);
+    struct addrinfo hints;
+    memset(&hints, 0, sizeof(hints));
+    hints.ai_family = AF_UNSPEC;
+    hints.ai_socktype = SOCK_STREAM;
+    if (getaddrinfo(g_dial.host, g_dial.ports[g_dial.port_idx], &hints, &g_dial.res) != 0)
+      g_dial.res = NULL;
+    g_dial.ai = g_dial.res;
+  }
+}
+
 void irc_connect(bot_state_t *state) {
-  if (state->server_fd != -1) return;
+  if (state->server_fd != -1 || g_dial.fd >= 0) return;
   time_t attempt_now = time(NULL);
   int pick = irc_pick_server(state, attempt_now);
   if (pick < 0) return; /* everything held; irc_pick_server logged why */
@@ -544,27 +657,28 @@ void irc_connect(bot_state_t *state) {
   }
 
   // If port specified: only try that port. Otherwise try 6667, then 6697
-  const char *ports_to_try[3] = {NULL, NULL, NULL};
+  memset(g_dial.ports, 0, sizeof(g_dial.ports));
   if (port_from_config) {
-    ports_to_try[0] = port_from_config;
+    snprintf(g_dial.port_cfg, sizeof(g_dial.port_cfg), "%s", port_from_config);
+    g_dial.ports[0] = g_dial.port_cfg;
   } else {
-    ports_to_try[0] = "6667";
-    ports_to_try[1] = "6697";
+    g_dial.ports[0] = "6667";
+    g_dial.ports[1] = "6697";
   }
+  snprintf(g_dial.host, sizeof(g_dial.host), "%s", host);
 
-  struct sockaddr_storage vhost_addr;
-  int vhost_family = AF_UNSPEC;
-
+  g_dial.vhost_family = AF_UNSPEC;
+  memset(&g_dial.vhost, 0, sizeof(g_dial.vhost));
   if (state->vhost[0] != '\0' && strcasecmp(state->vhost, "NULL") != 0) {
-      struct sockaddr_in *v4 = (struct sockaddr_in *)&vhost_addr;
-      struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&vhost_addr;
+      struct sockaddr_in *v4 = (struct sockaddr_in *)&g_dial.vhost;
+      struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&g_dial.vhost;
 
       if (inet_pton(AF_INET, state->vhost, &v4->sin_addr) == 1) {
-          vhost_family = AF_INET;
+          g_dial.vhost_family = AF_INET;
           v4->sin_family = AF_INET;
           v4->sin_port = 0;
       } else if (inet_pton(AF_INET6, state->vhost, &v6->sin6_addr) == 1) {
-          vhost_family = AF_INET6;
+          g_dial.vhost_family = AF_INET6;
           v6->sin6_family = AF_INET6;
           v6->sin6_port = 0;
       } else {
@@ -572,135 +686,191 @@ void irc_connect(bot_state_t *state) {
       }
   }
 
-  int sockfd = -1;
-  for (int i = 0; ports_to_try[i] != NULL && sockfd == -1; i++) {
-    log_message(L_INFO, state, "[INFO] Attempting to connect to %s:%s...\n",
-                host, ports_to_try[i]);
-
-    struct addrinfo hints, *res;
-    memset(&hints, 0, sizeof(hints));
-    hints.ai_family = AF_UNSPEC;
-    hints.ai_socktype = SOCK_STREAM;
-
-    if (getaddrinfo(host, ports_to_try[i], &hints, &res) != 0) continue;
-
-    for (struct addrinfo *p = res; p != NULL; p = p->ai_next) {
-
-      if (vhost_family != AF_UNSPEC && p->ai_family != vhost_family) {
-          continue;
-      }
-
-      if ((sockfd = socket(p->ai_family, p->ai_socktype, p->ai_protocol)) < 0)
-        continue;
-
-      if (vhost_family != AF_UNSPEC) {
-            socklen_t addr_len = (vhost_family == AF_INET) ? sizeof(struct sockaddr_in)
-                                                           : sizeof(struct sockaddr_in6);
-
-            if (bind(sockfd, (struct sockaddr*)&vhost_addr, addr_len) < 0) {
-                log_message(L_INFO, state, "[WARN] Failed to bind VHOST %s: %s\n",
-                            state->vhost, strerror(errno));
-                close(sockfd);
-                sockfd = -1;
-                continue;
-            }
-      }
-
-      // Set socket to non-blocking for connect timeout
-      int flags = fcntl(sockfd, F_GETFL, 0);
-      fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-
-      int conn_result = connect(sockfd, p->ai_addr, p->ai_addrlen);
-      bool connected = false;
-
-      if (conn_result == 0) {
-        // Connected immediately (rare)
-        connected = true;
-      } else if (errno == EINPROGRESS) {
-        // Connection in progress, wait with timeout
-        fd_set writefds;
-        struct timeval timeout;
-        FD_ZERO(&writefds);
-        FD_SET(sockfd, &writefds);
-        timeout.tv_sec = 10;  // 10 second timeout
-        timeout.tv_usec = 0;
-
-        int select_result = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
-        if (select_result > 0) {
-          // Check if connection succeeded
-          int so_error;
-          socklen_t len = sizeof(so_error);
-          getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &len);
-          if (so_error == 0) {
-            connected = true;
-          }
-        } else if (select_result == 0) {
-          log_message(L_INFO, state,
-                      "[INFO] Connection timeout after 10 seconds.\n");
-        }
-      }
-
-      if (connected) {
-        // Set back to blocking mode
-        fcntl(sockfd, F_SETFL, flags);
-
-        // Try TLS if connecting to port 6697
-        if (strcmp(ports_to_try[i], "6697") == 0) {
-          state->ssl_ctx = SSL_CTX_new(TLS_client_method());
-          if (!state->ssl_ctx) {
-            close(sockfd);
-            sockfd = -1;
-            continue;
-          }
-          state->ssl = SSL_new(state->ssl_ctx);
-          SSL_set_fd(state->ssl, sockfd);
-          if (SSL_connect(state->ssl) == 1) {
-            state->is_ssl = true;
-            log_message(L_INFO, state,
-                        "[INFO] Secure TLS connection established.\n");
-          } else {
-            log_message(L_INFO, state,
-                        "[INFO] SSL handshake failed. Trying insecure.\n");
-            SSL_free(state->ssl);
-            state->ssl = NULL;
-            SSL_CTX_free(state->ssl_ctx);
-            state->ssl_ctx = NULL;
-            close(sockfd);
-            sockfd = -1;
-          }
-        } else {
-          state->is_ssl = false;
-          log_message(L_INFO, state,
-                      "[INFO] Insecure connection established.\n");
-        }
-        break;
-      }
-      close(sockfd);
-      sockfd = -1;
-    }
-    freeaddrinfo(res);
-  }
-
-  if (sockfd != -1) {
-    state->server_fd = sockfd;
-    sendq_clear(state); /* new link: empty queue, full burst */
-    isupport_reset(state);
-    state->status = S_CONNECTED;
-    state->last_pong_time = time(NULL);
-    state->pong_pending = false;
-    state->connection_time = time(NULL);
-    snprintf(state->current_nick, sizeof(state->current_nick), "%s",
-             state->target_nick);
-    irc_printf(state, "NICK %s\r\n", state->current_nick);
-    irc_printf(state, "USER %s 0 * :%s\r\n", state->user, state->gecos);
-  }
+  g_dial.port_idx = -1;
+  g_dial.res = g_dial.ai = NULL;
+  dial_next(state);
   state->current_server_index++;
 }
 
-void irc_handle_read(bot_state_t *state) {
-  static char read_buffer[MAX_BUFFER * 2];
-  static int buffer_len = 0;
+/* Review 9: the CA certificates the server's chain is checked against:
+ * OpenSSL's own default locations, and the first bundle found at the usual
+ * paths (a static build does not know the host's layout).  False when none
+ * could be loaded -- every server then reads as unverified. */
+static bool tls_load_cas(SSL_CTX *ctx) {
+  static const char *const bundles[] = {
+      "/etc/ssl/certs/ca-certificates.crt", /* Debian, Ubuntu, Alpine */
+      "/etc/pki/tls/certs/ca-bundle.crt",   /* RHEL, Rocky, Fedora */
+      "/etc/ssl/ca-bundle.pem",             /* openSUSE */
+      "/etc/ssl/cert.pem",                  /* BSDs, macOS, Alpine */
+  };
+  SSL_CTX_set_default_verify_paths(ctx);
+  for (size_t i = 0; i < sizeof(bundles) / sizeof(bundles[0]); i++)
+    if (access(bundles[i], R_OK) == 0 && SSL_CTX_load_verify_locations(ctx, bundles[i], NULL) == 1)
+      break;
+  ERR_clear_error(); /* a missing default path is not this link's error */
+  return sk_X509_OBJECT_num(X509_STORE_get0_objects(SSL_CTX_get_cert_store(ctx))) > 0;
+}
 
+/* Review 9: the handshake is done; was the certificate good?  The chain was
+ * checked with SSL_VERIFY_NONE, so a failure is only recorded: the link stays
+ * up (IRC networks run self-signed certificates) and the log and `status`
+ * say so. */
+static void tls_check_result(bot_state_t *state, bool have_cas) {
+#if OPENSSL_VERSION_NUMBER >= 0x30000000L
+  X509 *cert = SSL_get1_peer_certificate(state->ssl);
+#else
+  X509 *cert = SSL_get_peer_certificate(state->ssl);
+#endif
+  long vr = SSL_get_verify_result(state->ssl);
+  state->irc_tls_verified = cert && vr == X509_V_OK;
+  snprintf(state->irc_tls_why, sizeof(state->irc_tls_why), "%s",
+           !cert ? "no certificate" : !have_cas ? "no CA certificates on this host"
+                                                : X509_verify_cert_error_string(vr));
+  X509_free(cert);
+  if (state->irc_tls_verified)
+    log_message(L_INFO, state, "[INFO] TLS certificate of %s verified.\n", g_dial.host);
+  else
+    log_message(L_INFO, state,
+                "[WARN] TLS certificate of %s NOT verified (%s): the link is encrypted, "
+                "but the server's identity is unchecked.\n",
+                g_dial.host, state->irc_tls_why);
+}
+
+/* The connect finished: a TLS port starts its handshake, any other is up. */
+static void dial_connected(bot_state_t *state) {
+  if (strcmp(g_dial.ports[g_dial.port_idx], "6697") != 0) {
+    dial_up(state, false);
+    return;
+  }
+  state->ssl_ctx = SSL_CTX_new(TLS_client_method());
+  if (state->ssl_ctx) {
+    SSL_CTX_set_verify(state->ssl_ctx, SSL_VERIFY_NONE, NULL); /* checked, not enforced */
+    g_dial.have_cas = tls_load_cas(state->ssl_ctx);
+  }
+  state->ssl = state->ssl_ctx ? SSL_new(state->ssl_ctx) : NULL;
+  if (state->ssl) {
+    /* the name the certificate must carry: an address literal as an IP SAN,
+     * else a host name (sent as SNI too) */
+    unsigned char ipbuf[16];
+    bool is_ip = inet_pton(AF_INET, g_dial.host, ipbuf) == 1 ||
+                 inet_pton(AF_INET6, g_dial.host, ipbuf) == 1;
+    if (is_ip) {
+      X509_VERIFY_PARAM_set1_ip_asc(SSL_get0_param(state->ssl), g_dial.host);
+    } else {
+      SSL_set_tlsext_host_name(state->ssl, g_dial.host);
+      SSL_set1_host(state->ssl, g_dial.host);
+    }
+  }
+  if (!state->ssl || SSL_set_fd(state->ssl, g_dial.fd) != 1) {
+    g_dial.tls = true; /* so dial_drop frees what was made */
+    dial_drop(state);
+    g_dial.ai = NULL; /* as before: a failed TLS port is not tried further */
+    dial_next(state);
+    return;
+  }
+  g_dial.tls = true;
+  g_dial.started = time(NULL);
+  dial_tls_step(state);
+}
+
+/* One non-blocking step of the TLS handshake. */
+static void dial_tls_step(bot_state_t *state) {
+  int r = SSL_connect(state->ssl);
+  if (r == 1) {
+    log_message(L_INFO, state, "[INFO] Secure TLS connection established.\n");
+    tls_check_result(state, g_dial.have_cas);
+    dial_up(state, true);
+    return;
+  }
+  int err = SSL_get_error(state->ssl, r);
+  if (err == SSL_ERROR_WANT_READ || err == SSL_ERROR_WANT_WRITE) {
+    g_dial.want_read = err == SSL_ERROR_WANT_READ;
+    return;
+  }
+  log_message(L_INFO, state, "[INFO] SSL handshake failed. Trying insecure.\n");
+  dial_drop(state);
+  g_dial.ai = NULL; /* as before: a failed TLS port is not tried further */
+  dial_next(state);
+}
+
+/* Up: back to a blocking socket (the reads and writes are as before) and
+ * the registration goes out. */
+static void dial_up(bot_state_t *state, bool tls) {
+  int sockfd = g_dial.fd;
+  fcntl(sockfd, F_SETFL, g_dial.flags);
+  g_dial.fd = -1;
+  g_dial.tls = false;
+  if (g_dial.res) freeaddrinfo(g_dial.res);
+  g_dial.res = g_dial.ai = NULL;
+  state->is_ssl = tls;
+  if (!tls) {
+    state->irc_tls_verified = false;
+    state->irc_tls_why[0] = '\0';
+    log_message(L_INFO, state, "[INFO] Insecure connection established.\n");
+  }
+
+  state->server_fd = sockfd;
+  sendq_clear(state); /* new link: empty queue, full burst */
+  isupport_reset(state);
+  state->status = S_CONNECTED;
+  state->last_pong_time = time(NULL);
+  state->pong_pending = false;
+  state->connection_time = time(NULL);
+  snprintf(state->current_nick, sizeof(state->current_nick), "%s",
+           state->target_nick);
+  irc_printf(state, "NICK %s\r\n", state->current_nick);
+  irc_printf(state, "USER %s 0 * :%s\r\n", state->user, state->gecos);
+}
+
+void irc_dial_fill_fds(bot_state_t *state, fd_set *rfds, fd_set *wfds, int *max_fd) {
+  (void)state;
+  if (g_dial.fd < 0) return;
+  FD_SET(g_dial.fd, g_dial.tls && g_dial.want_read ? rfds : wfds);
+  if (g_dial.fd > *max_fd) *max_fd = g_dial.fd;
+}
+
+void irc_dial_process(bot_state_t *state, const fd_set *rfds, const fd_set *wfds) {
+  if (g_dial.fd < 0 || !(fd_isset(g_dial.fd, rfds) || fd_isset(g_dial.fd, wfds))) return;
+  if (g_dial.tls) {
+    dial_tls_step(state);
+    return;
+  }
+  int err = 0;
+  socklen_t el = sizeof(err);
+  if (getsockopt(g_dial.fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
+  if (err == 0) {
+    dial_connected(state);
+  } else {
+    dial_drop(state);
+    dial_next(state);
+  }
+}
+
+/* A step that has not finished in its bound: on to the next address. */
+void irc_dial_tick(bot_state_t *state) {
+  int bound = g_dial.tls ? IRC_TLS_TIMEOUT : IRC_DIAL_TIMEOUT;
+  if (g_dial.fd < 0 || time(NULL) - g_dial.started <= bound) return;
+  log_message(L_INFO, state, g_dial.tls ? "[INFO] TLS handshake timeout after %d seconds.\n"
+                                        : "[INFO] Connection timeout after %d seconds.\n",
+              bound);
+  if (g_dial.tls) g_dial.ai = NULL; /* a TLS port that stalls, as one that fails */
+  dial_drop(state);
+  dial_next(state);
+}
+
+bool irc_dialing(const bot_state_t *state) {
+  (void)state;
+  return g_dial.fd >= 0;
+}
+
+/* Give the dial up entirely (a disconnect, a server change, shutdown). */
+void irc_dial_abort(bot_state_t *state) {
+  dial_drop(state);
+  if (g_dial.res) freeaddrinfo(g_dial.res);
+  g_dial.res = g_dial.ai = NULL;
+}
+
+void irc_handle_read(bot_state_t *state) {
   if (buffer_len >= (int)(sizeof(read_buffer) - 1)) {
       log_message(L_INFO, state, "[WARN] Receive buffer full (line too long). Flushing buffer.\n");
       buffer_len = 0;
@@ -715,7 +885,6 @@ void irc_handle_read(bot_state_t *state) {
       if (ssl_err != SSL_ERROR_WANT_READ && ssl_err != SSL_ERROR_WANT_WRITE) {
         if (ssl_err != SSL_ERROR_ZERO_RETURN) ERR_print_errors_fp(stderr);
         irc_disconnect(state);
-        buffer_len = 0;
       }
       return;
     }
@@ -725,7 +894,6 @@ void irc_handle_read(bot_state_t *state) {
     if (bytes_read <= 0) {
       if (bytes_read == 0 || (!IO_WOULD_BLOCK(errno) && errno != EINTR)) {
         irc_disconnect(state);
-        buffer_len = 0;
       }
       return;
     }
@@ -741,7 +909,7 @@ void irc_handle_read(bot_state_t *state) {
   while ((line_end = strstr(line_start, "\r\n")) != NULL) {
     *line_end = '\0';
     if (!HIDEPINGPONG || !irc_line_is_keepalive(line_start))
-      log_message(L_RAW, state, "[RAW_RECV] %s\n", line_start);
+      log_raw(state, "[RAW_RECV] ", line_start);
     parser_handle_line(state, line_start);
     line_start = line_end + 2;
   }
@@ -765,14 +933,19 @@ void irc_check_status(bot_state_t *state) {
     // the hub connection has likely "zombied" or the network path is dead.
     if (now - state->last_hub_activity > 120) {
       log_message(L_INFO, state, "[HUB] Connection timed out (Watchdog). Reconnecting...\n");
-      
-      close(state->hub_fd);
-      state->hub_fd = -1;
-      state->hub_connected = false;
-      state->hub_authenticated = false;
-      state->hub_connecting = false;
+      /* the full teardown (session key wiped, auth state reset), keeping the
+       * retry timing the watchdog always had */
+      time_t last_attempt = state->last_hub_connect_attempt;
+      hub_client_disconnect(state);
+      state->last_hub_connect_attempt = last_attempt;
       // Note: the main loop's hub_client_connect() will handle the retry logic
     }
+  } else if (state->hub_count > 0 && state->hub_fd != -1 && !state->hub_authenticated &&
+             now - state->last_hub_connect_attempt > HUB_AUTH_TIMEOUT &&
+             !hub_client_data_waiting(state)) {
+    log_message(L_INFO, state, "[HUB] Handshake not finished in %d s — dropping the link\n",
+                HUB_AUTH_TIMEOUT);
+    hub_client_disconnect(state);
   }
 
   // --- IRC SERVER STATUS ---
@@ -781,7 +954,8 @@ void irc_check_status(bot_state_t *state) {
      * registration is redialled every main-loop tick (~1 s) -- the pattern
      * that gets a host throttled and then Z-lined.  Per-server ban/throttle
      * holds are applied inside irc_connect(). */
-    if (now - state->last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL)
+    irc_dial_tick(state);
+    if (!irc_dialing(state) && now - state->last_irc_attempt >= IRC_RECONNECT_MIN_INTERVAL)
       irc_connect(state);
     return;
   }
@@ -811,6 +985,14 @@ void irc_check_status(bot_state_t *state) {
   }
 
   // --- NICK & CHANNEL MANAGEMENT ---
+  if ((state->status & S_AUTHED) && state->overlong_since &&
+      now - state->overlong_since > NICK_OVERLONG_TIMEOUT) {
+    log_message(L_INFO, state,
+                "[INFO] Still under %s (over %d characters) after %ds: reconnecting\n",
+                state->overlong_nick, MAX_NICK - 1, NICK_OVERLONG_TIMEOUT);
+    irc_disconnect(state);
+    return;
+  }
   if (state->status & S_AUTHED) {
     channel_manager_check_joins(state);
     
@@ -841,6 +1023,22 @@ void irc_attempt_nick_change(bot_state_t *state, const char *new_nick) {
   log_message(L_DEBUG, state, "[DEBUG] Attemping NICK to %s\n", new_nick);
   irc_printf(state, "NICK %s\r\n", new_nick);
   state->last_nick_attempt = time(NULL);
+}
+
+/* Review 10b: the server put us under `nick`, over the 9 bytes a bot nick may
+ * be (a long 001, a services rename to Guest123456).  Nothing longer is
+ * stored or sent to the hub: the bot renames itself back to its target now,
+ * and with current_nick empty the reclaim in irc_check_status keeps trying;
+ * a refused target falls back to the 9-byte alternates (the 433 handler).
+ * Still over 9 after NICK_OVERLONG_TIMEOUT, it reconnects. */
+void irc_nick_overlong(bot_state_t *state, const char *nick) {
+  if (!state->overlong_since) state->overlong_since = time(NULL);
+  snprintf(state->overlong_nick, sizeof(state->overlong_nick), "%s", nick);
+  state->current_nick[0] = '\0';
+  log_message(L_INFO, state,
+              "[INFO] Server put me under %s, over %d characters: renaming back to %s\n",
+              state->overlong_nick, MAX_NICK - 1, state->target_nick);
+  irc_attempt_nick_change(state, state->target_nick);
 }
 
 void irc_generate_new_nick(bot_state_t *state) {

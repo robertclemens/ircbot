@@ -116,7 +116,7 @@ bool access_uflag_put(bot_state_t *state, const char *uuid, const char *flags, t
   if (!r) {
     if (state->uflag_record_count >= MAX_USER_FLAGS) {
       log_message(L_INFO, state, "[ACCESS] Flag table full (%d): uf| for %s dropped\n",
-                  MAX_USER_FLAGS, uuid);
+                  MAX_USER_FLAGS, bot_who(state, 'u', uuid));
       return false;
     }
     r = &state->uflag_records[state->uflag_record_count++];
@@ -137,7 +137,7 @@ bool access_uchan_put(bot_state_t *state, const char *uuid, const char *chan, bo
   if (!r) {
     if (state->uchan_record_count >= MAX_CHAN_BINDS) {
       log_message(L_INFO, state, "[ACCESS] Binding table full (%d): uc| %s for %s dropped\n",
-                  MAX_CHAN_BINDS, chan, uuid);
+                  MAX_CHAN_BINDS, chan, bot_who(state, 'u', uuid));
       return false;
     }
     r = &state->uchan_records[state->uchan_record_count++];

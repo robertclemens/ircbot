@@ -127,7 +127,7 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
       state->recent_nonces[state->nonce_idx] = (nonce_entry_t){nonce, now};
       state->nonce_idx = (state->nonce_idx + 1) % NONCE_CACHE_SIZE;
       log_message(L_DEBUG, state, "[BOT-COMM] ~B2 verified from %s (%s)\n",
-                  sender->uuid, sender_nick ? "privmsg" : "hub relay");
+                  bot_who(state, 'b', sender->uuid), sender_nick ? "privmsg" : "hub relay");
 
       char *sp;
       char *bot_command = strtok_r(cmd, " ", &sp);
@@ -145,7 +145,7 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
         } else {
           log_message(L_INFO, state, "[BOT-COMM] SETNICK from %s refused: "
                                      "'%s' is not a valid IRC nick\n",
-                      sender->uuid, bot_arg1);
+                      bot_who(state, 'b', sender->uuid), bot_arg1);
         }
       } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "INVITE") == 0) {
@@ -224,13 +224,14 @@ void bot_comms_process_payload(bot_state_t *state, const char *payload) {
   uuid[ul] = '\0';
   if (strncmp(bar + 1, "~B2 ", 4) != 0) {
     log_message(L_CMD, state,
-                "[BOT-COMM] Relayed frame from %s is not ~B2; dropped\n", uuid);
+                "[BOT-COMM] Relayed frame from %s is not ~B2; dropped\n",
+                bot_who(state, 'b', uuid));
     return;
   }
   trusted_bot_t *tb = auth_trusted_bot_by_uuid(state, uuid);
   if (!tb) {
-    log_message(L_CMD, state, "[BOT-COMM] Relayed ~B2 from unknown bot %s\n",
-                uuid);
+    log_message(L_CMD, state, "[BOT-COMM] Relayed ~B2 from unknown %s\n",
+                bot_who(state, 'b', uuid));
     return;
   }
   b2_open_and_dispatch(state, tb, bar + 5, NULL);

@@ -151,6 +151,35 @@ void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]) {
   out[n] = '\0';
 }
 
+const char *bot_who(const bot_state_t *state, char kind, const char *uuid) {
+  static _Thread_local char slots[BOT_WHO_SLOTS][BOT_WHO_MAX];
+  static _Thread_local int next;
+  next = (next + 1) % BOT_WHO_SLOTS;
+  char *out = slots[next];
+  const char *word = kind == 'u' ? "user" : "bot";
+  char name[MAX_NICK > 64 ? MAX_NICK : 64] = "";
+  if (uuid && uuid[0] && kind == 'b') {
+    for (int i = 0; i < state->trusted_bot_count; i++)
+      if (strcmp(state->trusted_bots[i].uuid, uuid) == 0) {
+        auth_trusted_bot_nick(&state->trusted_bots[i], name);
+        break;
+      }
+  } else if (uuid && uuid[0] && kind == 'u') {
+    for (int i = 0; i < state->user_record_count; i++)
+      if (strcmp(state->user_records[i].uuid, uuid) == 0) {
+        word = state->user_records[i].type == 'a' ? "admin" : "oper";
+        snprintf(name, sizeof(name), "%s", state->user_records[i].name);
+        break;
+      }
+  }
+  snprintf(out, BOT_WHO_MAX, "%s %.63s (%.63s)", word, name[0] ? name : "?",
+           uuid && uuid[0] ? uuid : "?");
+  /* names come from the hub: no control byte reaches a log line through one */
+  for (char *q = out; *q; q++)
+    if ((unsigned char)*q < 0x20 || *q == 0x7f) *q = '_';
+  return out;
+}
+
 trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick) {
   if (!nick || !nick[0]) return NULL;
   for (int i = 0; i < state->trusted_bot_count; i++) {

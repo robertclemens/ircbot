@@ -19,6 +19,25 @@
 #include <unistd.h>
 
 static hub_auth_state_t auth_state = HUB_AUTH_NONE;
+
+/* Review 15b: the hub link is read without blocking into g_hub_rx, and
+ * every whole frame in it is handled.  The blocking reads waited for a whole
+ * frame, so a hub (or anything on the path) that stopped mid-frame froze the
+ * bot until the 120 s watchdog -- IRC pings unanswered.  A frame left half
+ * there now just waits; the watchdog still drops a link that never finishes
+ * one.  g_hub_rx_gen moves on every reset, so a frame whose handling drops
+ * or redials the link ends the pass over the old buffer. */
+static unsigned char *g_hub_rx;
+static size_t g_hub_rx_len;
+static unsigned g_hub_rx_gen;
+#define HUB_RX_CAP ((size_t)4 + MAX_HUB_FRAME)
+
+static void hub_rx_reset(void) {
+  if (g_hub_rx) secure_wipe(g_hub_rx, g_hub_rx_len);
+  g_hub_rx_len = 0;
+  g_hub_rx_gen++;
+}
+
 static time_t last_pong_sent = 0;
 
 void hub_client_init(bot_state_t *state) {
@@ -35,10 +54,68 @@ void hub_client_init(bot_state_t *state) {
   last_pong_sent = 0;
 }
 
-void hub_client_on_connect(bot_state_t *state) {
-  if (state->hub_count > 0) {
-    hub_client_connect(state);
+/* Review 16: the hub dial in flight.  hub_client_connect resolves the hub
+ * and starts a non-blocking connect to each address in turn; its socket is
+ * state->hub_fd, not yet hub_connected, and the main loop watches it for
+ * writability (hub_client_dial_ready).  An address that does not answer in
+ * HUB_DIAL_TIMEOUT is given up for the next, as the blocking dial did. */
+#define HUB_DIAL_TIMEOUT 10
+static struct addrinfo *g_dial_res, *g_dial_ai;
+static time_t g_dial_started;
+static int g_dial_flags;
+static char g_dial_hub[256];
+
+static void hub_dial_free(void) {
+  if (g_dial_res) freeaddrinfo(g_dial_res);
+  g_dial_res = g_dial_ai = NULL;
+}
+
+static void hub_dial_up(bot_state_t *state, int sockfd);
+
+/* Start a connect to g_dial_ai or the next address that takes one. */
+static void hub_dial_next(bot_state_t *state) {
+  for (; g_dial_ai; g_dial_ai = g_dial_ai->ai_next) {
+    int sockfd = socket(g_dial_ai->ai_family, g_dial_ai->ai_socktype, g_dial_ai->ai_protocol);
+    if (sockfd < 0) continue;
+    g_dial_flags = fcntl(sockfd, F_GETFL, 0);
+    if (g_dial_flags < 0 || fcntl(sockfd, F_SETFL, g_dial_flags | O_NONBLOCK) < 0) {
+      close(sockfd);
+      continue;
+    }
+    if (connect(sockfd, g_dial_ai->ai_addr, g_dial_ai->ai_addrlen) == 0) {
+      hub_dial_up(state, sockfd);
+      return;
+    }
+    if (errno == EINPROGRESS) {
+      state->hub_fd = sockfd;
+      g_dial_started = time(NULL);
+      return;
+    }
+    close(sockfd);
   }
+  log_message(L_INFO, state, "[HUB] Failed to connect to %s\n", g_dial_hub);
+  hub_dial_free();
+  state->hub_connecting = false;
+}
+
+/* The address in flight failed or timed out: on to the next. */
+static void hub_dial_failed(bot_state_t *state) {
+  close(state->hub_fd);
+  state->hub_fd = -1;
+  if (g_dial_ai) g_dial_ai = g_dial_ai->ai_next;
+  hub_dial_next(state);
+}
+
+/* The main loop saw the dial's socket writable: the connect is done. */
+void hub_client_dial_ready(bot_state_t *state) {
+  if (state->hub_fd == -1 || state->hub_connected || !g_dial_ai) return;
+  int err = 0;
+  socklen_t el = sizeof(err);
+  if (getsockopt(state->hub_fd, SOL_SOCKET, SO_ERROR, &err, &el) != 0) err = errno;
+  if (err == 0)
+    hub_dial_up(state, state->hub_fd);
+  else
+    hub_dial_failed(state);
 }
 
 /* Copy the raw key halves from the pre-decoded, mlock'd hub_key_raw buffer.
@@ -63,7 +140,8 @@ bool bot_key_decode(bot_state_t *state, unsigned char ed_priv[32],
   unsigned char *dec = base64_decode(state->hub_key, &dec_len);
   if (!dec || dec_len != HUB_KEY_RAW_LEN) {
     log_message(L_INFO, state, "[HUB] hub_key is not a valid 64-byte Curve25519 key\n");
-    if (dec) { secure_wipe(dec, HUB_KEY_RAW_LEN); free(dec); }
+    /* the decoded length (base64_decode allocates strlen(input)) */
+    if (dec) { if (dec_len > 0) secure_wipe(dec, (size_t)dec_len); free(dec); }
     return false;
   }
   memcpy(ed_priv, dec,      32);
@@ -94,6 +172,15 @@ bool bot_self_pub_refresh(bot_state_t *state) {
 /* Encrypt one [cmd][len][payload] frame under the hub session key and send
  * it, authenticated or not (CMD_BOT_RETIRE_ACK answers mid-handshake).
  * Returns false (after disconnecting on a send error) if it could not. */
+/* Review 6: the AAD of frame number `ctr` sent with direction byte `dir`. */
+static void link_aad(char dir, uint64_t ctr, unsigned char out[HUB_LINK_AAD_LEN]) {
+  memcpy(out, "LNK1", 4);
+  out[4] = (unsigned char)dir;
+  for (int i = 0; i < 8; i++) out[5 + i] = (unsigned char)(ctr >> (56 - 8 * i));
+}
+
+/* Every frame to the hub after the handshake is sealed here, in the order it
+ * goes out: a sequenced link counts them (review 6). */
 static bool hub_seal_frame(bot_state_t *state, int cmd, const char *payload,
                            int pay_len) {
   if (state->hub_fd == -1) return false;
@@ -105,10 +192,18 @@ static bool hub_seal_frame(bot_state_t *state, int cmd, const char *payload,
   if (pay_len) memcpy(&plain[5], payload, (size_t)pay_len);
 
   unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
+  unsigned char aad[HUB_LINK_AAD_LEN];
+  bool seq = state->hub_link_tx_seq;
+  if (seq) link_aad('B', state->hub_link_tx_ctr, aad);
+  int cipher_len = crypto_aes_gcm_encrypt_aad(
+      plain, 5 + pay_len, seq ? aad : NULL, seq ? HUB_LINK_AAD_LEN : 0,
+      state->hub_session_key, cipher + 4, tag);
   secure_wipe(plain, (size_t)(5 + pay_len));
   if (cipher_len <= 0) return false;
+  if (seq)
+    state->hub_link_tx_ctr++;
+  else if (cmd == CMD_LINK_SEQ && pay_len == 2 && memcmp(payload, "go", 2) == 0)
+    state->hub_link_tx_seq = true; /* every frame after our go */
   memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
   uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
   memcpy(cipher, &net_len, 4);
@@ -263,7 +358,11 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_connecting = false;
   state->hub_connect_time = 0;
   auth_state = HUB_AUTH_NONE;
+  hub_rx_reset();
+  hub_dial_free();
   secure_wipe(state->hub_session_key, 32);
+  state->hub_link_offered = state->hub_link_tx_seq = state->hub_link_rx_seq = false;
+  state->hub_link_tx_ctr = state->hub_link_rx_ctr = 0;
   state->current_hub[0] = '\0'; // Clear current hub tracking
   state->last_hub_connect_attempt = time(NULL);
   last_pong_sent = 0;
@@ -272,6 +371,22 @@ void hub_client_disconnect(bot_state_t *state) {
    * authentication re-reports unconditionally. */
   state->presence_server[0] = '\0';
   state->last_presence_sent = 0;
+}
+
+/* Bytes from the hub not read yet.  The handshake timeout leaves such a link
+ * alone: a blocking IRC connect can hold the loop past HUB_AUTH_TIMEOUT while
+ * the hub's challenge sits in the socket. */
+bool hub_client_data_waiting(bot_state_t *state) {
+  if (state->hub_fd == -1) return false;
+  /* A whole frame read but not handled yet; part of one only waits for the
+   * rest, and a hub that never sends it is what the timeout is for. */
+  if (g_hub_rx_len >= 4) {
+    uint32_t nl;
+    memcpy(&nl, g_hub_rx, 4);
+    if (g_hub_rx_len - 4 >= ntohl(nl)) return true;
+  }
+  char b;
+  return recv(state->hub_fd, &b, 1, MSG_PEEK | MSG_DONTWAIT) > 0;
 }
 
 void hub_client_heartbeat(bot_state_t *state) {
@@ -285,21 +400,7 @@ void hub_client_heartbeat(bot_state_t *state) {
   if (now - state->last_hub_ping_time < 30)
     return;
   state->last_hub_ping_time = now;
-  unsigned char plain[16] = {0}, buffer[128] = {0}, tag[GCM_TAG_LEN] = {0};
-  plain[0] = (unsigned char)CMD_PING;
-  uint32_t zero = 0;
-  memcpy(&plain[1], &zero, 4);
-  int enc_len =
-      crypto_aes_gcm_encrypt(plain, 5, state->hub_session_key, buffer + 4, tag);
-  if (enc_len > 0) {
-    memcpy(buffer + 4 + enc_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(enc_len + GCM_TAG_LEN));
-    memcpy(buffer, &net_len, 4);
-    if (send(state->hub_fd, buffer, (size_t)(4 + enc_len + GCM_TAG_LEN), 0) !=
-        (ssize_t)(4 + enc_len + GCM_TAG_LEN)) {
-      hub_client_disconnect(state);
-    }
-  }
+  hub_seal_frame(state, CMD_PING, NULL, 0);
 }
 
 void hub_client_sync_hostmask(bot_state_t *state) {
@@ -833,34 +934,19 @@ bool hub_client_push_delta(bot_state_t *state, const char *key,
   char payload[MAX_BUFFER];
   int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%ld",
                          key, value ? value : "", (long)(ts ? ts : time(NULL)));
-  if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return false;
+  /* The whole frame -- length, IV, [cmd][len:4], payload, tag -- must fit
+   * plain[] / cipher[] and the hub's MAX_BUFFER receive cap; a payload just
+   * under sizeof(payload) ran both buffers past their end. */
+  if (pay_len <= 0 ||
+      pay_len > MAX_BUFFER - (4 + GCM_IV_LEN + 5 + GCM_TAG_LEN)) return false;
 
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_BOT_DELTA;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
-      log_message(L_DEBUG, state, "[HUB] Delta pushed: %s=%s ts=%ld\n",
-                  key, value ? value : "", (long)ts);
-      return true;
-    } else {
-      log_message(L_INFO, state, "[HUB] Delta push failed, falling back\n");
-      hub_client_disconnect(state);
-      return false;
-    }
+  if (!hub_seal_frame(state, CMD_BOT_DELTA, payload, pay_len)) {
+    log_message(L_INFO, state, "[HUB] Delta push failed, falling back\n");
+    return false;
   }
-  return false;
+  log_message(L_DEBUG, state, "[HUB] Delta pushed: %s=%s ts=%ld\n",
+              key, value ? value : "", (long)ts);
+  return true;
 }
 
 /* hl|<addr>/<fp>,...: the hubs this bot dials, so the hub console's hub del
@@ -1065,32 +1151,10 @@ bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
   snprintf(payload, sizeof(payload), "%s|%s", target_uuid, channel);
 
   log_message(L_INFO, state,
-              "[HUB] Requesting ops via hub: target=%s chan=%s\n", target_uuid,
-              channel);
+              "[HUB] Requesting ops via hub: target=%s chan=%s\n",
+              bot_who(state, 'b', target_uuid), channel);
 
-  int pay_len = (int)strlen(payload);
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_OP_REQUEST;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
-      return true;
-    }
-    hub_client_disconnect(state);
-  }
-
-  return false;
+  return hub_seal_frame(state, CMD_OP_REQUEST, payload, (int)strlen(payload));
 }
 
 /* Route a sealed bot command ("~B2 <b64>") to a specific bot by UUID via hub
@@ -1108,7 +1172,8 @@ bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return false;
   if (!hub_send_frame(state, CMD_BOT_RELAY, payload, pay_len)) return false;
   log_message(L_DEBUG, state,
-              "[BOT-COMM] CMD_BOT_RELAY sent to hub for %s\n", target_uuid);
+              "[BOT-COMM] CMD_BOT_RELAY sent to hub for %s\n",
+              bot_who(state, 'b', target_uuid));
   return true;
 }
 
@@ -1255,32 +1320,18 @@ void hub_client_push_config(bot_state_t *state) {
   log_message(L_DEBUG, state, "[HUB-SYNC] Pushing config to hub (%zu bytes)\n",
               strlen(payload));
 
+  /* One seal path for every frame (review 6).  It also bounds the frame to
+   * MAX_BUFFER: the inline copy here sealed a payload near sizeof(payload)
+   * into cipher[MAX_BUFFER] with no room for the length, IV and tag. */
   int pay_len = (int)strlen(payload);
-  unsigned char plain[MAX_BUFFER];
-  plain[0] = (unsigned char)CMD_CONFIG_PUSH;
-  uint32_t inner_len = htonl((uint32_t)pay_len);
-  memcpy(&plain[1], &inner_len, 4);
-  memcpy(&plain[5], payload, (size_t)pay_len);
-
-  unsigned char cipher[MAX_BUFFER], tag[GCM_TAG_LEN];
-  int cipher_len = crypto_aes_gcm_encrypt(
-      plain, 5 + pay_len, state->hub_session_key, cipher + 4, tag);
-
-  if (cipher_len > 0) {
-    memcpy(cipher + 4 + cipher_len, tag, GCM_TAG_LEN);
-    uint32_t net_len = htonl((uint32_t)(cipher_len + GCM_TAG_LEN));
-    memcpy(cipher, &net_len, 4);
-
-    int total = 4 + cipher_len + GCM_TAG_LEN;
-    if (send(state->hub_fd, cipher, (size_t)total, 0) == total) {
-      for (int i = 0; i < state->cfg_ban_count; i++)
-        state->cfg_bans[i].push_pending = false;
-      log_message(L_INFO, state, "[HUB] Config pushed to hub\n");
-    } else {
-      log_message(L_INFO, state, "[HUB] Failed to push config\n");
-      hub_client_disconnect(state);
-    }
+  if (hub_seal_frame(state, CMD_CONFIG_PUSH, payload, pay_len)) {
+    for (int i = 0; i < state->cfg_ban_count; i++)
+      state->cfg_bans[i].push_pending = false;
+    log_message(L_INFO, state, "[HUB] Config pushed to hub\n");
+  } else {
+    log_message(L_INFO, state, "[HUB] Failed to push config (%d bytes)\n", pay_len);
   }
+  secure_wipe(payload, sizeof(payload));
 }
 
 /* Push what this bot saw on a channel (K|) after a live MODE change or a
@@ -1602,8 +1653,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   memcpy(saved_uchans, state->uchan_records, sizeof(uchan_record_t) * (size_t)saved_uchan_count);
   if (has_user_lines) state->user_record_count = 0;
   if (has_mask_lines) state->mask_record_count = 0;
-  /* uf| / uc| (user_flags plan): the hub's set replaces ours like a|/o|/m|.
-   * A hub that predates them sends none and ours stay (then migrated). */
+  /* uf| / uc| (user_flags plan): the hub's set replaces ours like a|/o|/m|. */
   if (has_access_lines) {
     state->uflag_record_count = 0;
     state->uchan_record_count = 0;
@@ -1664,7 +1714,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
     case 'c': // Channel
     {
       char chan[MAX_CHAN], key[MAX_KEY], op[8];
-      long long ts;
+      long long ts = 0; /* the old 4-field form can match without one */
       int parsed;
       int modes_val = 0;
 
@@ -1702,8 +1752,8 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
           // New channel from hub
           c = channel_add(state, chan);
           if (c) {
-            /* c| is existence and the admin's key; what the bots saw comes
-             * as K| (a 2.5.0 hub's modes field is still taken). */
+            /* c| is existence and the admin's key; its modes field is the
+             * hub's copy of K| (the authority, applied when it arrives). */
             snprintf(c->ckey, sizeof(c->ckey), "%s", key);
             c->modes = (chan_mode_t)(modes_val & (M_K | M_I));
             c->is_managed = true;
@@ -2002,7 +2052,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   }
 
   /* Flags / bindings of users this payload dropped go; a user it brought
-   * without any gets what it could do before flags (access_migrate). */
+   * without any gets its default (access_migrate). */
   access_prune(state);
   access_migrate(state);
 
@@ -2042,6 +2092,8 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   } else {
     log_message(L_DEBUG, state, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
   }
+  /* static: the config it held (keys, hashes) would outlive the call */
+  secure_wipe(work_buf, work_len + 1);
 }
 
 /* ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) ----------- */
@@ -2286,21 +2338,17 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     char channel[MAX_CHAN];
 
     if (sscanf(payload, "%255[^|]|%64s", hostmask, channel) == 2) {
-      // Extract nick from hostmask (nick!user@host)
-      char nick[MAX_NICK];
+      /* Nick from the hostmask (nick!user@host).  One that does not fit is
+       * refused: cut to the buffer it named someone else, who got the +o. */
+      char nick[MAX_MEMBER_NICK];
       char *bang = strchr(hostmask, '!');
-      if (bang) {
-        size_t nick_len = (size_t)(bang - hostmask);
-        if (nick_len >= MAX_NICK)
-          nick_len = MAX_NICK - 1;
-        memcpy(nick, hostmask, nick_len);
-        nick[nick_len] = '\0';
-      } else {
-        size_t nick_len = strlen(hostmask);
-        if (nick_len >= sizeof(nick)) nick_len = sizeof(nick) - 1;
-        memcpy(nick, hostmask, nick_len);
-        nick[nick_len] = '\0';
+      size_t nick_len = bang ? (size_t)(bang - hostmask) : strlen(hostmask);
+      if (nick_len == 0 || nick_len >= sizeof(nick)) {
+        log_message(L_INFO, state, "[HUB] OP_GRANT nick does not fit — ignored\n");
+        break;
       }
+      memcpy(nick, hostmask, nick_len);
+      nick[nick_len] = '\0';
 
       // Check if we're in that channel and have ops
       chan_t *c = channel_find(state, channel);
@@ -2322,7 +2370,7 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
               c->op_grant_held[k++] = c->op_grant_held[i];
           c->op_grant_held_count = k;
           if (k < OP_GRANT_HOLD_MAX) {
-            snprintf(c->op_grant_held[k].nick, MAX_NICK, "%s", nick);
+            snprintf(c->op_grant_held[k].nick, sizeof(c->op_grant_held[k].nick), "%s", nick);
             c->op_grant_held[k].at = now;
             c->op_grant_held_count++;
             log_message(L_INFO, state,
@@ -2357,8 +2405,10 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 
   case CMD_INVITE_REQUEST:
     if (payload && payload_len > 0) {
-      char inv_nick[MAX_NICK], inv_chan[MAX_CHAN];
-      if (sscanf(payload, "%9[^|]|%64[^\n]", inv_nick, inv_chan) == 2) {
+      /* a nick that does not fit is refused, never cut to someone else's */
+      char inv_nick[MAX_MEMBER_NICK], inv_chan[MAX_CHAN];
+      if (wire_field(payload, 0, inv_nick, sizeof(inv_nick)) && inv_nick[0] &&
+          sscanf(payload, "%*[^|]|%64[^\n]", inv_chan) == 1) {
         chan_t *ic = channel_find(state, inv_chan);
         if (ic && ic->status == C_IN) {
           if (ic->i_am_opped) {
@@ -2378,9 +2428,11 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
      * past the kind was filled in by the hub from its own records. */
     if (payload && payload_len > 0) {
       char a_id[64], a_kind[16], a_chan[MAX_CHAN], a_uuid[64];
-      char a_nick[MAX_NICK] = "", a_mask[MAX_MASK_LEN] = "";
-      int n = sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%63[^|]|%9[^|]|%255[^|]",
+      char a_nick[MAX_MEMBER_NICK] = "", a_mask[MAX_MASK_LEN] = "";
+      int n = sscanf(payload, "%63[^|]|%15[^|]|%64[^|]|%63[^|]|%31[^|]|%255[^|]",
                      a_id, a_kind, a_chan, a_uuid, a_nick, a_mask);
+      /* a nick that does not fit is refused, never cut to someone else's */
+      if (n >= 5 && !wire_field(payload, 4, a_nick, sizeof(a_nick))) n = 0;
       if (n >= 4) {
         chan_req_kind_t k = chan_req_kind_from_token(a_kind);
         if (k < CHAN_REQ_KIND_COUNT)
@@ -2468,6 +2520,10 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 }
 
 void hub_client_connect(bot_state_t *state) {
+  if (state->hub_fd != -1 && !state->hub_connected && g_dial_ai) {
+    if (time(NULL) - g_dial_started > HUB_DIAL_TIMEOUT) hub_dial_failed(state);
+    return;
+  }
   if (state->hub_count == 0 || state->hub_fd != -1 || state->hub_connecting)
     return;
   // Safety: Ensure hub_count is positive before rand() % state->hub_count
@@ -2583,56 +2639,24 @@ void hub_client_connect(bot_state_t *state) {
     return;
   }
 
-  int sockfd = -1;
-  bool connected = false;
-  int flags = 0;
-  for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
-    sockfd = socket(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-    if (sockfd < 0) continue;
+  snprintf(g_dial_hub, sizeof(g_dial_hub), "%s", hub_original);
+  hub_dial_free();
+  g_dial_res = g_dial_ai = res;
+  hub_dial_next(state);
+  __sync_lock_release(&lock);
+}
 
-    flags = fcntl(sockfd, F_GETFL, 0);
-    fcntl(sockfd, F_SETFL, flags | O_NONBLOCK);
-
-    int conn_result = connect(sockfd, ai->ai_addr, ai->ai_addrlen);
-    if (conn_result == 0) {
-      connected = true;
-    } else if (errno == EINPROGRESS) {
-      fd_set writefds;
-      struct timeval timeout;
-      FD_ZERO(&writefds);
-      FD_SET(sockfd, &writefds);
-      timeout.tv_sec = 10;
-      timeout.tv_usec = 0;
-      int sel = select(sockfd + 1, NULL, &writefds, NULL, &timeout);
-      if (sel > 0) {
-        int so_error;
-        socklen_t solen = sizeof(so_error);
-        getsockopt(sockfd, SOL_SOCKET, SO_ERROR, &so_error, &solen);
-        if (so_error == 0) connected = true;
-      }
-    }
-
-    if (connected) break;
-    close(sockfd);
-    sockfd = -1;
-  }
-  freeaddrinfo(res);
-
-  if (!connected) {
-    log_message(L_INFO, state, "[HUB] Failed to connect to %s:%s\n", host,
-                port_str);
-    state->hub_connecting = false;
-    __sync_lock_release(&lock);
-    return;
-  }
-
-  fcntl(sockfd, F_SETFL, flags);
+/* The dial is up: back to a blocking socket (the frame writes stay whole,
+ * the reads are MSG_DONTWAIT) and the handshake begins. */
+static void hub_dial_up(bot_state_t *state, int sockfd) {
+  fcntl(sockfd, F_SETFL, g_dial_flags);
+  hub_dial_free();
 
   state->hub_fd = sockfd;
   state->hub_connected = true;
   state->hub_authenticated = false;
   auth_state = HUB_AUTH_NONE;
-  snprintf(state->current_hub, sizeof(state->current_hub), "%s", hub_original);
+  snprintf(state->current_hub, sizeof(state->current_hub), "%s", g_dial_hub);
 
   int uuid_len = (int)strlen(state->bot_uuid);
   uint32_t net_len = htonl((uint32_t)uuid_len);
@@ -2646,52 +2670,62 @@ void hub_client_connect(bot_state_t *state) {
     hub_client_disconnect(state);
   }
   state->hub_connecting = false;
-  __sync_lock_release(&lock);
 }
 
-void hub_client_process(bot_state_t *state) {
-  if (state->hub_count == 0 || state->hub_fd == -1)
-    return;
+static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
+                             int packet_len);
 
-  unsigned char header[4];
-  int header_read = 0;
-  while (header_read < 4) {
-    int n = (int)recv(state->hub_fd, header + header_read, (size_t)(4 - header_read), 0);
-    if (n <= 0) {
-      if (n < 0 && (IO_WOULD_BLOCK(errno) || errno == EINTR))
-        return;
-      hub_client_disconnect(state);
-      return;
-    }
-    header_read += n;
-  }
-  uint32_t net_len;
-  memcpy(&net_len, header, 4);
-  uint32_t wire_len = ntohl(net_len);
-  /* Change 5: a CMD_CONFIG_DATA frame from the hub can exceed MAX_BUFFER at
-   * scale — bound by the config-frame ceiling instead of the small wire size. */
-  if (wire_len == 0 || wire_len > MAX_HUB_FRAME) {
+void hub_client_process(bot_state_t *state) {
+  if (state->hub_count == 0 || state->hub_fd == -1 || !state->hub_connected)
+    return;
+  if (!g_hub_rx && !(g_hub_rx = malloc(HUB_RX_CAP))) {
     hub_client_disconnect(state);
     return;
   }
-  int packet_len = (int)wire_len;
-  unsigned char *packet_body = malloc((size_t)packet_len);
-  if (!packet_body) {
+  while (g_hub_rx_len < HUB_RX_CAP) {
+    ssize_t n = recv(state->hub_fd, g_hub_rx + g_hub_rx_len, HUB_RX_CAP - g_hub_rx_len,
+                     MSG_DONTWAIT);
+    if (n > 0) {
+      g_hub_rx_len += (size_t)n;
+      continue;
+    }
+    if (n < 0 && errno == EINTR) continue;
+    if (n < 0 && IO_WOULD_BLOCK(errno)) break;
     hub_client_disconnect(state);
     return;
   }
-  int total_read = 0;
-  while (total_read < packet_len) {
-    int r = (int)recv(state->hub_fd, packet_body + total_read,
-                      (size_t)(packet_len - total_read), 0);
-    if (r <= 0) {
-      if (r < 0 && errno == EINTR) continue;
-      free(packet_body);
+  unsigned gen = g_hub_rx_gen;
+  size_t off = 0;
+  while (g_hub_rx_len - off >= 4) {
+    uint32_t net_len;
+    memcpy(&net_len, g_hub_rx + off, 4);
+    uint32_t wire_len = ntohl(net_len);
+    /* Change 5: a CMD_CONFIG_DATA frame from the hub can exceed MAX_BUFFER at
+     * scale — bound by the config-frame ceiling instead of the small wire size. */
+    if (wire_len == 0 || wire_len > MAX_HUB_FRAME) {
       hub_client_disconnect(state);
       return;
     }
-    total_read += r;
+    if (g_hub_rx_len - off - 4 < wire_len) break; /* the rest is still coming */
+    unsigned char *packet_body = malloc(wire_len);
+    if (!packet_body) {
+      hub_client_disconnect(state);
+      return;
+    }
+    memcpy(packet_body, g_hub_rx + off + 4, wire_len);
+    off += 4 + wire_len;
+    hub_handle_frame(state, packet_body, (int)wire_len); /* frees packet_body */
+    if (gen != g_hub_rx_gen) return; /* the link dropped or was redialled */
   }
+  if (off > 0) {
+    memmove(g_hub_rx, g_hub_rx + off, g_hub_rx_len - off);
+    g_hub_rx_len -= off;
+    secure_wipe(g_hub_rx + g_hub_rx_len, off);
+  }
+}
+
+static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
+                             int packet_len) {
   if (!state->hub_authenticated) {
     if (auth_state == HUB_AUTH_SENT_UUID) {
       /* v2 layout: challenge(32) || hub_eph_pub(32) || hub_sig(64)    (128 bytes)
@@ -2800,7 +2834,9 @@ void hub_client_process(bot_state_t *state) {
         return;
       }
     } else if (auth_state == HUB_AUTH_SENT_SIGNATURE) {
-      if (packet_len >= GCM_IV_LEN + 1 + GCM_TAG_LEN) {
+      /* The ACK is exactly one sealed byte; it decrypts into ack_pt[8], so a
+       * longer frame is refused before decryption, never written past it. */
+      if (packet_len == GCM_IV_LEN + 1 + GCM_TAG_LEN) {
         unsigned char ack_tag[GCM_TAG_LEN];
         unsigned char ack_pt[8] = {0};
         memcpy(ack_tag, packet_body + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
@@ -2819,6 +2855,8 @@ void hub_client_process(bot_state_t *state) {
           state->last_hub_activity = time(NULL);
           state->hub_connect_time = time(NULL);
           log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v2)!\n");
+          /* Review 6: first frame on the link; a 2.5.1 hub ignores it. */
+          hub_seal_frame(state, CMD_LINK_SEQ, "offer", 5);
           hub_client_push_config(state);
           /* This hub has no presence for us yet, so report unconditionally
            * rather than waiting for the heartbeat's change check. */
@@ -2861,13 +2899,42 @@ void hub_client_process(bot_state_t *state) {
   unsigned char tag[GCM_TAG_LEN];
   if (packet_len > (GCM_IV_LEN + GCM_TAG_LEN)) {
     memcpy(tag, packet_body + packet_len - GCM_TAG_LEN, GCM_TAG_LEN);
-    int plain_len =
-        crypto_aes_gcm_decrypt(packet_body, packet_len - GCM_TAG_LEN,
-                               state->hub_session_key, plain, tag);
+    /* Review 6: on a sequenced link the frame must be the next one. */
+    unsigned char aad[HUB_LINK_AAD_LEN];
+    bool seq = state->hub_link_rx_seq;
+    if (seq) link_aad('H', state->hub_link_rx_ctr, aad);
+    int plain_len = crypto_aes_gcm_decrypt_aad(
+        packet_body, packet_len - GCM_TAG_LEN, seq ? aad : NULL,
+        seq ? HUB_LINK_AAD_LEN : 0, state->hub_session_key, plain, tag);
+    if (plain_len <= 0) {
+      /* Not a frame of this session in this place: fail secure. */
+      log_message(L_INFO, state, "[HUB] Frame from hub failed its tag%s: disconnecting\n",
+                  seq ? " (replayed, reordered or forged)" : "");
+      free(packet_body);
+      hub_client_disconnect(state);
+      return;
+    }
+    if (seq) state->hub_link_rx_ctr++;
     if (plain_len > 0) {
       unsigned char cmd = plain[0];
 
-      if (cmd == CMD_BOT_RETIRE) {
+      if (cmd == CMD_LINK_SEQ) {
+        /* The hub's "offer" is answered with our "go" (our frames after it
+         * are sequenced); its "go" sequences every frame it sends after. */
+        if (plain_len >= 5 + 5 && memcmp(plain + 5, "offer", 5) == 0 &&
+            !state->hub_link_offered) {
+          state->hub_link_offered = true;
+          hub_seal_frame(state, CMD_LINK_SEQ, "go", 2);
+        } else if (plain_len >= 5 + 2 && memcmp(plain + 5, "go", 2) == 0 &&
+                   state->hub_link_offered && !state->hub_link_rx_seq) {
+          state->hub_link_rx_seq = true;
+          state->hub_link_rx_ctr = 0;
+          log_message(L_DEBUG, state, "[HUB] Sequenced link framing on\n");
+        }
+        secure_wipe(plain, (size_t)plain_len);
+        free(packet_body);
+        return;
+      } else if (cmd == CMD_BOT_RETIRE) {
         /* Empty payload: handled before the payload dispatch below. */
         free(packet_body);
         hub_client_retire(state);
@@ -2876,24 +2943,11 @@ void hub_client_process(bot_state_t *state) {
         // RATE LIMIT: Only respond to ping once per 5 seconds
         time_t now = time(NULL);
         if (now - last_pong_sent >= 5) {
-          unsigned char pong_plain[16] = {0};
-          pong_plain[0] = CMD_PING;
-          uint32_t zero = 0;
-          memcpy(&pong_plain[1], &zero, 4);
-          unsigned char pong_buf[128], pong_tag[GCM_TAG_LEN];
-          int pong_enc = crypto_aes_gcm_encrypt(
-              pong_plain, 5, state->hub_session_key, pong_buf + 4, pong_tag);
-          if (pong_enc > 0) {
-            memcpy(pong_buf + 4 + pong_enc, pong_tag, GCM_TAG_LEN);
-            uint32_t pong_len = htonl((uint32_t)(pong_enc + GCM_TAG_LEN));
-            memcpy(pong_buf, &pong_len, 4);
-            if (send(state->hub_fd, pong_buf, (size_t)(4 + pong_enc + GCM_TAG_LEN), 0) <= 0) {
-              hub_client_disconnect(state);
-              free(packet_body);
-              return;
-            }
-            last_pong_sent = now;
+          if (!hub_seal_frame(state, CMD_PING, NULL, 0)) {
+            free(packet_body);
+            return;
           }
+          last_pong_sent = now;
         }
       } else {
         // Extract payload from plain[5...] and call handler
@@ -2910,8 +2964,12 @@ void hub_client_process(bot_state_t *state) {
             payload_buf[payload_len] = '\0';
 
             hub_handle_response(state, cmd, payload_buf, payload_len);
+            /* both static: wipe what this frame put there (review
+             * 2026-10-25 L1) */
+            secure_wipe(payload_buf, (size_t)payload_len + 1);
           }
         }
+        secure_wipe(plain, (size_t)plain_len);
       }
     } else {
       free(packet_body);

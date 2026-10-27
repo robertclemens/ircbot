@@ -166,7 +166,8 @@ static void bots_tree_row(const bot_state_t *state, int i, bool *last_at,
   else if (r->has_started)
     up = r->started > 0 ? now - r->started : 0;
   else
-    up = r->uptime + (age > 0 ? age : 0);
+    up = r->uptime > LLONG_MAX - (age > 0 ? age : 0) ? LLONG_MAX
+                                                      : r->uptime + (age > 0 ? age : 0);
   tree_fmt_uptime(c->uptime, sizeof(c->uptime), up);
   snprintf(c->server, sizeof(c->server), "%s",
            r->kind == 'h' ? "(hub)" : (r->server[0] ? r->server : "-"));
@@ -253,7 +254,7 @@ static const cmd_log_rule_t LOGGABLE_CMDS[] = {
   {"+admin", 0},   {"+oper", 0},    {"chkey", 0},
   {"die", 0},      {"jump", 0},     {"join", 0},      {"part", 0},
   {"op", 0},       {"invite", 0},   {"+bot", 0},      {"-bot", 0},
-  {"status", 0},   {"givenick", 0}, {"chnick", 0},    {"saveconf", 0},
+  {"status", 0},   {"givenick", 0}, {"chnick", 0},
   {"setlog", 0},   {"getlog", 0},   {"admins", 0},    {"opers", 0},
   {"match", 0},    {"-admin", 0},   {"-oper", 0},     {"+usermask", 0},
   {"-usermask", 0}, {"+server", 0}, {"-server", 0},   {"update", 0},
@@ -1187,7 +1188,7 @@ static const struct {
   char        flag;
 } BOT_CMD_FLAGS[] = {
   {"die", 'b'},      {"jump", 'b'},      {"+bot", 'b'},      {"-bot", 'b'},
-  {"givenick", 'b'}, {"chnick", 'b'},    {"saveconf", 'b'},  {"rekey", 'b'},
+  {"givenick", 'b'}, {"chnick", 'b'},    {"rekey", 'b'},
   {"+server", 'b'},  {"-server", 'b'},
   {"join", 'c'},     {"part", 'c'},      {"op", 'c'},        {"invite", 'c'},
   {"unban", 'c'},    {"key", 'c'},       {"chanmode", 'c'},  {"chanset", 'c'},
@@ -1357,7 +1358,7 @@ static void help_admin_list(bot_state_t *state, const char *nick, const user_rec
      "chkey", NULL},
     {"+bot", "-bot", "+hub", "-hub", "rekey", NULL},
     {"chanmode", "chanset", "+ban", "-ban", "bans", NULL},
-    {"saveconf", "setlog", "getlog", "update", "help", NULL},
+    {"setlog", "getlog", "update", "help", NULL},
   };
   static const char *const HUB_ONLY[] = {"+admin", "-admin", "chattr", "+oper", "-oper",
                                          "chanoper", "+usermask", "-usermask", "+bot", "-bot",
@@ -1498,6 +1499,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         snprintf(channel_name, sizeof(channel_name), "#%s", arg1);
       }
 
+      if (!valid_chan_name(channel_name, strlen(channel_name))) {
+        irc_printf(state, "PRIVMSG %s :Error: %s is not a channel name.\r\n", nick,
+                   channel_name);
+        return;
+      }
       chan_t *c = channel_find(state, channel_name);
       if (c && c->is_managed) {
         irc_printf(state,
@@ -1510,6 +1516,10 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       time_t prev_ts = c ? c->timestamp : 0;
       if (!c) {
         c = channel_add(state, channel_name);
+        if (!c) {
+          irc_printf(state, "PRIVMSG %s :Error: no room for another channel.\r\n", nick);
+          return;
+        }
       }
       if (c) {
         if (arg2)
@@ -1520,8 +1530,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         log_message(L_DEBUG, state, "[JOIN] Channel %s: re-enabled ts=%ld\n",
                     channel_name, (long)c->timestamp);
       }
-      config_write_with_state_pass(state);
-      hub_client_push_config(state); // Sync to hub immediately
+      config_write_with_state_pass(state); /* pushes to the hub as well */
       irc_printf(state, "PRIVMSG %s :JOIN %s and saving config file.\r\n", nick,
                  arg1);
     } else if (strcasecmp(command, "part") == 0) {
@@ -1728,8 +1737,15 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                    nick);
       }
       irc_printf(state, "PRIVMSG %s :| Uptime   : %s\r\n", nick, uptime_str);
+      char tls_str[128];
+      if (!state->is_ssl)
+        snprintf(tls_str, sizeof(tls_str), "NO");
+      else if (state->irc_tls_verified)
+        snprintf(tls_str, sizeof(tls_str), "YES (verified)");
+      else
+        snprintf(tls_str, sizeof(tls_str), "YES (UNVERIFIED: %s)", state->irc_tls_why);
       irc_printf(state, "PRIVMSG %s :| Network  : %s (%s, TLS: %s)\r\n",
-                 nick, srv, conn_str, state->is_ssl ? "YES" : "NO");
+                 nick, srv, conn_str, tls_str);
 
       /* Servers section — only shown when multiple servers configured */
       if (state->server_count > 1) {
@@ -2028,10 +2044,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       if (!cn_found)
         irc_printf(state, "PRIVMSG %s :Error: No bot/admin/oper named '%s' found.\r\n",
                    nick, arg1);
-    } else if (strcasecmp(command, "saveconf") == 0) {
-      config_write_with_state_pass(state);
-      irc_printf(state, "PRIVMSG %s :Configuration state saved to %s.\r\n",
-                 nick, CONFIG_FILE);
     } else if (strcasecmp(command, "setlog") == 0) {
       if (!arg1) {
         irc_printf(state,
@@ -2789,8 +2801,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       secure_wipe(dec, (size_t)dec_len);
       free(dec);
       state->hub_count++;
-      config_write_with_state_pass(state);
-      hub_client_push_config(state); /* its hl| list changed */
+      config_write_with_state_pass(state); /* pushes: its hl| list changed */
       irc_printf(state,
                  "PRIVMSG %s :Added Hub: %s (pubkey pinned)\r\n", nick, arg1);
       /* If we are not connected to any hub yet, try the new one now. */
@@ -2828,8 +2839,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         state->hub_count--;
         memset(&state->hubs[state->hub_count], 0,
                sizeof(state->hubs[state->hub_count]));
-        config_write_with_state_pass(state);
-        hub_client_push_config(state); /* its hl| list changed */
+        config_write_with_state_pass(state); /* pushes: its hl| list changed */
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
 
         // If we disconnected and there are other hubs available, reconnect
@@ -3166,11 +3176,6 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                      "PRIVMSG %s :Syntax: -bot <nick*!*user@hostmask.com> - "
                      "Removes a bot from the known bot list as shown in the "
                      "'status' command.\r\n",
-                     nick);
-        } else if (strcasecmp(arg1, "saveconf") == 0) {
-          irc_printf(state,
-                     "PRIVMSG %s :Syntax: saveconf - Immediately save config "
-                     "file.\r\n",
                      nick);
         } else if (strcasecmp(arg1, "setlog") == 0) {
           irc_printf(state,

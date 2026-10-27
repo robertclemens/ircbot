@@ -100,7 +100,7 @@ static bool plain_text(const char *s, size_t len) {
   return true;
 }
 
-static bool valid_chan_name(const char *s, size_t len) {
+bool valid_chan_name(const char *s, size_t len) {
   if (len < 2 || len >= MAX_CHAN || (s[0] != '#' && s[0] != '&'))
     return false;
   for (size_t i = 0; i < len; i++) {

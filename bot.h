@@ -37,7 +37,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.5.1"
+#define BOT_VERSION "2.5.2"
 #endif
 
 // Only edit this section
@@ -45,8 +45,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define VHOST "NULL" // NULL for default host, set for alternate
 #define PASS_FILE ".ircbot.pass"        // Machine-bound password file
 /* PBKDF2-HMAC-SHA256 rounds for the .ircbot.cnf and .ircbot.pass keys
- * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; releases
- * after it carry min_from 2.5.0, so only this count is read. */
+ * (OWASP's 2023 figure).  2.5.0 moved both files here from 100k; every
+ * release since carries min_from 2.5.0 or later, so only this count is read. */
 #define PBKDF2_ITERATIONS 600000
 #define VERSION_RESPONSE                                                       \
   "A robot may not injure a human being" // This is the response to a CTCP
@@ -62,7 +62,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 /* Retained previous binary/config, kept (not deleted) after a hub-driven
  * upgrade so CMD_UPGRADE_ABORT can put the node back. */
 #define UPGRADE_PREV_SUFFIX ".prev"
-#define PASS_PREV_FILE PASS_FILE UPGRADE_PREV_SUFFIX /* 2.5.0's rollback copy: removed at start */
 /* How long a CMD_UPGRADE_PREPARE stays commitable.  A hub that stalls
  * mid-roll has to ask again rather than commit against a stale plan. */
 #define UPGRADE_PREPARE_TTL 900
@@ -72,6 +71,11 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * which still bounds it — an unbounded transfer would wedge the bot. */
 #define UPGRADE_QUICK_TIMEOUT 8L
 #define UPDATE_FETCH_TIMEOUT 300L
+/* Download ceilings, as irchub's HUB_UPDATE_MAX_*: a manifest is a few KB and
+ * an archive a few MB; without them a hostile or broken server grew the
+ * buffer (or the file) until the fetch timed out. */
+#define UPDATE_MAX_MANIFEST (1024 * 1024)
+#define UPDATE_MAX_ARCHIVE (256L * 1024 * 1024)
 /* The upgrade script's startup watchdog: how long the new build's daemon has
  * to be up before the script keeps it (mirrors irchub). */
 #define UPGRADE_WATCH_SECS 20
@@ -82,9 +86,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define UPGRADE_OPS_WAIT 180
 /* The staged new binary's -selftest must finish within this many seconds. */
 #define UPGRADE_SELFTEST_SECS 15
-/* The oldest upgrade target: an older build cannot read this config or pass
- * file (PBKDF2 600k since 2.5.0). */
-#define UPGRADE_TARGET_MIN "2.5.0"
+/* The oldest upgrade target: 2.5.0 cannot link with a 2.5.2 hub
+ * (MESH_MIN_VERSION 2.5.1), and anything older cannot read this config or
+ * pass file (PBKDF2 600k since 2.5.0). */
+#define UPGRADE_TARGET_MIN "2.5.1"
 /* Marker ops line capacity: channel names, space-separated. */
 #define UPGRADE_OPS_MAX 1024
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
@@ -148,8 +153,13 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define DEAD_SERVER_TIMEOUT 120 // Server connection timeout
 #define CHECK_LAG_TIMEOUT 60    // Lag timeout
 #define IRC_REGISTER_TIMEOUT 90 // Connected but no 001 by then: drop, try the next server
+#define NICK_OVERLONG_TIMEOUT 60 // Still under a nick over 9 bytes by then: reconnect (10b)
 #define ROSTER_REFRESH_INTERVAL 120 // WHO interval (s) when NOT opped (seeking ops); opped bots WHO only on deop
 #define HUB_RECONNECT_DELAY 30 // [NEW] Delay between hub connection attempts
+/* A hub link not authenticated this long after its connect is dropped: an
+ * endpoint that took the TCP connection and never finished the handshake
+ * kept the bot on it for good (hub_client_connect waits while hub_fd is set). */
+#define HUB_AUTH_TIMEOUT 15
 /* IRC server refusals (bans / throttles) -- see irc_note_refusal().  A server
  * that refuses the bot is skipped until its hold expires. */
 #define IRC_RECONNECT_MIN_INTERVAL 10 // Floor between any two IRC connect attempts
@@ -252,7 +262,11 @@ static inline bool fd_isset(int fd, const fd_set *set) {
   4096 // Stores admin request hashes to protect against anti-replay attacks
 #define NONCE_CACHE_SIZE                                                       \
   4096 // Nonce cache for secure communication. Prevents replay attacks
-#define NONCE_TTL_SECONDS 60 // Entries older than this are treated as empty
+/* Entries older than this are treated as empty.  A frame is accepted while
+ * its stamp is within +/-B2_TS_SKEW of our clock, so for 2*skew seconds: a
+ * nonce must be remembered at least that long or a frame stamped ahead of
+ * us replays once it is forgotten (it was 60 against a 120 s window). */
+#define NONCE_TTL_SECONDS (2 * B2_TS_SKEW + 1)
 typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 /* Config-write debounce.  auth_mark_used() bumps last_seen/last_used on every
  * successful admin auth, which would otherwise mean a full config rewrite --
@@ -515,6 +529,13 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_BOT_RETIRE        0x7F
 #define CMD_BOT_RETIRE_ACK    0x80
 #define CMD_ADMIN_LIST_REVOKED 0x81
+/* Review 6: sequenced link framing (irchub hub.h has the full contract).
+ * After the ACK each side sends "offer"; seeing the other's, it answers "go",
+ * and every frame it seals after its go carries 13 bytes of AAD: "LNK1" ||
+ * direction (B bot->hub, H hub->bot) || 64-bit big-endian counter from 0,
+ * not sent.  A 2.5.1 hub ignores the offer and the link stays as it was. */
+#define CMD_LINK_SEQ 0x83
+#define HUB_LINK_AAD_LEN 13
 #define USER_CHAN_RID_MAX     32
 #define USER_CHAN_PENDING     8
 #define USER_CHAN_REPLY_WAIT  45  /* s: the hub's CHAN_ELECT_TTL (40) + margin */
@@ -927,7 +948,7 @@ struct chan_t {
    * bot joining at once): granted when the +o lands, dropped after
    * OP_GRANT_HOLD_SECS.  Without it the asker waits out its 60 s timeout. */
   struct {
-    char nick[MAX_NICK];
+    char nick[MAX_MEMBER_NICK];
     time_t at;
   } op_grant_held[OP_GRANT_HOLD_MAX];
   int op_grant_held_count;
@@ -1140,10 +1161,21 @@ struct bot_state {
    * server keeps our current nick, so it is not retried until the target
    * changes or the bot reconnects. */
   char nick_refused[MAX_NICK];
+  /* Review 10b: a nick over 9 bytes the server put us under (a long 001, a
+   * services rename).  current_nick cannot hold it, so it is kept here only
+   * to recognise the NICK that renames us back; overlong_since says since
+   * when, and a bot still over 9 after NICK_OVERLONG_TIMEOUT reconnects. */
+  char overlong_nick[MAX_MEMBER_NICK];
+  time_t overlong_since;
   bool pong_pending;
   bool nick_change_pending;
   bool default_server_ignored;
   bool is_ssl;
+  /* Review 9: the IRC server's certificate checked against the CA store and
+   * its name (never enforced: an unverified server is still joined, with a
+   * warning); why it failed, for the log and `status`. */
+  bool irc_tls_verified;
+  char irc_tls_why[96];
   SSL_CTX *ssl_ctx;
   SSL *ssl;
   log_type_t log_type;
@@ -1234,6 +1266,13 @@ struct bot_state {
    * config_write_file never writes them again before the bot exits. */
   bool retired;
   unsigned char hub_session_key[32];
+  /* Review 6 (CMD_LINK_SEQ): the hub's offer seen, our go sent, its go seen;
+   * counters of the frames sealed / opened since.  Reset per hub link. */
+  bool hub_link_offered;
+  bool hub_link_tx_seq;
+  bool hub_link_rx_seq;
+  uint64_t hub_link_tx_ctr;
+  uint64_t hub_link_rx_ctr;
   time_t last_hub_connect_attempt;
   time_t last_hub_ping_time;    // Last time we sent a PING to the hub
   time_t last_hub_activity;     // Last time we received a valid PONG/Data from hub
@@ -1329,6 +1368,13 @@ trusted_bot_t *auth_trusted_bot_by_uuid(bot_state_t *state, const char *uuid);
 trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick);
 /* Nick part of a trusted bot's mask (up to '!'), bounded to MAX_NICK. */
 void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]);
+/* Log label for another bot or a user named by uuid (irchub hub_who):
+ * "bot bunny_ (<uuid>)", "admin robert (<uuid>)"; a name nobody knows reads
+ * "?".  kind: 'b' bot, 'u' admin/oper.  One of BOT_WHO_SLOTS rotating
+ * buffers, so one log line can carry several. */
+#define BOT_WHO_SLOTS 4
+#define BOT_WHO_MAX   160
+const char *bot_who(const bot_state_t *state, char kind, const char *uuid);
 /* Case-insensitive IRC-style glob ('*', '?').  Used for usermasks and for
  * matching a requester's hostmask against channel ban masks. */
 bool auth_wildcard_match(const char *pattern, const char *text);
@@ -1356,6 +1402,7 @@ bool config_load(bot_state_t *state, const char *password,
                  const char *filename);
 void config_write(bot_state_t *state, const char *password);
 void config_write_local(const bot_state_t *state, const char *password);
+void config_key_forget(void);
 void config_notify_hub_if_changed(bot_state_t *state);
 chan_t *channel_add(bot_state_t *state, const char *name);
 bool channel_remove(bot_state_t *state, const char *name);
@@ -1606,6 +1653,7 @@ int  sendq_lane_of(const char *line);            /* SENDQ_LANE_* for a line */
 void irc_handle_read(bot_state_t *state);
 void irc_check_status(bot_state_t *state);
 void irc_attempt_nick_change(bot_state_t *state, const char *new_nick);
+void irc_nick_overlong(bot_state_t *state, const char *nick);
 void irc_generate_new_nick(bot_state_t *state);
 /* Server refusal handling (irc_client.c) */
 void irc_note_refusal(bot_state_t *state, const char *text, bool ban_numeric);
@@ -1682,6 +1730,8 @@ bool util_sha256_file(const char *path, char *output_hash_hex);
 void log_message(log_type_t log_type_flag, const bot_state_t *state,
                  const char *format, ...)
     __attribute__((format(printf, 3, 4)));
+void log_raw(const bot_state_t *state, const char *tag, const char *line);
+void log_mask_keys(const bot_state_t *state, const char *line, char *out, size_t cap);
 int crypto_aes_gcm_encrypt(const unsigned char *plaintext, int plaintext_len,
                            const unsigned char *key, unsigned char *ciphertext,
                            unsigned char *tag);
@@ -1781,6 +1831,9 @@ void hub_client_heartbeat(bot_state_t *state);
  * when the hub has no presence for us at all). */
 void hub_client_send_presence(bot_state_t *state, bool force);
 void hub_client_disconnect(bot_state_t *state);
+bool hub_client_data_waiting(bot_state_t *state);
+/* #/& then 1..MAX_CHAN-2 bytes, no blank, control, ',' or '|' (chancfg.c) */
+bool valid_chan_name(const char *s, size_t len);
 /* Network-upgrade reporting (CMD_UPGRADE_RESULT).  report_upgrade_result()
  * is a no-op unless this process is a hub-driven upgrade's restart. */
 void hub_client_send_upgrade_result(bot_state_t *state, const char *id,
@@ -1793,7 +1846,12 @@ void hub_client_send_activity(bot_state_t *state);
 bool hub_client_send_activity_query(bot_state_t *state, const char *payload);
 void commands_activity_reply(bot_state_t *state, char *payload);
 void commands_activity_tick(bot_state_t *state, time_t now);
-void hub_client_on_connect(bot_state_t *state);
+void hub_client_dial_ready(bot_state_t *state);
+void irc_dial_fill_fds(bot_state_t *state, fd_set *rfds, fd_set *wfds, int *max_fd);
+void irc_dial_process(bot_state_t *state, const fd_set *rfds, const fd_set *wfds);
+void irc_dial_tick(bot_state_t *state);
+bool irc_dialing(const bot_state_t *state);
+void irc_dial_abort(bot_state_t *state);
 void hub_client_grant_held_ops(bot_state_t *state, chan_t *c);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
@@ -1855,7 +1913,7 @@ void config_write_local_with_state_pass(bot_state_t *s);
  * never replicate (a removed admin staying active elsewhere). */
 static inline time_t lww_next_ts(time_t prev) {
   time_t now = time(NULL);
-  return now > prev ? now : prev + 1;
+  return now > prev ? now : prev < LLONG_MAX ? prev + 1 : prev;
 }
 
 /* LWW acceptance for a replicated add/del record: a strictly newer stamp wins,

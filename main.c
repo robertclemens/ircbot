@@ -826,6 +826,7 @@ static void run_config_wizard(void) {
   /* Release the wizard's local state: frees server_list[] entries (the strdup
    * at the server_buf line) and the channel list, and cleanses key material. */
   state_destroy(&state);
+  config_key_forget();
 }
 
 static int run_selftest(void) {
@@ -992,10 +993,6 @@ int main(int argc, char *argv[]) {
 
   if (do_identity) return run_identity(startup_password);
 
-  /* The pre-2.5.0 pass file 2.5.0 kept for its own rollback: nothing reads
-   * it any more. */
-  remove(PASS_PREV_FILE);
-
   printf("%s %s\n", BOT_NAME, BOT_VERSION);
   fflush(stdout); /* or the buffered lines are written again by the fork */
   daemonize();
@@ -1129,6 +1126,8 @@ int main(int argc, char *argv[]) {
 
     // DCC chats (connect in progress, or open)
     dcc_fill_fds(&state, &read_fds, &write_fds, &max_fd);
+    // An IRC dial in flight (connect, then TLS)
+    irc_dial_fill_fds(&state, &read_fds, &write_fds, &max_fd);
 
     struct timeval tv = {1, 0}; // 1 second timeout
     /* Lines waiting for credit: wake exactly when the next one may go (0 =
@@ -1156,8 +1155,7 @@ int main(int argc, char *argv[]) {
       // Handle Hub Async Connection Completion
       if (state.hub_fd != -1 && !state.hub_connected &&
           fd_isset(state.hub_fd, &write_fds)) {
-        state.hub_connected = true;
-        hub_client_on_connect(&state);
+        hub_client_dial_ready(&state);
       }
 
       // Handle Hub Incoming Data (Pongs, Configs, etc.)
@@ -1166,6 +1164,7 @@ int main(int argc, char *argv[]) {
       }
 
       dcc_process(&state, &read_fds, &write_fds);
+      irc_dial_process(&state, &read_fds, &write_fds);
     }
 
     /* Paced output: whatever the queue may send now.  The select() timeout
@@ -1181,6 +1180,7 @@ int main(int argc, char *argv[]) {
   if (state.hub_fd != -1)
     close(state.hub_fd);
   state_destroy(&state);
+  config_key_forget();
 #ifdef HAVE_CURL
   curl_global_cleanup();
 #endif

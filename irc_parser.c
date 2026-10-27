@@ -68,6 +68,9 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
   char seen_key[MAX_KEY];
   snprintf(seen_key, sizeof(seen_key), "%s", c->key);
   int seen_modes = (int)c->modes;
+  /* Only a MODE that sets or clears k or i is something seen: anything else
+   * would stamp this bot's own (possibly stale) copy of the key as learned. */
+  bool touched = false;
 
   /* Live modes, key, limit, ban list and halfop/voice flags (chanlive.c) on
    * their own copy of the arguments: this function tokenises args in place. */
@@ -97,68 +100,65 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
 
     if (mode == '+') {
       adding = true;
-    } else if (mode == '-') {
-      adding = false;
+      continue;
     }
-    // --- Modes that ALWAYS take an argument ---
-    else if (mode == 'o' || mode == 'v' || mode == 'b' || mode == 'e' ||
-             mode == 'I') {
-      if (current_arg) {
-        // Handle OPS (+o / -o)
-        if (mode == 'o') {
-          // Check if it affects US
-          if (strcasecmp(current_arg, state->current_nick) == 0) {
-            c->i_am_opped = adding;
-            for (int k = 0; k < c->roster_count; k++) {
-              if (strcasecmp(c->roster[k].nick, state->current_nick) == 0) {
-                c->roster[k].is_op = adding;
-                break;
-              }
-            }
-            if (adding) {
-              c->enf_dirty = c->enf_ops_check = true; /* chanenf.c sweep */
-              c->op_request_pending = false;
-              c->op_request_retry_count = 0;
-              log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
-              hub_client_grant_held_ops(state, c);
-            } else {
-              /* Deopped: re-read the channel before choosing a helper.  While
-               * we held ops the roster was never refreshed, so peers that left
-               * or renamed may still be listed and peers that joined are not.
-               * The 315 handler picks a trusted op from the fresh WHO and sends
-               * the request, with the usual rate limit and retries.  Skipped
-               * while a request is already pending; its timeout re-WHOs. */
-              log_message(L_INFO, state,
-                          "[INFO] I was DEOPPED in %s. Refreshing roster to "
-                          "find a trusted op.\n",
-                          channel);
-              if (!c->op_request_pending) {
-                c->roster_count = 0;
-                irc_printf(state, "WHO %s\r\n", c->name);
-                c->last_who_request = time(NULL);
-              }
-            }
-          }
-          // Check if it affects SOMEONE ELSE in our roster
-          else {
-            for (int k = 0; k < c->roster_count; k++) {
-              if (strcasecmp(c->roster[k].nick, current_arg) == 0) {
-                c->roster[k].is_op = adding;
-                log_message(L_DEBUG, state,
-                            "[DEBUG] Roster update: %s is_op=%d in %s\n",
-                            current_arg, adding, channel);
-                break;
-              }
-            }
+    if (mode == '-') {
+      adding = false;
+      continue;
+    }
+    /* Which modes take an argument is the server's (005 PREFIX + CHANMODES,
+     * defaults "ohv" / "beI,k,l"): a hardcoded list let a server's own
+     * modes (+q, +j, +f...) shift every later argument, so "+qo a b" read
+     * a as the opped nick (review 2026-10-25 #17). */
+    bool has_arg = isupport_mode_has_arg(state, mode, adding);
+
+    if (mode == 'o' && has_arg && current_arg) {
+      // Check if it affects US
+      if (strcasecmp(current_arg, state->current_nick) == 0) {
+        c->i_am_opped = adding;
+        for (int k = 0; k < c->roster_count; k++) {
+          if (strcasecmp(c->roster[k].nick, state->current_nick) == 0) {
+            c->roster[k].is_op = adding;
+            break;
           }
         }
-
-        // Consumed one argument, move to next
-        current_arg = strtok_r(NULL, " ", &saveptr);
+        if (adding) {
+          c->enf_dirty = c->enf_ops_check = true; /* chanenf.c sweep */
+          c->op_request_pending = false;
+          c->op_request_retry_count = 0;
+          log_message(L_INFO, state, "[INFO] I am now OP in %s\n", channel);
+          hub_client_grant_held_ops(state, c);
+        } else {
+          /* Deopped: re-read the channel before choosing a helper.  While
+           * we held ops the roster was never refreshed, so peers that left
+           * or renamed may still be listed and peers that joined are not.
+           * The 315 handler picks a trusted op from the fresh WHO and sends
+           * the request, with the usual rate limit and retries.  Skipped
+           * while a request is already pending; its timeout re-WHOs. */
+          log_message(L_INFO, state,
+                      "[INFO] I was DEOPPED in %s. Refreshing roster to "
+                      "find a trusted op.\n",
+                      channel);
+          if (!c->op_request_pending) {
+            c->roster_count = 0;
+            irc_printf(state, "WHO %s\r\n", c->name);
+            c->last_who_request = time(NULL);
+          }
+        }
       }
-    }
-    // --- Modes that CONDITIONALLY take an argument ---
-    else if (mode == 'k') {
+      // Check if it affects SOMEONE ELSE in our roster
+      else {
+        for (int k = 0; k < c->roster_count; k++) {
+          if (strcasecmp(c->roster[k].nick, current_arg) == 0) {
+            c->roster[k].is_op = adding;
+            log_message(L_DEBUG, state,
+                        "[DEBUG] Roster update: %s is_op=%d in %s\n",
+                        current_arg, adding, channel);
+            break;
+          }
+        }
+      }
+    } else if (mode == 'k') {
       if (key_managed) {
         /* the mode job puts the stored key back; learn nothing */
       } else if (adding && current_arg) {
@@ -167,29 +167,26 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
         memcpy(seen_key, current_arg, klen);
         seen_key[klen] = '\0';
         seen_modes |= M_K;
+        touched = true;
       } else if (!adding) {
         /* -k clears the key regardless of arg */
         seen_key[0] = '\0';
         seen_modes &= ~M_K;
-      }
-      if (current_arg)
-        current_arg = strtok_r(NULL, " ", &saveptr);
-    } else if (mode == 'l') {
-      // +l takes arg (limit). -l DOES NOT take arg.
-      if (adding && current_arg) {
-        current_arg = strtok_r(NULL, " ", &saveptr);
+        touched = true;
       }
     } else if (mode == 'i') {
+      touched = true;
       if (adding)
         seen_modes |= M_I;
       else
         seen_modes &= ~M_I;
     }
-    // --- Modes that NEVER take an argument (t, s, n, m, p, etc) ---
+    if (has_arg && current_arg)
+      current_arg = strtok_r(NULL, " ", &saveptr);
   }
   /* Learned, never existence: the c| stamp stays, so a delete this MODE
    * races is not undone (an unmanaged channel learns nothing). */
-  bool learned = c->is_managed && chan_learn(c, seen_key, seen_modes);
+  bool learned = touched && c->is_managed && chan_learn(c, seen_key, seen_modes);
   secure_wipe(seen_key, sizeof(seen_key));
   return learned;
 }
@@ -287,6 +284,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
     state->pong_pending = false;
     return;
   }
+  /* "PING token" (no colon) and ":server PING :token" (a prefix): the fast
+   * path above only knows "PING :token", and an unanswered ping times out */
+  if (strcmp(command, "PING") == 0) {
+    irc_printf(state, "PONG :%s\r\n", irc_trailing(params));
+    state->last_pong_time = time(NULL);
+    state->pong_pending = false;
+    return;
+  }
   if (strcmp(command, "004") == 0) {
     char *server_name = strtok_r(params, " ", &saveptr_irc);
     server_name = strtok_r(NULL, " ", &saveptr_irc);
@@ -307,7 +312,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
     {
       const char *sp = strchr(params, ' ');
       size_t nlen = sp ? (size_t)(sp - params) : strlen(params);
-      if (nlen > 0 && nlen < sizeof(state->current_nick)) {
+      if (nlen >= sizeof(state->current_nick)) {
+        char long_nick[MAX_MEMBER_NICK];
+        snprintf(long_nick, sizeof(long_nick), "%.*s", (int)nlen, params);
+        irc_nick_overlong(state, long_nick);
+      } else if (nlen > 0) {
+        state->overlong_nick[0] = '\0';
+        state->overlong_since = 0;
         char srv_nick[MAX_NICK];
         memcpy(srv_nick, params, nlen);
         srv_nick[nlen] = '\0';
@@ -360,8 +371,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
                     state->target_nick, irc_trailing(saveptr_irc ? saveptr_irc
                                                                  : ""));
       }
-      /* Not registered yet: without an accepted nick there is no 001. */
-      if (!(state->status & S_AUTHED))
+      /* Not registered yet: without an accepted nick there is no 001.  Under
+       * a nick over 9 bytes (10b), the target refused: take an alternate. */
+      if (!(state->status & S_AUTHED) || state->overlong_nick[0])
         irc_generate_new_nick(state);
     }
   } else if (strcmp(command, "465") == 0 || strcmp(command, "463") == 0) {
@@ -783,8 +795,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
         strchr(join_mask, '!') && strchr(join_mask, '@'))
       update_own_hostmask(state, join_mask);
 
-    if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
-                 strcasecmp(nick, state->target_nick) == 0)) {
+    /* Our own JOIN: current_nick is what the server knows us as (001, NICK).
+     * Whoever holds target_nick while we run on a fallback is someone else. */
+    if (nick && strcasecmp(nick, state->current_nick) == 0) {
       char *chan_name = (*params == ':') ? params + 1 : params;
       chan_t *c = channel_find(state, chan_name);
       if (c && !c->is_managed) {
@@ -819,8 +832,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     }
   } else if (strcmp(command, "PART") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
-    if (nick && strcasecmp(nick, state->current_nick) != 0 &&
-        strcasecmp(nick, state->target_nick) != 0) {
+    if (nick && strcasecmp(nick, state->current_nick) != 0) {
       char pchan[MAX_CHAN];
       const char *pc = (*params == ':') ? params + 1 : params;
       size_t pl = strcspn(pc, " ");
@@ -830,8 +842,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
         chanenf_on_part(state, pchan, nick);
       }
     }
-    if (nick && (strcasecmp(nick, state->current_nick) == 0 ||
-                 strcasecmp(nick, state->target_nick) == 0)) {
+    /* our own PART only (see JOIN) */
+    if (nick && strcasecmp(nick, state->current_nick) == 0) {
       // Extract channel name (may have : prefix or trailing reason)
       char *chan_name = (*params == ':') ? params + 1 : params;
       char *space = strchr(chan_name, ' ');
@@ -871,8 +883,14 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *new_nick = (*params == ':') ? params + 1 : params;
     if (old_nick && new_nick)
       chanenf_on_nick(state, old_nick, new_nick);
-    if (old_nick && new_nick &&
-        strcasecmp(old_nick, state->current_nick) == 0) {
+    bool me = old_nick && new_nick &&
+              (strcasecmp(old_nick, state->current_nick) == 0 ||
+               (state->overlong_nick[0] && strcasecmp(old_nick, state->overlong_nick) == 0));
+    if (me && strlen(new_nick) >= sizeof(state->current_nick)) {
+      irc_nick_overlong(state, new_nick); /* 10b: never clipped */
+    } else if (me) {
+      state->overlong_nick[0] = '\0';
+      state->overlong_since = 0;
       snprintf(state->current_nick, sizeof(state->current_nick), "%s", new_nick);
       state->current_nick_ts = time(NULL);
 

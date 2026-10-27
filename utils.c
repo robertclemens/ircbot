@@ -321,6 +321,7 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
                              void *userp) {
   size_t realsize = size * nmemb;
   http_response_t *mem = (http_response_t *)userp;
+  if (mem->size + realsize + 1 > UPDATE_MAX_MANIFEST) return 0;
 
   char *ptr = realloc(mem->buffer, mem->size + realsize + 1);
   if (ptr == NULL) {
@@ -335,9 +336,19 @@ static size_t write_callback(void *contents, size_t size, size_t nmemb,
 
   return realsize;
 }
-static size_t write_file_callback(void *ptr, size_t size, size_t nmemb,
-                                  FILE *stream) {
-  return fwrite(ptr, size, nmemb, stream);
+/* An archive download, counted: CURLOPT_MAXFILESIZE_LARGE only sees a
+ * declared Content-Length on older curl (Rocky 8). */
+typedef struct {
+  FILE *fp;
+  curl_off_t n;
+} capped_file_t;
+
+static size_t write_file_callback(void *ptr, size_t size, size_t nmemb, void *userp) {
+  capped_file_t *cf = (capped_file_t *)userp;
+  size_t real = size * nmemb;
+  if (cf->n + (curl_off_t)real > (curl_off_t)UPDATE_MAX_ARCHIVE) return 0;
+  cf->n += (curl_off_t)real;
+  return fwrite(ptr, 1, real, cf->fp);
 }
 
 /* Set around a manifest read made from the event loop (see
@@ -391,9 +402,11 @@ static bool download_file(const char *url, const char *outfile) {
     return false;
   }
 
+  capped_file_t cf = {fp, 0};
   curl_easy_setopt(curl, CURLOPT_URL, url);
   curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, write_file_callback);
-  curl_easy_setopt(curl, CURLOPT_WRITEDATA, fp);
+  curl_easy_setopt(curl, CURLOPT_WRITEDATA, &cf);
+  curl_easy_setopt(curl, CURLOPT_MAXFILESIZE_LARGE, (curl_off_t)UPDATE_MAX_ARCHIVE);
   curl_easy_setopt(curl, CURLOPT_USERAGENT, "ircbot-updater/1.0");
   curl_easy_setopt(curl, CURLOPT_FOLLOWLOCATION, 1L);
   curl_easy_setopt(curl, CURLOPT_SSL_VERIFYPEER, 1L);
@@ -411,9 +424,9 @@ static bool download_file(const char *url, const char *outfile) {
 
   CURLcode res = curl_easy_perform(curl);
   curl_easy_cleanup(curl);
-  fclose(fp);
-
-  return (res == CURLE_OK);
+  bool ok = (fclose(fp) == 0) && res == CURLE_OK;
+  if (!ok) remove(outfile);
+  return ok;
 }
 
 static bool verify_sha256(const char *filepath, const char *expected_hash) {
@@ -549,6 +562,22 @@ static bool updater_set_tree(const char *variant) {
                   variant) < (int)sizeof(g_update_tree);
 }
 
+/* An https:// URL whose host is exactly github.com, githubusercontent.com or
+ * a subdomain of it (raw. for manifests; downloads redirect to objects.).
+ * "Contains github.com" let https://evil.example/github.com through; userinfo
+ * (github.com@evil.example) is refused outright. */
+static bool url_host_trusted(const char *url) {
+  if (strncmp(url, "https://", 8) != 0) return false;
+  const char *h = url + 8;
+  size_t n = strcspn(h, "/:?#@");
+  if (h[n] == '@') return false;
+  static const char gh[] = "github.com", ghu[] = "githubusercontent.com";
+  if (n == sizeof(gh) - 1 && strncasecmp(h, gh, n) == 0) return true;
+  if (n == sizeof(ghu) - 1 && strncasecmp(h, ghu, n) == 0) return true;
+  return n > sizeof(ghu) && h[n - sizeof(ghu)] == '.' &&
+         strncasecmp(h + n - (sizeof(ghu) - 1), ghu, sizeof(ghu) - 1) == 0;
+}
+
 static bool validate_url(const char *url) {
   if (!url) return false;
   /* Reject shell metacharacters regardless of source. */
@@ -561,14 +590,7 @@ static bool validate_url(const char *url) {
   if (ebase && strncmp(url, ebase, strlen(ebase)) == 0) {
     return true;
   }
-  if (strncmp(url, "https://", 8) != 0) {
-    return false;
-  }
-  if (strstr(url, "github.com") == NULL &&
-      strstr(url, "githubusercontent.com") == NULL) {
-    return false;
-  }
-  return true;
+  return url_host_trusted(url);
 }
 
 /* Fetch the release manifest AND its detached Ed25519 signature, then verify
@@ -1656,7 +1678,7 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
    * them; a source build is checked by the script. */
   if (updater_version_cmp(target_ver, UPGRADE_TARGET_MIN) < 0) {
     remove(archive);
-    *err = "target predates " UPGRADE_TARGET_MIN " and cannot read this config";
+    *err = "target predates " UPGRADE_TARGET_MIN ", the oldest the mesh links with";
     return false;
   }
   if (strcasecmp(row.kind, "bin") == 0) {
