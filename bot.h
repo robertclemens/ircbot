@@ -70,6 +70,26 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * nor its hub link while curl blocks.  COMMIT's download gets the long one,
  * which still bounds it — an unbounded transfer would wedge the bot. */
 #define UPGRADE_QUICK_TIMEOUT 8L
+/* The failback's limits, in seconds (see FAILBACK_BODY).  A source build's limit
+ * and the confirm window are the reliability plan's agreed values. */
+#define UPGRADE_INSTALL_SECS    120
+#define UPGRADE_BUILD_SECS      1800
+#define UPGRADE_CONFIRM_SECS    300
+#define UPGRADE_FAILBACK_EXPIRY 1800
+#define UPGRADE_STAGE_BEAT   20    /* a node says it is staging this often */
+#define UPGRADE_STAGE_SILENCE 90   /* a node silent this long has left the run */
+#define UPGRADE_STAGE_GATE   180   /* a prebuilt's stage limit */
+#define UPGRADE_STAGE_KEEP   900   /* a stage no COMMIT came for is removed */
+#define CRON_HELPER_TIMEOUT 60   /* a crontab edit that takes longer is killed */
+#define CRON_CHECK_SECS     3600 /* how often a node looks at its line */
+#define CRON_SILENT_SECS    900  /* no stamp for this long: no cron daemon */
+/* What preflight asks of the disk, in bytes.  A build's own needs come from the
+ * manifest's size column; these cover what it cannot say. */
+#define UPGRADE_SPACE_MARGIN      (16ULL * 1024 * 1024)
+#define UPGRADE_SPACE_BIN_DEFAULT (64ULL * 1024 * 1024)   /* no size column     */
+#define UPGRADE_SPACE_BUILD_C     (256ULL * 1024 * 1024)  /* objects, make      */
+#define UPGRADE_SPACE_BUILD_RS    (1536ULL * 1024 * 1024) /* cargo's target dir */
+#define UPGRADE_MIN_INODES        64
 #define UPDATE_FETCH_TIMEOUT 300L
 /* Download ceilings, as irchub's HUB_UPDATE_MAX_*: a manifest is a few KB and
  * an archive a few MB; without them a hostile or broken server grew the
@@ -427,6 +447,9 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  * trusted-bot records remain the sole authority for that. */
 #define CMD_BOT_PRESENCE 0x56  // Bot -> Hub: version|server|started|variant
 #define CMD_BOT_TREE     0x58  // Hub -> Bot: rendered tree rows
+#define CMD_UPGRADE_STAGE 0x88 // Hub -> Bot: id, get the build ready while the old one runs
+#define CMD_UPGRADE_PROGRESS 0x89 // Bot -> Hub: id|uuid|phase|code|note
+#define CMD_CRON_SET     0x8B  // Hub -> Bot: on|off, this bot's production crontab line
 
 /* ---- Channel-access requests (unban / invite / key) ----------------------
  * A bot locked out of a managed channel -- 474 banned, 473 invite-only, 475
@@ -1401,6 +1424,7 @@ void config_read(bot_state_t *state, const char *filename);
 bool config_load(bot_state_t *state, const char *password,
                  const char *filename);
 void config_write(bot_state_t *state, const char *password);
+unsigned long config_saves(void);
 void config_write_local(const bot_state_t *state, const char *password);
 void config_key_forget(void);
 void config_notify_hub_if_changed(bot_state_t *state);
@@ -1561,6 +1585,14 @@ bool chanenf_request_deop(bot_state_t *state, const char *chan,
  * retry, bot-written B|); kick_too also requests the kick for that nick. */
 bool chanenf_request_ban(bot_state_t *state, const char *chan, const char *nuh,
                          const char *reason, bool kick_too);
+/* The hub picked this bot for an admin's channel kick / ban (CMD_CHAN_DO
+ * kinds "kick" and "ban").  Act now, not through the job deal: true = sent
+ * (or the ban is already on the channel), false = not done.  detail says
+ * which; a kick's "absent" / "protected" mean no other bot can do better. */
+bool chanenf_admin_kick(bot_state_t *state, const char *chan, const char *nick,
+                        const char *reason, char *detail, size_t detail_size);
+bool chanenf_admin_ban(bot_state_t *state, const char *chan, const char *mask,
+                       char *detail, size_t detail_size);
 /* Repeat-offence memory keyed by channel + host: counts this one, forgets
  * after bantime; returns the count (1 = first offence). */
 unsigned chanenf_offence(bot_state_t *state, const char *chan, const char *nuh);
@@ -1703,6 +1735,19 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
 /* CMD_UPGRADE_ABORT: restore <exe>.prev / <config>.prev and restart onto
  * them.  Returns false when there is nothing retained to go back to. */
 bool updater_hub_rollback(bot_state_t *state, const char *reason);
+void updater_failback_confirm(void);
+void updater_standalone_tick(bot_state_t *state);
+const char *updater_cron_status(void);
+void updater_cron_set(bool on);
+bool updater_cron_tick(const char *exe);
+int updater_cron_drop(const char *exe);
+bool updater_install_in_progress(void);
+void updater_stage_start(const char *exe, const char *id, const char *ver, const char *variant);
+void updater_stage_clear(void);
+void updater_stage_boot_clean(void);
+void hub_client_stage_tick(bot_state_t *state);
+bool updater_stage_tick(char *id, size_t id_size, char *out, size_t out_size);
+bool updater_failback_note(char *out, size_t out_size);
 /* CMD_UPGRADE_PREPARE: could this bot take target_ver as `variant`?  Checks
  * everything COMMIT will need short of the download (signed manifest, host
  * artifact, min_from, unattended restart).  False with `reason` filled in. */

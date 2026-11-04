@@ -54,6 +54,10 @@ There are no admin, oper or bot passwords: bots, admins and opers are each ident
         ```
         No `cd` is needed: the bot always works in its own directory, whatever directory it is started from (`.ircbot.cnf`, `.ircbot.pass`, `.ircbot.pid` and `.ircbot.log` live beside the binary). Run one binary per bot, in a directory owned by you and not writable by group or others — the bot refuses to start otherwise.
 
+During a hub-driven upgrade, the node adds one temporary line to its own user's crontab, tagged `# ircbot:failback:<dir>:`, where `<dir>` is the directory holding the binary. It restores the previous build if the new one never proves itself, even after a reboot, and is removed along with its script (`.upgrade.failback`) once the upgrade settles, at most about 40 minutes later (about 65 for a source build). If `crontab` is missing or unreadable, the upgrade goes ahead without this cover and logs that it did.
+
+A node can also keep a permanent keepalive line, tagged `# ircbot:production:<dir>:`. This is off unless an admin turns it on from a hub with `bot set cron` or `hub set cron`, for every node (`global`) or one; the last command wins. It needs the `.pass` file. The node only ever changes its own tagged lines, and `bot del` removes a bot's. An upgrade leaves the line in place: a start while an upgrade installs exits quietly.
+
 5) Make your keypair. Every admin and oper has their own:
     ```
     make keygen && ./utils/keygen robert

@@ -252,6 +252,11 @@ static void hub_client_retire(bot_state_t *state) {
   log_message(L_INFO, state, "[HUB] This bot was deleted on the hub: wiping its config "
                              "and exiting\n");
   state->retired = true;
+  int cron = updater_cron_drop(state->executable_path);
+  if (cron == 10)
+    log_message(L_INFO, state, "[HUB] A hand-written crontab line still runs this binary\n");
+  else if (cron != 0)
+    log_message(L_INFO, state, "[HUB] Could not remove this bot's crontab lines\n");
   bool ok = retire_wipe_file(CONFIG_FILE);
   ok = retire_wipe_file(CONFIG_FILE ".tmp") && ok;
   ok = retire_wipe_file(CONFIG_FILE UPGRADE_PREV_SUFFIX) && ok;
@@ -449,10 +454,10 @@ void hub_client_send_presence(bot_state_t *state, bool force) {
 
   /* The variant rides last: a hub that predates it reads the start time
    * with atoll(), which stops at the '|', so older hubs are unaffected. */
-  char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + TREE_VARIANT_MAX + 64];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld|%s",
+  char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + TREE_VARIANT_MAX + 128];
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld|%s|%s",
                          BOT_VERSION, server, (long long)state->bot_start_time,
-                         BOT_UPDATE_VARIANT);
+                         BOT_UPDATE_VARIANT, updater_cron_status());
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
 
   if (hub_send_frame(state, CMD_BOT_PRESENCE, payload, pay_len)) {
@@ -488,6 +493,21 @@ static void upgrade_field(char *dst, size_t dst_size, const char *src) {
 }
 
 /* id|uuid|cur_ver|variant|arch|libc|ready|reason */
+/* id|uuid|phase|code|note */
+static void hub_client_send_upgrade_progress(bot_state_t *state, const char *id,
+                                             const char *status) {
+  char payload[MAX_BUFFER / 8];
+  int n = snprintf(payload, sizeof(payload), "%s|%s|%s", id, state->bot_uuid, status);
+  if (n > 0 && n < (int)sizeof(payload)) hub_send_frame(state, CMD_UPGRADE_PROGRESS, payload, n);
+}
+
+void hub_client_stage_tick(bot_state_t *state) {
+  char id[64], status[256];
+  if (!updater_stage_tick(id, sizeof(id), status, sizeof(status))) return;
+  log_message(L_DEBUG, state, "[UPGRADE] Stage of %s: %s\n", id, status);
+  if (state->hub_authenticated) hub_client_send_upgrade_progress(state, id, status);
+}
+
 static void hub_client_send_upgrade_ready(bot_state_t *state, const char *id,
                                           bool ready, const char *reason) {
   char arch[32], libc[16], clean_reason[192];
@@ -541,8 +561,9 @@ void hub_client_report_upgrade_result(bot_state_t *state) {
               "[UPGRADE] Restarted after %s: running %s/%s (wanted %s)\n", id,
               BOT_VERSION, updater_host_variant(), wanted);
   if (!ok) {
-    char detail[112];
-    snprintf(detail, sizeof(detail), "wanted %s", wanted);
+    char detail[192];
+    if (!updater_failback_note(detail, sizeof(detail)))
+      snprintf(detail, sizeof(detail), "wanted %s", wanted);
     hub_client_send_upgrade_result(state, id, "version-mismatch", detail);
     return;
   }
@@ -582,6 +603,7 @@ static bool upgrade_ops_back(const bot_state_t *state, const char *ops,
 void hub_client_upgrade_report_tick(bot_state_t *state) {
   if (!state->upgrade_report_id[0] || !state->hub_authenticated) return;
   bool on_irc = (state->status & S_AUTHED) != 0;
+  if (on_irc) updater_failback_confirm();
   char missing[UPGRADE_OPS_MAX];
   bool back = on_irc && upgrade_ops_back(state, state->upgrade_report_ops,
                                          missing, sizeof(missing));
@@ -744,6 +766,16 @@ static void hub_client_handle_upgrade_prepare(bot_state_t *state,
   }
   (void)kind; /* the artifact kind is chosen from the manifest at COMMIT */
   hub_client_send_upgrade_ready(state, id, ready, reason);
+  /* A frame an older hub drops: this bot can get a build ready before COMMIT. */
+  if (ready) hub_client_send_upgrade_progress(state, id, "ready|");
+}
+
+/* id: get the build ready.  Only a run we said ready to. */
+static void hub_client_handle_upgrade_stage(bot_state_t *state, const char *payload) {
+  char id[64] = "";
+  wire_field(payload, 0, id, sizeof(id));
+  if (!id[0] || !state->upgrade_id[0] || strcmp(state->upgrade_id, id) != 0) return;
+  updater_stage_start(state->executable_path, id, state->upgrade_target, state->upgrade_variant);
 }
 
 /* id|target_ver|variant — go.  Only an id we acknowledged at PREPARE, and
@@ -814,6 +846,7 @@ static void hub_client_handle_upgrade_abort(bot_state_t *state,
   wire_tail(payload, 1, reason, sizeof(reason));
   log_message(L_INFO, state, "[UPGRADE] Abort %s: %s\n",
               id[0] ? id : "(no id)", reason[0] ? reason : "no reason given");
+  updater_stage_clear();
   state->upgrade_id[0] = '\0';
   state->upgrade_prepared = 0;
   /* Only the run that installed the build we are running may take it back.
@@ -2099,7 +2132,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
 /* ---- Channel-request election (CMD_CHAN_PROBE / CMD_CHAN_DO) ----------- */
 
 /* NULL when we could do `kind` in `channel` right now, else why not.  Only
- * our own state: in the channel and opped (op/invite/unban), or in it and
+ * our own state: in the channel and opped (op/invite/unban/mode/kick/ban), or in it and
  * holding its key (key). */
 static const char *chan_elect_cannot(bot_state_t *state, const char *kind,
                                      const char *channel) {
@@ -2107,7 +2140,8 @@ static const char *chan_elect_cannot(bot_state_t *state, const char *kind,
   if (!c || c->status != C_IN) return "not in channel";
   if (strcmp(kind, "key") == 0) return c->key[0] ? NULL : "no key";
   if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0 ||
-      strcmp(kind, "unban") == 0 || strcmp(kind, "mode") == 0)
+      strcmp(kind, "unban") == 0 || strcmp(kind, "mode") == 0 ||
+      strcmp(kind, "kick") == 0 || strcmp(kind, "ban") == 0)
     return c->i_am_opped ? NULL : "not opped";
   return "unknown request";
 }
@@ -2167,6 +2201,17 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
     log_message(L_INFO, state, "[CHANREQ] Applied stored modes in %s: %s\n",
                 chan, note);
     chan_done_send(state, id, true, state->current_nick);
+    return;
+  }
+  if (strcmp(kind, "kick") == 0 || strcmp(kind, "ban") == 0) {
+    /* an admin's channel kick (nick, the reason in the hostmask slot) or
+     * ban (the mask in the hostmask slot): sent now, not dealt */
+    char detail[96];
+    bool ok = strcmp(kind, "kick") == 0
+                  ? chanenf_admin_kick(state, chan, nick, mask, detail, sizeof(detail))
+                  : mask[0] && chanenf_admin_ban(state, chan, mask, detail, sizeof(detail));
+    if (!ok && strcmp(kind, "ban") == 0 && !mask[0]) snprintf(detail, sizeof(detail), "no mask");
+    chan_done_send(state, id, ok, detail);
     return;
   }
   if (strcmp(kind, "op") == 0) {
@@ -2296,6 +2341,14 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 
   case CMD_BOT_TREE:
     hub_client_process_tree(state, payload, payload_len);
+    break;
+
+  case CMD_UPGRADE_STAGE:
+    hub_client_handle_upgrade_stage(state, payload);
+    break;
+
+  case CMD_CRON_SET:
+    updater_cron_set(payload_len == 2 && memcmp(payload, "on", 2) == 0);
     break;
 
   case CMD_ACTIVITY_REPLY:

@@ -688,41 +688,52 @@ static void act_kick(bot_state_t *state, chan_t *c, const char *nick,
   hub_client_chan_event(state, c->name, "kick", nk, why);
 }
 
-static void act_ban(bot_state_t *state, chan_t *c, const char *mask_in,
-                    const char *why) {
+/* What ban_set did; the job path ignores it, the hub's ban election
+ * reports it. */
+typedef enum { BS_SENT, BS_LIVE, BS_NOOP, BS_FULL, BS_RECENT, BS_HITS, BS_OVERLAP } ban_set_t;
+
+/* who: the member or record a refused mask would hit (BS_HITS/BS_OVERLAP). */
+static ban_set_t ban_set(bot_state_t *state, chan_t *c, const char *mask_in,
+                         const char *why, char *who, size_t who_size) {
   if (!c->i_am_opped || !safe_token(mask_in, BAN_MASK_MAX))
-    return;
+    return BS_NOOP;
   /* mask_in may point into c->bans or the job table: own copy, as the link
    * (and with it the ban list) can go away inside irc_printf */
   char mask[BAN_MASK_MAX + 1];
   snprintf(mask, sizeof(mask), "%s", mask_in);
   if (live_has_ban(c, mask))
-    return;
+    return BS_LIVE;
   if (c->ban_list_known && c->ban_count >= isupport_ban_cap(state))
-    return; /* the server's list is full */
+    return BS_FULL; /* the server's list is full */
   time_t now = time(NULL);
   ban_track_t *t = track_get(state, c->name, mask, now);
   if (now - t->set_at < RECENT_BAN_MS / 1000)
-    return;
+    return BS_RECENT;
   /* §6.2: step 1 every time (who is in the channel), step 2 cached 60 s */
-  char who[80];
-  if (!allowed_members(state, c, mask, who, sizeof(who))) {
+  if (!allowed_members(state, c, mask, who, who_size)) {
     log_message(L_INFO, state, "[BAN] Not setting %s in %s: it would hit %s\n",
                 mask, c->name, who);
-    return;
+    return BS_HITS;
   }
   if (now - t->checked_at >= 60) {
-    t->overlap_ok = !auth_mask_overlaps_authorised(state, mask, c->name, who, sizeof(who));
+    t->overlap_ok = !auth_mask_overlaps_authorised(state, mask, c->name, who, who_size);
     t->checked_at = now;
     if (!t->overlap_ok)
       log_message(L_INFO, state, "[BAN] Not setting %s in %s: it overlaps %s\n",
                   mask, c->name, who);
   }
   if (!t->overlap_ok)
-    return;
+    return BS_OVERLAP;
   t->set_at = now;
   irc_printf(state, "MODE %s +b %s\r\n", c->name, mask);
   hub_client_chan_event(state, c->name, "ban", mask, why);
+  return BS_SENT;
+}
+
+static void act_ban(bot_state_t *state, chan_t *c, const char *mask_in,
+                    const char *why) {
+  char who[80];
+  (void)ban_set(state, c, mask_in, why, who, sizeof(who));
 }
 
 static void act_unban(bot_state_t *state, chan_t *c, const char *mask_in,
@@ -948,6 +959,84 @@ bool chanenf_request_ban(bot_state_t *state, const char *chan, const char *nuh,
   if (kick_too)
     job_submit(state, c, JA_KICK, nick, reason);
   return ok;
+}
+
+/* --- the hub's channel kick / ban election (CMD_CHAN_DO) ------------------ */
+
+static int unauth_match(bot_state_t *state, const chan_t *c, const char *mask,
+                        const roster_entry_t **hits, int max, bool *auth_hit);
+
+bool chanenf_admin_kick(bot_state_t *state, const char *chan, const char *nick,
+                        const char *reason, char *detail, size_t detail_size) {
+  chan_t *c = chan ? channel_find(state, chan) : NULL;
+  const char *no = !c || c->status != C_IN ? "not in channel"
+                   : !c->i_am_opped        ? "not opped"
+                   : !valid_nick(state, nick) ? "not a valid nick"
+                                              : NULL;
+  roster_entry_t *e = no ? NULL : rfind(c, nick);
+  if (!no && !e)
+    no = "absent";
+  else if (!no && entry_authorised(state, c->name, e))
+    no = "protected"; /* a bot (this one too) or an authorised user */
+  if (no) {
+    snprintf(detail, detail_size, "%s", no);
+    return false;
+  }
+  char nk[MAX_MEMBER_NICK];
+  snprintf(nk, sizeof(nk), "%s", e->nick);
+  log_message(L_INFO, state, "[CHANREQ] Kicking %s from %s (picked by the hub)\n", nk,
+              c->name);
+  act_kick(state, c, nk, reason && reason[0] ? reason : "kicked");
+  snprintf(detail, detail_size, "KICK sent");
+  return true;
+}
+
+bool chanenf_admin_ban(bot_state_t *state, const char *chan, const char *mask,
+                       char *detail, size_t detail_size) {
+  chan_t *c = chan ? channel_find(state, chan) : NULL;
+  if (!c || c->status != C_IN || !c->i_am_opped) {
+    snprintf(detail, detail_size, "%s", !c || c->status != C_IN ? "not in channel" : "not opped");
+    return false;
+  }
+  /* the listed record's reason and sticky flag, as the sweep uses them */
+  char reason[BAN_REASON_MAX + 1] = "banned";
+  bool sticky = false;
+  for (int i = 0; i < state->cfg_ban_count; i++) {
+    const cfg_ban_t *b = &state->cfg_bans[i];
+    if (b->active && strcasecmp(b->mask, mask) == 0 &&
+        (strcmp(b->chan, "*") == 0 || strcasecmp(b->chan, c->name) == 0)) {
+      if (b->reason[0]) snprintf(reason, sizeof(reason), "%s", b->reason);
+      sticky = strchr(b->flags, 's') != NULL;
+      break;
+    }
+  }
+  /* +dynamicbans: a listed ban that is not sticky goes on only while an
+   * unauthorised member it matches is there (ban_sweep (b)); "dynamic" is
+   * about the ban, not this bot, so the hub tries no other */
+  if (!sticky && chancfg_get(state, c, CS_DYNAMICBANS) && !live_has_ban(c, mask) &&
+      unauth_match(state, c, mask, NULL, 0, NULL) == 0) {
+    snprintf(detail, detail_size, "dynamic");
+    return false;
+  }
+  char who[80] = "";
+  ban_set_t r = ban_set(state, c, mask, reason, who, sizeof(who));
+  switch (r) {
+  case BS_SENT:    snprintf(detail, detail_size, "MODE +b sent"); break;
+  case BS_LIVE:    snprintf(detail, detail_size, "already set"); break;
+  case BS_RECENT:  snprintf(detail, detail_size, "just set"); break;
+  case BS_NOOP:    snprintf(detail, detail_size, "not a valid mask"); break;
+  case BS_FULL:    snprintf(detail, detail_size, "the channel ban list is full"); break;
+  case BS_HITS:    snprintf(detail, detail_size, "it would hit %.60s", who); break;
+  case BS_OVERLAP: /* who is empty when the refusal was cached */
+    snprintf(detail, detail_size, "it overlaps %.60s", who[0] ? who : "a bot or an authorised user");
+    break;
+  }
+  if (r == BS_SENT || r == BS_LIVE || r == BS_RECENT) {
+    log_message(L_INFO, state, "[CHANREQ] Ban %s in %s (picked by the hub): %s\n", mask,
+                c->name, detail);
+    return true;
+  }
+  return false;
 }
 
 /* +revenge: the unauthorised `prefix` hurt an authorised member.  First time

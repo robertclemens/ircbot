@@ -613,6 +613,11 @@ bool config_load(bot_state_t *state, const char *password,
 
 /* Serialize state to the encrypted config file on disk.
  * Does NOT push to the hub — callers that want a push call config_write(). */
+/* How many writes have reached the disk.  A write that fails keeps the old file and
+ * says nothing else, so an upgrade counts these to know its flush landed. */
+static unsigned long g_config_saves = 0;
+unsigned long config_saves(void) { return g_config_saves; }
+
 static void config_write_file(const bot_state_t *state, const char *password) {
   if (state->retired) return;   /* wiped on the hub's order: stays gone */
   if (strlen(password) >= MAX_PASS)
@@ -862,7 +867,9 @@ static void config_write_file(const bot_state_t *state, const char *password) {
     fprintf(stderr, "[CFG] Failed to rename %s to %s: %s\n",
             temp_file, CONFIG_FILE, strerror(errno));
     remove(temp_file);
+    return;
   }
+  g_config_saves++;
 }
 
 void config_write(bot_state_t *state, const char *password) {

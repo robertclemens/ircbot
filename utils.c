@@ -2,6 +2,7 @@
 #include <ctype.h>
 #ifdef HAVE_CURL
 #include <curl/curl.h>
+#include <dirent.h>
 #endif
 #include <netdb.h>
 #include <openssl/crypto.h>
@@ -9,11 +10,14 @@
 #include <openssl/rand.h>
 #include <openssl/sha.h>
 #include <sys/mman.h>
+#include <sys/prctl.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <strings.h>
+#include <errno.h>
 #include <sys/stat.h>
+#include <sys/statvfs.h>
 #include <sys/utsname.h>
 #include <sys/wait.h>
 #include <signal.h>
@@ -225,6 +229,513 @@ bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
   return true;
 }
 
+/* ---- Failback ----------------------------------------------------------
+ * A node must recover by itself: its admin may have no shell on the host.  One
+ * script decides, called from two places: the upgrade script's background loop
+ * every 10 s, and a temporary crontab line every minute, which outlives a reboot
+ * or a killed loop.  It holds no secrets, and removes itself and the line once
+ * the new build confirms or the old one is back.  The body is the same text in
+ * all four trees: ircbot, ircbot.rs, irchub, irchub.rs. */
+#define FAILBACK_FILE ".upgrade.failback"
+#define FAILBACK_STATE ".upgrade.state"
+#define FAILBACK_CONFIRM ".upgrade.confirmed"
+#define CRON_HELPER ".cron.helper"
+
+static const char *const FAILBACK_BODY[] = {
+  "umask 077\n",
+  "PATH=\"${PATH:-}:/usr/bin:/bin\"; export PATH\n",
+  "cd \"$D\" 2>/dev/null || exit 1\n",
+  "STATE=.upgrade.state; CONF=.upgrade.confirmed; SELF=${SELF:-.upgrade.failback}\n",
+  "LOCK=.upgrade.lock; TRIES=.upgrade.tries; PREV=\"$EXE.prev\"\n",
+  "FAILTAG=\"# $PRODUCT:failback:$D:\"; PRODTAG=\"# $PRODUCT:production:$D:\"\n",
+  "# A hardened daemon is not dumpable, so its /proc/<pid>/exe cannot be read: the\n",
+  "# pid file and the process name say whether it is ours.\n",
+  "COMM=$(basename \"$EXE\" | cut -c1-15)\n",
+  "HLOCK=\"${HOME:-$D}/.irc-cron.lock\"\n",
+  "HELD=\"\"\n",
+  "\n",
+  "take_lock() {\n",
+  "  i=0\n",
+  "  while :; do\n",
+  "    if ( set -C; echo $$ >\"$1\" ) 2>/dev/null; then HELD=\"$HELD $1\"; return 0; fi\n",
+  "    h=$(cat \"$1\" 2>/dev/null)\n",
+  "    if [ -n \"$h\" ] && kill -0 \"$h\" 2>/dev/null; then\n",
+  "      i=$((i + 1)); [ \"$i\" -ge \"$2\" ] && return 1\n",
+  "      sleep 1\n",
+  "    else\n",
+  "      rm -f \"$1\"\n",
+  "    fi\n",
+  "  done\n",
+  "}\n",
+  "drop_locks() { for l in $HELD; do rm -f \"$l\"; done; HELD=\"\"; }\n",
+  "trap drop_locks EXIT\n",
+  "\n",
+  "clean() { printf '%s' \"$1\" | tr -d '|\\r\\n' | cut -c1-160; }\n",
+  "set_state() { # phase pid note\n",
+  "  printf '%s|%s|%s|%s|%s\\n' \"$ID\" \"$1\" \"$(date +%s)\" \"$2\" \"$(clean \"$3\")\" >\"$STATE.tmp\" &&\n",
+  "    mv -f \"$STATE.tmp\" \"$STATE\"\n",
+  "}\n",
+  "read_state() {\n",
+  "  rid=\"\"; phase=\"\"; since=0; spid=\"\"; note=\"\"\n",
+  "  [ -f \"$STATE\" ] || return 1\n",
+  "  IFS='|' read -r rid phase since spid note <\"$STATE\" || return 1\n",
+  "  [ \"$rid\" = \"$ID\" ]\n",
+  "}\n",
+  "pid_now() { [ -f \"$PIDF\" ] && tr -dc 0-9 <\"$PIDF\"; }\n",
+  "alive() {\n",
+  "  p=$(pid_now)\n",
+  "  [ -n \"$p\" ] && kill -0 \"$p\" 2>/dev/null && [ \"$(cat \"/proc/$p/comm\" 2>/dev/null)\" = \"$COMM\" ]\n",
+  "}\n",
+  "start_exe() { \"$EXE\" </dev/null >/dev/null 2>&1 & }\n",
+  "\n",
+  "# Read, change, write, read back, compare.  Only an answer that says there is\n",
+  "# no crontab counts as empty: any other read error writes nothing, so a bad read\n",
+  "# can never wipe an admin's jobs.  Only a line holding this tag changes, along with\n",
+  "# tagged lines whose directory is gone; every other line stays as it was.\n",
+  "cron_read() { # file\n",
+  "  if ! crontab -l >\"$1\" 2>\"$1.err\"; then\n",
+  "    grep -Eqi 'no crontab|no such file|does not exist' \"$1.err\" || return 1\n",
+  "    : >\"$1\"\n",
+  "  fi\n",
+  "}\n",
+  "cron_sweep() { # in out\n",
+  "  sed -nE 's/.*# (ircbot|irchub):(production|failback):(\\/[^:]*):$/\\3/p' \"$1\" |\n",
+  "    while read -r dd; do [ -d \"$dd\" ] || printf ':%s:\\n' \"$dd\"; done >\"$2.dead\"\n",
+  "  if [ -s \"$2.dead\" ]; then grep -vF -f \"$2.dead\" \"$1\" >\"$2\"; else cp \"$1\" \"$2\"; fi\n",
+  "}\n",
+  "cron_edit() { # add|remove tag line\n",
+  "  command -v crontab >/dev/null 2>&1 || return 3\n",
+  "  take_lock \"$HLOCK\" 15 || return 1\n",
+  "  T=\".upgrade.cron.$$\"; rc=1; n=0\n",
+  "  while [ \"$n\" -lt 3 ]; do\n",
+  "    n=$((n + 1))\n",
+  "    cron_read \"$T.cur\" || break\n",
+  "    if [ \"$1\" = remove ] && ! grep -qF \"$2\" \"$T.cur\"; then rc=0; break; fi\n",
+  "    if [ \"$1\" = add ] && grep -qF \"$2\" \"$T.cur\"; then rc=0; break; fi\n",
+  "    cron_sweep \"$T.cur\" \"$T.swept\"\n",
+  "    grep -vF \"$2\" \"$T.swept\" >\"$T.rest\"\n",
+  "    cp \"$T.rest\" \"$T.new\"\n",
+  "    [ \"$1\" = add ] && printf '%s\\n' \"$3\" >>\"$T.new\"\n",
+  "    crontab \"$T.new\" >/dev/null 2>&1 || { sleep 1; continue; }\n",
+  "    crontab -l >\"$T.chk\" 2>/dev/null\n",
+  "    grep -vF \"$2\" \"$T.chk\" | grep -v '^# \\(DO NOT EDIT\\|(\\)' >\"$T.a\"\n",
+  "    grep -v '^# \\(DO NOT EDIT\\|(\\)' \"$T.rest\" >\"$T.b\"\n",
+  "    if cmp -s \"$T.a\" \"$T.b\"; then\n",
+  "      if [ \"$1\" = add ]; then grep -qF \"$2\" \"$T.chk\" && { rc=0; break; }\n",
+  "      else grep -qF \"$2\" \"$T.chk\" || { rc=0; break; }; fi\n",
+  "    fi\n",
+  "    sleep 1\n",
+  "  done\n",
+  "  rm -f \"$T\".*\n",
+  "  rm -f \"$HLOCK\"; HELD=$(printf '%s' \"$HELD\" | sed \"s| $HLOCK||\")\n",
+  "  return \"$rc\"\n",
+  "}\n",
+  "fail_line() {\n",
+  "  printf \"* * * * * [ -x '%s/%s' ] && '%s/%s' tick >/dev/null 2>&1 %s\\n\" \\\n",
+  "    \"$D\" \"$SELF\" \"$D\" \"$SELF\" \"$FAILTAG\"\n",
+  "}\n",
+  "prod_line() {\n",
+  "  printf \"*/5 * * * * touch '%s/.cron.seen'; [ -x '%s' ] && '%s' >/dev/null 2>&1 %s\\n\" \\\n",
+  "    \"$D\" \"$EXE\" \"$EXE\" \"$PRODTAG\"\n",
+  "}\n",
+  "# What this instance's production line is: 0 ours, 10 a hand-written line runs\n",
+  "# this binary, 11 none, 3 no crontab tool, 1 it cannot be read.\n",
+  "cron_status() {\n",
+  "  command -v crontab >/dev/null 2>&1 || return 3\n",
+  "  T=\".upgrade.cron.$$\"\n",
+  "  cron_read \"$T.st\" || { rm -f \"$T\".*; return 1; }\n",
+  "  rc=11\n",
+  "  if grep -qF \"$PRODTAG\" \"$T.st\"; then rc=0\n",
+  "  elif grep -vE '^[[:space:]]*#' \"$T.st\" | grep -qF \"$EXE\"; then rc=10\n",
+  "  fi\n",
+  "  rm -f \"$T\".*\n",
+  "  return \"$rc\"\n",
+  "}\n",
+  "safe_path() { case \"$D\" in *[!A-Za-z0-9._/-]*) return 1 ;; esac; }\n",
+  "\n",
+  "# keep = leave the state file, for the build that has to report it\n",
+  "finish() {\n",
+  "  cron_edit remove \"$FAILTAG\"\n",
+  "  [ \"${1:-}\" = keep ] || rm -f \"$STATE\"\n",
+  "  rm -f \"$CONF\" \"$TRIES\" \"$SELF\" \"./$SCRIPT\"\n",
+  "  drop_locks\n",
+  "  exit 1\n",
+  "}\n",
+  "\n",
+  "restore() { # reason\n",
+  "  read_state\n",
+  "  [ -n \"$spid\" ] && [ \"$spid\" != \"$PPID\" ] && [ \"$spid\" != \"$$\" ] && kill \"$spid\" 2>/dev/null\n",
+  "  if alive; then\n",
+  "    p=$(pid_now); kill \"$p\" 2>/dev/null\n",
+  "    i=0\n",
+  "    while kill -0 \"$p\" 2>/dev/null && [ \"$i\" -lt 5 ]; do sleep 1; i=$((i + 1)); done\n",
+  "    kill -9 \"$p\" 2>/dev/null\n",
+  "  fi\n",
+  "  if [ ! -f \"$PREV\" ]; then\n",
+  "    [ -x \"$EXE\" ] && ! alive && start_exe\n",
+  "    set_state failback-gave-up \"\" \"$1; no previous build retained\"\n",
+  "    return\n",
+  "  fi\n",
+  "  mv -f \"$EXE\" \"$EXE.failed\" 2>/dev/null\n",
+  "  if ! mv -f \"$PREV\" \"$EXE\"; then\n",
+  "    mv -f \"$EXE.failed\" \"$EXE\" 2>/dev/null\n",
+  "    set_state failback-gave-up \"\" \"$1; could not restore the previous build\"\n",
+  "    return\n",
+  "  fi\n",
+  "  [ -f \"$CFG.prev\" ] && cp -f \"$CFG.prev\" \"$CFG\"\n",
+  "  rm -f \"$PIDF\"\n",
+  "  set_state restored \"\" \"$1\"\n",
+  "  start_exe\n",
+  "}\n",
+  "\n",
+  "tick() {\n",
+  "  read_state || finish\n",
+  "  now=$(date +%s); age=$((now - since))\n",
+  "  if [ \"$now\" -ge \"$HARD\" ]; then\n",
+  "    case \"$phase\" in\n",
+  "      restored|failback-gave-up) ;;\n",
+  "      *) set_state failback-gave-up \"\" \"the upgrade never finished\" ;;\n",
+  "    esac\n",
+  "    finish keep\n",
+  "  fi\n",
+  "  case \"$phase\" in\n",
+  "    installing)\n",
+  "      if ! kill -0 \"$spid\" 2>/dev/null; then restore \"the install was interrupted\"\n",
+  "      elif [ \"$age\" -ge \"$INSTALL_LIMIT\" ]; then restore \"the install took over $INSTALL_LIMIT s\"\n",
+  "      fi ;;\n",
+  "    started)\n",
+  "      if [ -f \"$CONF\" ] && [ \"$(cat \"$CONF\" 2>/dev/null)\" = \"$ID\" ] && alive; then finish\n",
+  "      elif ! alive; then\n",
+  "        [ \"$age\" -ge \"$WATCH\" ] && restore \"the new build did not stay up\"\n",
+  "      elif [ \"$age\" -ge \"$CONFIRM_LIMIT\" ]; then restore \"$NOTE within $CONFIRM_LIMIT s\"\n",
+  "      fi ;;\n",
+  "    restored)\n",
+  "      alive && finish keep\n",
+  "      t=$(cat \"$TRIES\" 2>/dev/null); t=$((${t:-0} + 1)); echo \"$t\" >\"$TRIES\"\n",
+  "      if [ \"$t\" -ge 5 ]; then\n",
+  "        set_state failback-gave-up \"\" \"$note; the previous build will not start\"\n",
+  "        finish keep\n",
+  "      fi\n",
+  "      start_exe ;;\n",
+  "    failback-gave-up) finish keep ;;\n",
+  "    *) finish ;;\n",
+  "  esac\n",
+  "  return 0\n",
+  "}\n",
+  "\n",
+  "# The cron-* arguments are a one-shot helper's: it runs once and removes itself.\n",
+  "case \"${1:-tick}\" in\n",
+  "  install)\n",
+  "    safe_path || exit 3\n",
+  "    cron_edit add \"$FAILTAG\" \"$(fail_line)\"; exit $? ;;\n",
+  "  phase) take_lock \"$LOCK\" 20 && set_state \"$2\" \"$3\" \"\" ;;\n",
+  "  restore) take_lock \"$LOCK\" 20 && restore \"$2\" ;;\n",
+  "  done) take_lock \"$LOCK\" 20; finish ;;\n",
+  "  tick) take_lock \"$LOCK\" 2 || exit 0; tick ;;\n",
+  "  cron-status) cron_status; rc=$?; rm -f \"$SELF\"; exit \"$rc\" ;;\n",
+  "  cron-on)\n",
+  "    cron_status; rc=$?\n",
+  "    if [ \"$rc\" = 11 ]; then\n",
+  "      if safe_path; then\n",
+  "        touch .cron.seen\n",
+  "        cron_edit add \"$PRODTAG\" \"$(prod_line)\" && cron_status; rc=$?\n",
+  "      else\n",
+  "        rc=4\n",
+  "      fi\n",
+  "    fi\n",
+  "    rm -f \"$SELF\"; exit \"$rc\" ;;\n",
+  "  cron-off)\n",
+  "    rc=0\n",
+  "    cron_edit remove \"$PRODTAG\" || rc=$?\n",
+  "    if [ \"$rc\" = 0 ]; then rm -f .cron.seen; cron_status; rc=$?; fi\n",
+  "    rm -f \"$SELF\"; exit \"$rc\" ;;\n",
+  "  cron-drop)\n",
+  "    rc=0\n",
+  "    cron_edit remove \"$PRODTAG\" || rc=$?\n",
+  "    cron_edit remove \"$FAILTAG\" || rc=$?\n",
+  "    if [ \"$rc\" = 0 ]; then\n",
+  "      cron_status; [ $? = 10 ] && rc=10\n",
+  "    fi\n",
+  "    rm -f \"$SELF\" .cron.seen; exit \"$rc\" ;;\n",
+  "esac\n",
+  "exit 0\n"
+};
+
+/* A value for the script's header: single-quoted, so nothing in a path expands */
+static void failback_quoted(FILE *f, const char *name, const char *value) {
+  fprintf(f, "%s='", name);
+  for (const char *p = value; *p; p++) {
+    if (*p == '\'') fputs("'\\''", f);
+    else fputc(*p, f);
+  }
+  fputs("'\n", f);
+}
+
+/* The script, for one upgrade (FAILBACK_FILE) or one crontab change (CRON_HELPER). */
+static bool failback_write(const char *path, const char *exe, const char *id, bool is_bin,
+                           const char *cfg, const char *pidf, const char *script,
+                           const char *note, const char *self) {
+  char dir[PATH_MAX];
+  snprintf(dir, sizeof(dir), "%s", exe);
+  char *slash = strrchr(dir, '/');
+  if (!slash) return false;
+  *slash = '\0';
+  int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
+  FILE *f = fd >= 0 ? fdopen(fd, "w") : NULL;
+  if (!f) {
+    if (fd >= 0) close(fd);
+    return false;
+  }
+  int install = is_bin ? UPGRADE_INSTALL_SECS : UPGRADE_BUILD_SECS;
+  fputs("#!/bin/sh\n", f);
+  fputs("# Written by ircbot: removes itself.  See its README.\n", f);
+  failback_quoted(f, "PRODUCT", "ircbot");
+  failback_quoted(f, "SELF", self);
+  failback_quoted(f, "D", dir);
+  failback_quoted(f, "EXE", exe);
+  failback_quoted(f, "ID", id);
+  failback_quoted(f, "CFG", cfg);
+  failback_quoted(f, "PIDF", pidf);
+  failback_quoted(f, "SCRIPT", script);
+  failback_quoted(f, "NOTE", note);
+  fprintf(f, "INSTALL_LIMIT=%d\nCONFIRM_LIMIT=%d\nWATCH=%d\nHARD=%lld\n", install,
+          UPGRADE_CONFIRM_SECS, UPGRADE_WATCH_SECS,
+          (long long)time(NULL) + install + UPGRADE_CONFIRM_SECS + UPGRADE_FAILBACK_EXPIRY);
+  for (size_t i = 0; i < sizeof(FAILBACK_BODY) / sizeof(FAILBACK_BODY[0]); i++)
+    fputs(FAILBACK_BODY[i], f);
+  (void)fchmod(fileno(f), 0700);
+  if (fclose(f) != 0) {
+    remove(path);
+    return false;
+  }
+  return true;
+}
+
+/* Run the script with one argument; its exit status, -1 if it could not run. */
+static int failback_run(const char *arg) {
+  pid_t pid = fork();
+  if (pid < 0) return -1;
+  if (pid == 0) {
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+    execl("./" FAILBACK_FILE, "./" FAILBACK_FILE, arg, (char *)NULL);
+    _exit(127);
+  }
+  int st = 0;
+  if (waitpid(pid, &st, 0) != pid || !WIFEXITED(st)) return -1;
+  return WEXITSTATUS(st);
+}
+
+/* Takes the upgrade back out of cron and off the disk. */
+static void failback_clear(void) {
+  if (access(FAILBACK_FILE, X_OK) == 0) (void)failback_run("done");
+  remove(FAILBACK_STATE);
+  remove(FAILBACK_CONFIRM);
+}
+
+/* The new build is up and has proved it can do its job. */
+void updater_failback_confirm(void) {
+  char line[256];
+  FILE *f = fopen(FAILBACK_STATE, "r");
+  if (!f) return;
+  bool got = fgets(line, sizeof(line), f) != NULL;
+  fclose(f);
+  if (!got) return;
+  char *phase = strchr(line, '|');
+  if (!phase) return;
+  *phase++ = '\0';
+  if (strncmp(phase, "started|", 8) != 0) return;
+  char tmp[64];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", FAILBACK_CONFIRM);
+  f = fopen(tmp, "w");
+  if (!f) return;
+  fprintf(f, "%s\n", line);
+  if (fclose(f) == 0) (void)rename(tmp, FAILBACK_CONFIRM);
+}
+
+/* Why this build is running instead of the one asked for: the note the script
+ * wrote when it restored it.  Taken once. */
+bool updater_failback_note(char *out, size_t out_size) {
+  char line[256];
+  out[0] = '\0';
+  FILE *f = fopen(FAILBACK_STATE, "r");
+  if (!f) return false;
+  bool got = fgets(line, sizeof(line), f) != NULL;
+  fclose(f);
+  if (!got) return false;
+  line[strcspn(line, "\r\n")] = '\0';
+  char *phase = strchr(line, '|');
+  if (!phase) return false;
+  phase++;
+  if (strncmp(phase, "restored|", 9) != 0 &&
+      strncmp(phase, "failback-gave-up|", 17) != 0)
+    return false;
+  char *note = strrchr(phase, '|');
+  if (!note || !note[1]) return false;
+  snprintf(out, out_size, "%s", note + 1);
+  remove(FAILBACK_STATE);
+  return true;
+}
+
+/* A bot with no hub: there is no link to report on, so the first time it is on IRC
+ * it settles its own upgrade.  Once per process. */
+void updater_standalone_tick(bot_state_t *state) {
+  static bool done = false;
+  if (done || state->hub_count != 0 || !(state->status & S_AUTHED)) return;
+  done = true;
+  char id[64], want[64], want_variant[16], ops[UPGRADE_OPS_MAX];
+  if (!updater_take_pending_upgrade(id, sizeof(id), want, sizeof(want), want_variant,
+                                    sizeof(want_variant), ops, sizeof(ops)))
+    return;
+  if (updater_version_cmp(BOT_VERSION, want) == 0) {
+    updater_failback_confirm();
+    log_message(L_INFO, state, "[UPGRADE] Now running %s\n", BOT_VERSION);
+    return;
+  }
+  char note[192];
+  if (!updater_failback_note(note, sizeof(note))) snprintf(note, sizeof(note), "reason unknown");
+  log_message(L_INFO, state, "[UPGRADE] The upgrade to %s did not hold, back on %s: %s\n", want,
+              BOT_VERSION, note);
+}
+
+/* ---- Production crontab line --------------------------------------------
+ * An instance's keepalive line, tagged "# <product>:production:<dir>:".  Off
+ * unless a hub says otherwise, and only ever this one tagged line: everything
+ * else in the crontab is read and left alone.  The script runs as a child, so a
+ * slow crontab never holds up the event loop. */
+static pid_t g_cron_pid = 0;
+static time_t g_cron_started = 0, g_cron_next = 0, g_cron_stat = 0;
+static int g_cron_wanted = -1;  /* -1 no hub has said, 0 off, 1 on */
+static char g_cron_status[64] = "";
+static bool g_cron_ours = false;
+
+static const char *cron_helper_run_arg(const char *exe, const char **fail) {
+  *fail = NULL;
+  if (g_cron_wanted == 1 && access(PASS_FILE, F_OK) != 0) {
+    *fail = "no .ircbot.pass";
+    return NULL;
+  }
+  if (!failback_write(CRON_HELPER, exe, "", true, CONFIG_FILE, PID_FILE, "upgrade.sh", "",
+                      CRON_HELPER)) {
+    *fail = "cannot write here";
+    return NULL;
+  }
+  return g_cron_wanted == 1 ? "cron-on" : g_cron_wanted == 0 ? "cron-off" : "cron-status";
+}
+
+static void cron_note(int rc, time_t now) {
+  char next[sizeof(g_cron_status)];
+  g_cron_ours = rc == 0;
+  if (rc == 0) snprintf(next, sizeof(next), "yes");
+  else if (rc == 10) snprintf(next, sizeof(next), "manual");
+  else if (rc == 11 || g_cron_wanted != 1) snprintf(next, sizeof(next), "no");
+  else if (rc == 3) snprintf(next, sizeof(next), "failed:no crontab tool");
+  else if (rc == 4) snprintf(next, sizeof(next), "failed:unsafe path");
+  else snprintf(next, sizeof(next), "failed:cannot read crontab");
+  snprintf(g_cron_status, sizeof(g_cron_status), "%s", next);
+  g_cron_stat = now;
+}
+
+/* What updater_cron_tick last found: yes, silent, manual, no or failed:<why>. */
+const char *updater_cron_status(void) { return g_cron_status; }
+
+/* A hub's order. */
+void updater_cron_set(bool on) {
+  int want = on ? 1 : 0;
+  if (want != g_cron_wanted) g_cron_next = 0;
+  g_cron_wanted = want;
+}
+
+/* True when the status changed, so the hub should hear it. */
+bool updater_cron_tick(const char *exe) {
+  time_t now = time(NULL);
+  char before[sizeof(g_cron_status)];
+  snprintf(before, sizeof(before), "%s", g_cron_status);
+  if (g_cron_pid > 0) {
+    int st = 0;
+    pid_t r = waitpid(g_cron_pid, &st, WNOHANG);
+    if (r == 0) {
+      if (now - g_cron_started > CRON_HELPER_TIMEOUT) kill(g_cron_pid, SIGKILL);
+      return false;
+    }
+    g_cron_pid = 0;
+    remove(CRON_HELPER);
+    cron_note(r > 0 && WIFEXITED(st) ? WEXITSTATUS(st) : 1, now);
+  }
+  if (now >= g_cron_next && exe && exe[0]) {
+    const char *fail = NULL;
+    const char *arg = cron_helper_run_arg(exe, &fail);
+    if (!arg) {
+      snprintf(g_cron_status, sizeof(g_cron_status), "failed:%s", fail);
+      g_cron_next = now + CRON_CHECK_SECS;
+    } else {
+      pid_t pid = fork();
+      if (pid == 0) {
+        for (int fd = 3; fd < 1024; fd++) close(fd);
+        execl("./" CRON_HELPER, "./" CRON_HELPER, arg, (char *)NULL);
+        _exit(127);
+      }
+      if (pid > 0) {
+        g_cron_pid = pid;
+        g_cron_started = now;
+      }
+      /* Set before it finishes: an order that arrives meanwhile clears this, and
+       * must not be overwritten when this child ends. */
+      g_cron_next = now + CRON_CHECK_SECS;
+    }
+  }
+  /* The line stamps .cron.seen each time it runs: no stamp, no cron daemon. */
+  if (g_cron_ours && now - g_cron_stat >= 60) {
+    struct stat cs;
+    g_cron_stat = now;
+    bool quiet = stat(".cron.seen", &cs) != 0 || now - cs.st_mtime > CRON_SILENT_SECS;
+    snprintf(g_cron_status, sizeof(g_cron_status), "%s", quiet ? "silent" : "yes");
+  }
+  return strcmp(before, g_cron_status) != 0;
+}
+
+/* The node is being deleted: both tagged lines go.  0 gone, 10 gone but a
+ * hand-written line still runs this binary, anything else could not. */
+int updater_cron_drop(const char *exe) {
+  if (g_cron_pid > 0) {
+    kill(g_cron_pid, SIGKILL);
+    (void)waitpid(g_cron_pid, NULL, 0);
+    g_cron_pid = 0;
+  }
+  if (!failback_write(CRON_HELPER, exe, "", true, CONFIG_FILE, PID_FILE, "upgrade.sh", "",
+                      CRON_HELPER))
+    return 1;
+  pid_t pid = fork();
+  if (pid < 0) return 1;
+  if (pid == 0) {
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+    execl("./" CRON_HELPER, "./" CRON_HELPER, "cron-drop", (char *)NULL);
+    _exit(127);
+  }
+  int st = 0;
+  int rc = waitpid(pid, &st, 0) == pid && WIFEXITED(st) ? WEXITSTATUS(st) : 1;
+  remove(CRON_HELPER);
+  return rc;
+}
+
+/* A keepalive line can fire while an upgrade installs, when no daemon holds the
+ * pid lock.  Starting the old build then would make the new one refuse to start,
+ * so a start waits that out.  A stale file past its limits stops nothing. */
+bool updater_install_in_progress(void) {
+  char line[256];
+  FILE *f = fopen(FAILBACK_STATE, "r");
+  if (!f) return false;
+  bool got = fgets(line, sizeof(line), f) != NULL;
+  fclose(f);
+  if (!got) return false;
+  char *phase = strchr(line, '|');
+  if (!phase || strncmp(phase + 1, "installing|", 11) != 0) return false;
+  long long since = 0, pid = 0;
+  if (sscanf(phase + 12, "%lld|%lld", &since, &pid) != 2 || pid <= 0) return false;
+  if (time(NULL) - since > UPGRADE_BUILD_SECS + 60) return false;
+  return kill((pid_t)pid, 0) == 0;
+}
+
+
 /* Put back the binary and config a hub-driven upgrade retained, then restart
  * onto them.  Used for CMD_UPGRADE_ABORT: by the time it arrives the new
  * build is already the running process, so undoing it means another exec. */
@@ -256,6 +767,7 @@ bool updater_hub_rollback(bot_state_t *state, const char *reason) {
     return false;
   }
   remove(UPGRADE_MARKER_FILE);
+  failback_clear();
 
   irc_printf(state, "QUIT :Upgrade aborted; restoring previous build...\r\n");
   irc_disconnect(state);
@@ -392,6 +904,33 @@ static bool fetch_url(const char *url, http_response_t *response) {
   return (res == CURLE_OK);
 }
 
+/* A stage reports how far it has got in the note of its status line: "72%" while it
+ * fetches, "40% 18 of 45 files" while make runs, "~60% 120 of 200 crates" while cargo
+ * runs, whose crates differ too much in size for more than an estimate. */
+static void stage_say(const char *phase, const char *code, const char *note);
+static void stage_build_tick(void);
+static bool g_stage_fetching = false;     /* in the stage child, during its download */
+static const char *g_stage_build = NULL;  /* in the stage child, during its build */
+
+static int stage_fetch_tick(void *data, curl_off_t total, curl_off_t now, curl_off_t ut,
+                            curl_off_t un) {
+  (void)data;
+  (void)ut;
+  (void)un;
+  static int last = -1;
+  static time_t said = 0;
+  time_t t = time(NULL);
+  if (total <= 0 || t - said < 2) return 0;
+  int pct = (int)(now * 100 / total);
+  if (pct == last) return 0;
+  last = pct;
+  said = t;
+  char note[16];
+  snprintf(note, sizeof(note), "%d%%", pct);
+  stage_say("fetching", "", note);
+  return 0;
+}
+
 static bool download_file(const char *url, const char *outfile) {
   CURL *curl = curl_easy_init();
   if (!curl) return false;
@@ -421,6 +960,10 @@ static bool download_file(const char *url, const char *outfile) {
   UPDATER_SET_PROTOCOLS(curl);
   updater_set_ca(curl);
   updater_set_timeouts(curl);
+  if (g_stage_fetching) {
+    curl_easy_setopt(curl, CURLOPT_XFERINFOFUNCTION, stage_fetch_tick);
+    curl_easy_setopt(curl, CURLOPT_NOPROGRESS, 0L);
+  }
 
   CURLcode res = curl_easy_perform(curl);
   curl_easy_cleanup(curl);
@@ -804,11 +1347,6 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
               "[DEBUG] updater_perform_upgrade called for %s.\n",
               version_to_install);
 
-  http_response_t response;
-  char *binary_url = NULL;
-  char *expected_hash = NULL;
-  char *deps_to_check = NULL;
-
   /* Downgrade protection: refuse to install anything older than the running
    * build, defeating a replay of an old (but validly signed) manifest that
    * points at a known-vulnerable version. */
@@ -820,221 +1358,16 @@ void updater_perform_upgrade(bot_state_t *state, const char *nick,
     return;
   }
 
-  /* Fetch + Ed25519-verify the manifest before trusting any field in it. */
-  const char *verr = NULL;
-  char *manifest = fetch_verified_manifest(&verr);
-  if (!manifest) {
-    irc_printf(state, "PRIVMSG %s :Upgrade aborted: %s.\r\n",
-               nick, verr ? verr : "unknown error");
-    return;
-  }
-  response.buffer = manifest;
-  response.size = 0;
-
-  char *saveptr;
-  char *line = strtok_r(response.buffer, "\n", &saveptr);
-
-  while (line) {
-    char version[64], date[64], url[512], hash[128], deps[256];
-    if (sscanf(line, "%63s %63s %511s %127s %255s", version, date, url, hash,
-               deps) == 5) {
-      if (version_eq(version, version_to_install)) {
-        if (!validate_url(url)) {
-          irc_printf(state, "PRIVMSG %s :Error: Invalid or untrusted URL in release file.\r\n", nick);
-          free(response.buffer);
-          return;
-        }
-        binary_url = strdup(url);
-        expected_hash = strdup(hash);
-        deps_to_check = strdup(deps);
-        break;
-      }
-    }
-    line = strtok_r(NULL, "\n", &saveptr);
-  }
-
-  if (!binary_url) {
-    irc_printf(state,
-               "PRIVMSG %s :Error: Version '%s' not found in release file.\r\n",
-               nick, version_to_install);
-    if (response.buffer) free(response.buffer);
-    /* If strdup(url) failed mid-match while hash/deps succeeded, those two are
-     * non-NULL here; free(NULL) is a no-op for the normal not-found path. */
-    free(expected_hash);
-    free(deps_to_check);
-    return;
-  }
-  if (response.buffer) {
-    free(response.buffer);
-    response.buffer = NULL;
-  }
-
-  char failed_deps[256] = "";
-  bool all_deps_ok = true;
-  char *dep = strtok_r(deps_to_check, ",", &saveptr);
-  while (dep) {
-    if (!check_dependency(dep)) {
-      if (!all_deps_ok)
-        strncat(failed_deps, ", ",
-                sizeof(failed_deps) - strlen(failed_deps) - 1);
-      strncat(failed_deps, dep, sizeof(failed_deps) - strlen(failed_deps) - 1);
-      all_deps_ok = false;
-    }
-    dep = strtok_r(NULL, ",", &saveptr);
-  }
-  free(deps_to_check);
-
-  if (!all_deps_ok) {
-    irc_printf(
-        state,
-        "PRIVMSG %s :Error: Cannot upgrade. Missing dependencies: %s\r\n", nick,
-        failed_deps);
-    free(binary_url);
-    free(expected_hash);
-    return;
-  }
-
-  const char *url_filename = strrchr(binary_url, '/');
-  if (url_filename) {
-    url_filename++;
-  } else {
-    url_filename = "ircbot.tar.gz";
-  }
-  char safe_filename[256];
-  if (!sanitize_filename(url_filename, safe_filename, sizeof(safe_filename))) {
-    irc_printf(state, "PRIVMSG %s :Error: Invalid filename in URL.\r\n", nick);
-    free(binary_url);
-    free(expected_hash);
-    return;
-  }
-
-  irc_printf(state, "PRIVMSG %s :Downloading %s...\r\n", nick, safe_filename);
-  if (!download_file(binary_url, safe_filename)) {
-    irc_printf(state, "PRIVMSG %s :Error: Failed to download new version.\r\n",
-               nick);
-    free(binary_url);
-    free(expected_hash);
-    return;
-  }
-
-  irc_printf(state, "PRIVMSG %s :Verifying hash...\r\n", nick);
-  if (!verify_sha256(safe_filename, expected_hash)) {
-    irc_printf(state,
-               "PRIVMSG %s :Error: SHA256 hash mismatch! Aborting upgrade.\r\n",
-               nick);
-    remove(safe_filename);
-    free(binary_url);
-    free(expected_hash);
-    return;
-  }
-
-  free(binary_url);
-  free(expected_hash);
-
-  char dir_name[256];
-  snprintf(dir_name, sizeof(dir_name), "%s", safe_filename);
-  char *tar_gz = strstr(dir_name, ".tar.gz");
-  if (tar_gz) {
-    *tar_gz = '\0';
-  } else {
-    irc_printf(
-        state,
-        "PRIVMSG %s :Error: Invalid archive name. Must end in .tar.gz\r\n",
-        nick);
-    remove(safe_filename);
-    return;
-  }
-  config_write_with_state_pass(state);
-  char backup_path[PATH_MAX + 8];
-  snprintf(backup_path, sizeof(backup_path), "%s.backup", state->executable_path);
-  rename(state->executable_path, backup_path);
-
-  irc_printf(state, "PRIVMSG %s :Hash verified. Creating upgrade script...\r\n",
-             nick);
-
-  /* Create with mode 0700 atomically (no umask-dependent world-readable/
-   * writable window on a script we are about to exec); fchmod as belt-and-
-   * suspenders.  Avoids the TOCTOU between fopen and a later path-based chmod. */
-  int up_fd = open("upgrade.sh", O_WRONLY | O_CREAT | O_TRUNC, 0700);
-  FILE *f = (up_fd >= 0) ? fdopen(up_fd, "w") : NULL;
-  if (!f) {
-    if (up_fd >= 0) close(up_fd);
-    irc_printf(state,
-               "PRIVMSG %s :Error: Could not create upgrade.sh script.\r\n",
-               nick);
-    remove(safe_filename);
-    rename(backup_path, state->executable_path);
-    return;
-  }
-
-  fprintf(f, "#!/bin/bash\n");
-  fprintf(f, "set -e\n");
-  fprintf(f, "OLD_PID=%d\n", getpid());
-  fprintf(f, "echo \"[UPGRADE] Waiting for old process (PID: $OLD_PID) to exit...\"\n");
-  fprintf(f, "for i in {1..30}; do\n");
-  fprintf(f, "  if ! kill -0 $OLD_PID 2>/dev/null; then\n");
-  fprintf(f, "    break\n");
-  fprintf(f, "  fi\n");
-  fprintf(f, "  sleep 1\n");
-  fprintf(f, "done\n");
-  fprintf(f, "UPGRADE_DIR=\"./bot_build_tmp\"\n");
-  fprintf(f, "rm -rf \"$UPGRADE_DIR\"\n");
-  fprintf(f, "mkdir \"$UPGRADE_DIR\"\n");
-  fprintf(f, "if [ ! -d \"$UPGRADE_DIR\" ]; then\n");
-  fprintf(f, "  echo \"[UPGRADE] FATAL: Could not create build directory.\"\n");
-  fprintf(f, "  exit 1\n");
-  fprintf(f, "fi\n");
-  fprintf(f, "echo \"[UPGRADE] Unpacking archive...\"\n");
-  fprintf(f, "tar -xzf \"%s\" --strip-components=1 -C \"$UPGRADE_DIR\" 2>/dev/null\n", 
-          safe_filename);
-  fprintf(f, "if [ $? -ne 0 ]; then\n");
-  fprintf(f, "  echo \"[UPGRADE] FATAL: Failed to extract archive.\"\n");
-  fprintf(f, "  mv \"%s\" \"%s\" 2>/dev/null\n", backup_path, state->executable_path);
-  fprintf(f, "  exit 1\n");
-  fprintf(f, "fi\n");
-  fprintf(f, "echo \"[UPGRADE] Entering $UPGRADE_DIR and compiling...\"\n");
-  fprintf(f, "cd \"$UPGRADE_DIR\"\n");
-  fprintf(f, "make clean >/dev/null 2>&1\n");
-  fprintf(f, "make 2>&1 | tee make.log\n");
-  fprintf(f, "if [ ! -f ircbot ]; then\n");
-  fprintf(f, "  echo \"[UPGRADE] FATAL: Make failed. Binary not found.\"\n");
-  fprintf(f, "  echo \"[UPGRADE] Restoring backup...\"\n");
-  fprintf(f, "  cd ..\n");
-  fprintf(f, "  mv \"%s\" \"%s\" 2>/dev/null\n", backup_path, state->executable_path);
-  fprintf(f, "  rm -f \"%s\"\n", PID_FILE);
-  fprintf(f, "  rm -rf \"$UPGRADE_DIR\"\n");
-  fprintf(f, "  rm -f \"%s\"\n", safe_filename);
-  fprintf(f, "  exit 1\n");
-  fprintf(f, "fi\n");
-  fprintf(f, "echo \"[UPGRADE] Moving new binary into place...\"\n");
-  fprintf(f, "mv ircbot \"%s\"\n", state->executable_path);
-  fprintf(f, "chmod 700 \"%s\"\n", state->executable_path);
-  fprintf(f, "cd ..\n");
-  fprintf(f, "echo \"[UPGRADE] Removing old PID file...\"\n");
-  fprintf(f, "rm -f \"%s\"\n", PID_FILE);
-  fprintf(f, "echo \"[UPGRADE] Removing backup...\"\n");
-  fprintf(f, "rm -f \"%s\"\n", backup_path);
-  fprintf(f, "echo \"[UPGRADE] Scheduling cleanup...\"\n");
-  fprintf(f, "(sleep 5; rm -rf \"$UPGRADE_DIR\" \"%s\" \"./upgrade.sh\" 2>/dev/null) &\n",
-          safe_filename);
-  fprintf(f, "echo \"[UPGRADE] Restarting bot...\"\n");
-  fprintf(f, "exec %s\n", state->executable_path);
-
-  (void)fchmod(fileno(f), 0700);
-  fclose(f);
-
-  irc_printf(state, "QUIT :Upgrading to %s...\r\n", version_to_install);
-  irc_disconnect(state);
-  /* The chats' fds are close-on-exec anyway; this says goodbye first. */
-  dcc_close_all(state, "Bot upgrading; closing.");
-  close(state->pid_fd);
-
-  sleep(1);
-
-  execl("./upgrade.sh", "./upgrade.sh", NULL);
-
-  perror("execl failed");
-  exit(1);
+  /* One install path: the same checks, staging, script and failback as a
+   * hub-driven upgrade, with this id instead of a run's.  On success this does
+   * not return. */
+  char id[64];
+  snprintf(id, sizeof(id), "local-%lld", (long long)time(NULL));
+  irc_printf(state, "PRIVMSG %s :Installing %s...\r\n", nick, version_to_install);
+  const char *err = NULL;
+  if (!updater_hub_commit(state, id, version_to_install, "", &err))
+    irc_printf(state, "PRIVMSG %s :Upgrade aborted: %s.\r\n", nick,
+               err ? err : "unknown error");
 }
 
 /* ======================================================================
@@ -1103,6 +1436,7 @@ typedef struct {
   char libc[16];    /* gnu | musl | any       */
   char min_from[64];/* oldest version this may upgrade FROM; '*' = any */
   char cpu[256];    /* CPU features it needs, "-" = none (column 10)    */
+  unsigned long long size; /* archive + unpacked bytes (column 11), 0 = unknown */
 } manifest_row_t;
 
 /* The variant whose tree manifest_select() is reading, for its reasons. */
@@ -1230,9 +1564,9 @@ static bool manifest_select(char *manifest, const char *version,
     snprintf(row.libc, sizeof(row.libc), "any");
     snprintf(row.min_from, sizeof(row.min_from), "*");
     snprintf(row.cpu, sizeof(row.cpu), "-");
-    int n = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s %255s",
+    int n = sscanf(line, "%63s %63s %511s %127s %255s %7s %31s %15s %63s %255s %llu",
                    row.version, date, row.url, row.hash, row.deps, row.kind,
-                   row.arch, row.libc, row.min_from, row.cpu);
+                   row.arch, row.libc, row.min_from, row.cpu, &row.size);
     if (n < 5) continue;
     if (!version_eq(row.version, version)) continue;
 
@@ -1334,6 +1668,160 @@ static bool hub_set_tree(const char *want_variant, char *reason,
  * list an artifact for this host.  A node that answers "ready" and then fails
  * at COMMIT is what turns a routine run into an abort, so the question is
  * asked in full up front. */
+/* ---- Preflight (PREPARE) -----------------------------------------------
+ * Can this host take the build at all?  Asked before anything changes, so a
+ * full disk or a read-only directory is an "unable" with a reason an admin
+ * can act on, not a failed restart.  Each reason starts with a fixed code
+ * word (disk:, dir:, exe:, exec:, tool:, net:).  Only a probe file is
+ * written, and it is gone again before this returns.  The instance dir is the
+ * cwd: instance_dir_enter() put us there. */
+#ifndef ST_NOEXEC
+#define ST_NOEXEC 8 /* Linux: glibc hides it without _GNU_SOURCE */
+#endif
+
+static bool preflight_tool(const char *name) {
+  const char *path = getenv("PATH");
+  char work[1024], full[1100];
+  snprintf(work, sizeof(work), "%s", path && path[0] ? path : "/usr/bin:/bin");
+  char *save = NULL;
+  for (char *d = strtok_r(work, ":", &save); d; d = strtok_r(NULL, ":", &save)) {
+    snprintf(full, sizeof(full), "%s/%s", d, name);
+    if (access(full, X_OK) == 0) return true;
+  }
+  return false;
+}
+
+static bool preflight_dir_probe(char *reason, size_t reason_size, const char *dir) {
+  const char *probe = ".upgrade.probe", *moved = ".upgrade.probe2";
+  int fd = open(probe, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+  bool ok = fd >= 0 && write(fd, "x", 1) == 1 && fsync(fd) == 0;
+  int err = errno;
+  if (fd >= 0) close(fd);
+  if (ok && rename(probe, moved) != 0) {
+    ok = false;
+    err = errno;
+  }
+  (void)unlink(probe);
+  (void)unlink(moved);
+  if (!ok)
+    snprintf(reason, reason_size, "dir: cannot write %.160s: %s", dir, strerror(err));
+  return ok;
+}
+
+/* The binary must be ours, and not immutable: a hard link fails on that where
+ * a rename could not be tried without moving it.  A filesystem with no hard
+ * links at all still passes: it is a different errno. */
+static bool preflight_exe(const char *exe, char *reason, size_t reason_size) {
+  struct stat st;
+  if (stat(exe, &st) != 0) {
+    snprintf(reason, reason_size, "exe: cannot read %.160s: %s", exe, strerror(errno));
+    return false;
+  }
+  if (st.st_uid != geteuid()) {
+    snprintf(reason, reason_size, "exe: cannot replace %.160s: owned by another user", exe);
+    return false;
+  }
+  const char *probe = ".upgrade.probe3";
+  (void)unlink(probe);
+  int rc = link(exe, probe);
+  int err = errno;
+  (void)unlink(probe);
+  if (rc != 0 && (err == EPERM || err == EACCES)) {
+    snprintf(reason, reason_size, "exe: cannot replace %.160s: %s", exe, strerror(err));
+    return false;
+  }
+  return true;
+}
+
+/* Everything the swap will write, plus a margin.  A manifest row without the
+ * size column gets a fixed allowance; a source build always gets one on top,
+ * for its objects. */
+static bool preflight_space(const char *dir, const char *exe, const char *cfg,
+                            unsigned long long size,
+                            bool is_bin, const char *variant, char *reason,
+                            size_t reason_size) {
+  struct statvfs sv;
+  if (statvfs(".", &sv) != 0) return true; /* unknown: the stage will tell */
+  if (sv.f_flag & ST_NOEXEC) {
+    snprintf(reason, reason_size, "exec: %.160s is mounted noexec", dir);
+    return false;
+  }
+  if (sv.f_files > 0 && sv.f_favail < UPGRADE_MIN_INODES) {
+    snprintf(reason, reason_size, "disk: no free inodes in %.160s", dir);
+    return false;
+  }
+  unsigned long long need = size;
+  if (!need) need = is_bin ? UPGRADE_SPACE_BIN_DEFAULT : 0;
+  if (!is_bin)
+    need += strcmp(variant, "rs") == 0 ? UPGRADE_SPACE_BUILD_RS : UPGRADE_SPACE_BUILD_C;
+  struct stat st;
+  if (stat(cfg, &st) == 0 && st.st_size > 0) need += (unsigned long long)st.st_size;
+  if (stat(exe, &st) == 0 && st.st_size > 0) need += (unsigned long long)st.st_size;
+  need += UPGRADE_SPACE_MARGIN;
+  unsigned long long have = (unsigned long long)sv.f_bavail * sv.f_frsize;
+  if (have < need) {
+    snprintf(reason, reason_size, "disk: needs %llu MB in %.160s, has %llu MB",
+             need / (1024 * 1024) + 1, dir, have / (1024 * 1024));
+    return false;
+  }
+  return true;
+}
+
+/* HEAD on the artifact.  A server that does not do HEAD says nothing either
+ * way, so it passes and the download decides. */
+static bool preflight_artifact(const char *url, char *reason, size_t reason_size) {
+  CURL *h = curl_easy_init();
+  if (!h) return true;
+  g_fetch_quick = UPGRADE_QUICK_TIMEOUT;
+  curl_easy_setopt(h, CURLOPT_URL, url);
+  curl_easy_setopt(h, CURLOPT_NOBODY, 1L);
+  curl_easy_setopt(h, CURLOPT_USERAGENT, "ircbot-updater/1.0");
+  curl_easy_setopt(h, CURLOPT_FOLLOWLOCATION, 1L);
+  curl_easy_setopt(h, CURLOPT_SSL_VERIFYPEER, 1L);
+  curl_easy_setopt(h, CURLOPT_SSL_VERIFYHOST, 2L);
+  curl_easy_setopt(h, CURLOPT_FAILONERROR, 1L);
+  UPDATER_SET_PROTOCOLS(h);
+  updater_set_ca(h);
+  updater_set_timeouts(h);
+  g_fetch_quick = 0;
+  CURLcode res = curl_easy_perform(h);
+  long code = 0;
+  curl_easy_getinfo(h, CURLINFO_RESPONSE_CODE, &code);
+  curl_easy_cleanup(h);
+  const char *slash = strrchr(url, '/');
+  const char *name = slash ? slash + 1 : url;
+  if (code >= 400) {
+    if (code == 405 || code == 501) return true;
+    snprintf(reason, reason_size, "net: %ld from %.120s", code, name);
+    return false;
+  }
+  if (res != CURLE_OK) {
+    snprintf(reason, reason_size, "net: cannot reach %.120s: %s", name, curl_easy_strerror(res));
+    return false;
+  }
+  return true;
+}
+
+static bool preflight_host(const char *exe, const char *cfg, const char *url,
+                           unsigned long long size, const char *kind,
+                           const char *variant, char *reason, size_t reason_size) {
+  char dir[512];
+  if (!getcwd(dir, sizeof(dir))) snprintf(dir, sizeof(dir), ".");
+  bool is_bin = strcasecmp(kind, "bin") == 0;
+  if (!preflight_space(dir, exe, cfg, size, is_bin, variant, reason, reason_size)) return false;
+  if (!preflight_dir_probe(reason, reason_size, dir)) return false;
+  if (!preflight_exe(exe, reason, reason_size)) return false;
+  if (access("/bin/bash", X_OK) != 0) {
+    snprintf(reason, reason_size, "tool: /bin/bash not found");
+    return false;
+  }
+  if (!preflight_tool("tar")) {
+    snprintf(reason, reason_size, "tool: tar not found");
+    return false;
+  }
+  return preflight_artifact(url, reason, reason_size);
+}
+
 bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                                const char *variant, const char *min_from,
                                char *reason, size_t reason_size) {
@@ -1392,7 +1880,8 @@ bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
     snprintf(reason, reason_size, "manifest artifact is not a ircbot release");
     return false;
   }
-  return true;
+  return preflight_host(state->executable_path, CONFIG_FILE, row.url, row.size,
+                        row.kind, want_variant, reason, reason_size);
 }
 
 /* Run argv[0] with argv, stdout+stderr captured into `out` (first line
@@ -1422,7 +1911,10 @@ static int run_bounded(const char *const argv[], int timeout_s, char *out,
     /* execv() takes char *const[] for historical reasons only: POSIX never
      * writes through it, so the union passes the const array unchanged. */
     union { const char *const *ro; char *const *rw; } av = { .ro = argv };
-    execv(argv[0], av.rw);
+    /* A bare name (make, cargo) is looked up on PATH, as the Rust port's Command does;
+     * a path runs as given. */
+    if (strchr(argv[0], '/')) execv(argv[0], av.rw);
+    else execvp(argv[0], av.rw);
     _exit(127);
   }
   close(pipefd[1]);
@@ -1441,6 +1933,7 @@ static int run_bounded(const char *const argv[], int timeout_s, char *out,
         out[got] = '\0';
       }
     }
+    stage_build_tick();
     if (waitpid(pid, &status, WNOHANG) == pid) {
       done = true;
       break;
@@ -1496,13 +1989,333 @@ static bool staged_selftest(const char *archive, char *err, size_t err_size) {
   return true;
 }
 
+/* ---- Staging -------------------------------------------------------------
+ * Get the new build ready and proven while the old one keeps running.  A child
+ * does the work under STAGE_DIR and writes one status line after each phase; the
+ * event loop reads it and tells the hub.  COMMIT then only swaps a file.  Nothing
+ * here touches <exe>, and everything here is gone again if no COMMIT comes. */
+#define STAGE_DIR ".upgrade.stage"
+
+static pid_t g_stage_pid = 0;
+static char g_stage_id[64] = "", g_stage_ver[64] = "";
+static char g_stage_phase[16] = "", g_stage_code[16] = "", g_stage_note[192] = "";
+static time_t g_stage_started = 0, g_stage_said = 0, g_stage_done = 0;
+static bool g_stage_ready = false;
+
+static void stage_rm(void) {
+  const char *rm[] = {"/bin/rm", "-rf", STAGE_DIR, NULL};
+  run_bounded(rm, 30, NULL, 0);
+}
+
+/* In the child: one line, atomically, for the parent to read. */
+static void stage_say(const char *phase, const char *code, const char *note) {
+  char clean[192];
+  snprintf(clean, sizeof(clean), "%s", note ? note : "");
+  for (char *c = clean; *c; c++)
+    if (*c == '|' || *c == '\r' || *c == '\n') *c = ' ';
+  FILE *f = fopen(STAGE_DIR "/status.tmp", "w");
+  if (!f) return;
+  fprintf(f, "%s|%s|%s\n", phase, code ? code : "", clean);
+  if (fclose(f) == 0) (void)rename(STAGE_DIR "/status.tmp", STAGE_DIR "/status");
+}
+
+/* Files make has compiled so far: a top-level .c with its object in place. */
+static void stage_count_c(const char *dir, int *total, int *done) {
+  static const char *const where[] = {"", "build/", "build/obj/", "obj/"};
+  DIR *d = opendir(dir);
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL) {
+    size_t n = strlen(e->d_name);
+    if (n < 3 || n > 200 || strcmp(e->d_name + n - 2, ".c") != 0) continue;
+    (*total)++;
+    for (size_t i = 0; i < sizeof(where) / sizeof(where[0]); i++) {
+      char obj[512];
+      snprintf(obj, sizeof(obj), "%s/%s%.*s.o", dir, where[i], (int)(n - 2), e->d_name);
+      if (access(obj, F_OK) == 0) {
+        (*done)++;
+        break;
+      }
+    }
+  }
+  closedir(d);
+}
+
+/* Crates cargo has got to, against the packages its lock file names. */
+static void stage_count_crates(const char *dir, int *total, int *done) {
+  char path[512], line[64];
+  snprintf(path, sizeof(path), "%s/Cargo.lock", dir);
+  FILE *f = fopen(path, "r");
+  if (!f) return;
+  while (fgets(line, sizeof(line), f))
+    if (strncmp(line, "[[package]]", 11) == 0) (*total)++;
+  fclose(f);
+  snprintf(path, sizeof(path), "%s/target/release/.fingerprint", dir);
+  DIR *d = opendir(path);
+  if (!d) return;
+  struct dirent *e;
+  while ((e = readdir(d)) != NULL)
+    if (e->d_name[0] != '.') (*done)++;
+  closedir(d);
+}
+
+/* From run_bounded's loop: at most one look every 5 s, and a word only on a change. */
+static void stage_build_tick(void) {
+  static time_t said = 0;
+  static char last[64] = "";
+  if (!g_stage_build) return;
+  time_t t = time(NULL);
+  if (t - said < 5) return;
+  said = t;
+  char path[512], note[64];
+  int total = 0, done = 0;
+  snprintf(path, sizeof(path), "%s/Cargo.toml", g_stage_build);
+  bool crates = access(path, R_OK) == 0;
+  if (crates) stage_count_crates(g_stage_build, &total, &done);
+  else stage_count_c(g_stage_build, &total, &done);
+  if (total <= 0) return;
+  if (done > total) done = total;
+  int pct = done * 100 / total;
+  if (pct > 99) pct = 99;
+  snprintf(note, sizeof(note), "%s%d%% %d of %d %s", crates ? "~" : "", pct, done, total,
+           crates ? "crates" : "files");
+  if (strcmp(note, last) == 0) return;
+  snprintf(last, sizeof(last), "%s", note);
+  stage_say("building", "src", note);
+}
+
+static void stage_fail(const char *code, const char *note) {
+  stage_say("failed", code, note);
+  _exit(1);
+}
+
+/* The whole job, in the child. */
+static void stage_child(const char *ver, const char *variant, const char *exe) {
+  (void)exe;
+  char why[320] = "";
+  /* A run names no variant unless the admin chose one: this host's own, as at PREPARE. */
+  if (!variant || !variant[0]) variant = updater_host_variant();
+  stage_say("fetching", "", "");
+  if (!hub_set_tree(variant, why, sizeof(why))) stage_fail("net", why);
+  const char *verr = NULL;
+  char *manifest = fetch_verified_manifest(&verr);
+  if (!manifest) {
+    const char *t = verr ? verr : "manifest fetch failed";
+    stage_fail(strstr(t, "signature") ? "sig" : "net", t);
+  }
+  manifest_row_t row;
+  memset(&row, 0, sizeof(row));
+  g_select_variant = variant;
+  bool picked = manifest_select(manifest, ver, &row, why, sizeof(why));
+  free(manifest);
+  if (!picked) stage_fail("build", why[0] ? why : "no usable artifact");
+  bool is_bin = strcasecmp(row.kind, "bin") == 0;
+  const char *archive = STAGE_DIR "/archive.tar.gz";
+  g_stage_fetching = true;
+  bool fetched = download_file(row.url, archive);
+  g_stage_fetching = false;
+  if (!fetched) stage_fail("net", "artifact download failed");
+  stage_say("verifying", is_bin ? "bin" : "src", "");
+  if (!verify_sha256(archive, row.hash)) stage_fail("hash", "artifact SHA-256 mismatch");
+  const char *bdir = STAGE_DIR "/build";
+  if (mkdir(bdir, 0700) != 0) stage_fail("dir", "could not make the build directory");
+  char out[256] = "";
+  const char *tar[] = {"/bin/tar", "-xzf", archive, "--strip-components=1", "-C", bdir, NULL};
+  if (access("/bin/tar", X_OK) != 0) tar[0] = "/usr/bin/tar";
+  if (run_bounded(tar, 120, out, sizeof(out)) != 0)
+    stage_fail("archive", "could not unpack the artifact");
+  char bin[256];
+  snprintf(bin, sizeof(bin), "%s/ircbot", bdir);
+  if (!is_bin) {
+    stage_say("building", "src", "");
+    g_stage_build = bdir;
+    char cargo[256];
+    snprintf(cargo, sizeof(cargo), "%s/Cargo.toml", bdir);
+    int rc;
+    if (access(cargo, R_OK) == 0) {
+      const char *cb[] = {"cargo", "build", "--release", "--manifest-path", cargo, NULL};
+      rc = run_bounded(cb, UPGRADE_BUILD_SECS - 60, out, sizeof(out));
+      snprintf(bin, sizeof(bin), "%s/target/release/ircbot", bdir);
+    } else {
+      const char *mk[] = {"make", "-C", bdir, NULL};
+      rc = run_bounded(mk, UPGRADE_BUILD_SECS - 60, out, sizeof(out));
+      
+    }
+    g_stage_build = NULL;
+    if (rc < 0) stage_fail("build", "the build ran past its limit");
+    if (rc != 0 || access(bin, F_OK) != 0) {
+      snprintf(why, sizeof(why), "the build failed: %.200s", out);
+      stage_fail("build", why);
+    }
+  }
+  if (access(bin, F_OK) != 0) stage_fail("archive", "the artifact holds no ircbot binary");
+  (void)chmod(bin, 0700);
+  stage_say("testing", is_bin ? "bin" : "src", "");
+  const char *st[] = {bin, "-selftest", NULL};
+  int rc = run_bounded(st, UPGRADE_SELFTEST_SECS, out, sizeof(out));
+  if (rc != 0) {
+    snprintf(why, sizeof(why), "new build failed its selftest: %.200s",
+             out[0] ? out : (rc < 0 ? "timed out" : "it exited with an error"));
+    stage_fail("selftest", why);
+  }
+  if (rename(bin, STAGE_DIR "/new") != 0) stage_fail("dir", "could not keep the staged build");
+  const char *rmb[] = {"/bin/rm", "-rf", bdir, archive, NULL};
+  run_bounded(rmb, 60, NULL, 0);
+  stage_say("staged", is_bin ? "bin" : "src", "");
+  _exit(0);
+}
+
+/* A hub's STAGE.  Starting again for the same build is a no-op, so a repeat costs
+ * nothing. */
+void updater_stage_start(const char *exe, const char *id, const char *ver, const char *variant) {
+  if (g_stage_id[0] && strcmp(g_stage_id, id) == 0 && (g_stage_pid > 0 || g_stage_ready)) return;
+  updater_stage_clear();
+  stage_rm();
+  snprintf(g_stage_id, sizeof(g_stage_id), "%s", id);
+  snprintf(g_stage_ver, sizeof(g_stage_ver), "%s", ver);
+  snprintf(g_stage_phase, sizeof(g_stage_phase), "fetching");
+  g_stage_code[0] = g_stage_note[0] = '\0';
+  g_stage_started = time(NULL);
+  g_stage_said = 0;
+  if (mkdir(STAGE_DIR, 0700) != 0) {
+    snprintf(g_stage_phase, sizeof(g_stage_phase), "failed");
+    snprintf(g_stage_code, sizeof(g_stage_code), "dir");
+    snprintf(g_stage_note, sizeof(g_stage_note), "could not make %s", STAGE_DIR);
+    return;
+  }
+  pid_t pid = fork();
+  if (pid == 0) {
+    for (int fd = 3; fd < 1024; fd++) close(fd);
+    /* It goes when the daemon goes: a stage belongs to one process. */
+    (void)prctl(PR_SET_PDEATHSIG, SIGTERM);
+    stage_child(ver, variant, exe);
+    _exit(1);
+  }
+  if (pid < 0) {
+    snprintf(g_stage_phase, sizeof(g_stage_phase), "failed");
+    snprintf(g_stage_code, sizeof(g_stage_code), "fork");
+    snprintf(g_stage_note, sizeof(g_stage_note), "could not start the stage");
+    return;
+  }
+  g_stage_pid = pid;
+}
+
+void updater_stage_clear(void) {
+  if (g_stage_pid > 0) {
+    kill(g_stage_pid, SIGKILL);
+    (void)waitpid(g_stage_pid, NULL, 0);
+    g_stage_pid = 0;
+  }
+  if (g_stage_id[0]) stage_rm();
+  g_stage_id[0] = g_stage_phase[0] = '\0';
+  g_stage_ready = false;
+}
+
+/* True when the hub should hear: "phase|code|note" in out, with the run's id. */
+bool updater_stage_tick(char *id, size_t id_size, char *out, size_t out_size) {
+  if (!g_stage_id[0]) return false;
+  time_t now = time(NULL);
+  bool changed = false;
+  if (g_stage_pid > 0) {
+    char line[256];
+    FILE *f = fopen(STAGE_DIR "/status", "r");
+    if (f) {
+      if (fgets(line, sizeof(line), f)) {
+        line[strcspn(line, "\r\n")] = '\0';
+        char *c1 = strchr(line, '|');
+        char *c2 = c1 ? strchr(c1 + 1, '|') : NULL;
+        if (c1 && c2) {
+          *c1 = *c2 = '\0';
+          if (strcmp(g_stage_phase, line) != 0) changed = true;
+          snprintf(g_stage_phase, sizeof(g_stage_phase), "%.15s", line);
+          snprintf(g_stage_code, sizeof(g_stage_code), "%.15s", c1 + 1);
+          snprintf(g_stage_note, sizeof(g_stage_note), "%.191s", c2 + 1);
+        }
+      }
+      fclose(f);
+    }
+    int st = 0;
+    pid_t r = waitpid(g_stage_pid, &st, WNOHANG);
+    if (r != 0) {
+      g_stage_pid = 0;
+      if (strcmp(g_stage_phase, "staged") == 0 && access(STAGE_DIR "/new", X_OK) == 0) {
+        g_stage_ready = true;
+        g_stage_done = now;
+      } else if (strcmp(g_stage_phase, "failed") != 0) {
+        snprintf(g_stage_phase, sizeof(g_stage_phase), "failed");
+        snprintf(g_stage_code, sizeof(g_stage_code), "stopped");
+        snprintf(g_stage_note, sizeof(g_stage_note), "the stage stopped before it finished");
+      }
+      changed = true;
+    } else if (now - g_stage_started > UPGRADE_BUILD_SECS) {
+      kill(g_stage_pid, SIGKILL);
+      (void)waitpid(g_stage_pid, NULL, 0);
+      g_stage_pid = 0;
+      snprintf(g_stage_phase, sizeof(g_stage_phase), "failed");
+      snprintf(g_stage_code, sizeof(g_stage_code), "limit");
+      snprintf(g_stage_note, sizeof(g_stage_note), "the stage ran past its limit");
+      changed = true;
+    }
+  }
+  /* A failed stage holds nothing worth keeping, and the run may not come back to say so. */
+  if (changed && g_stage_pid <= 0 && strcmp(g_stage_phase, "failed") == 0) stage_rm();
+  if (g_stage_ready && now - g_stage_done > UPGRADE_STAGE_KEEP) {
+    updater_stage_clear();
+    return false;
+  }
+  /* A beat while it works: silence is how the driver tells a stage has died. */
+  if (!changed && (g_stage_pid <= 0 || now - g_stage_said < UPGRADE_STAGE_BEAT)) {
+    if (g_stage_said) return false;
+  }
+  g_stage_said = now;
+  snprintf(id, id_size, "%s", g_stage_id);
+  snprintf(out, out_size, "%s|%s|%s", g_stage_phase, g_stage_code, g_stage_note);
+  return true;
+}
+
+/* A stage belongs to one process: whatever a dead one left is rubbish. */
+void updater_stage_boot_clean(void) {
+  if (access(STAGE_DIR, F_OK) == 0) stage_rm();
+}
+
+/* The staged build for this run, ready to swap in. */
+static bool stage_ready_for(const char *id, const char *ver) {
+  return g_stage_ready && strcmp(g_stage_id, id) == 0 && strcmp(g_stage_ver, ver) == 0 &&
+         access(STAGE_DIR "/new", X_OK) == 0;
+}
+
 /* Write the upgrade script for a hub-driven commit.  `kind` decides the
  * middle of it: a prebuilt binary is unpacked and moved into place, a source
  * tarball is compiled first.  Either way the previous binary stays at
  * <exe>.prev — the hub, not the script, decides whether to keep it. */
+/* Lay the script down and put it in cron, before anything changes.  A host with
+ * no usable cron still has the upgrade script's own loop: it loses only the
+ * reboot cover, and says so. */
+static bool failback_stage(const char *exe, const char *id, bool is_bin,
+                           const char *cfg, const char *pidf, const char *script,
+                           const char *note) {
+  if (!failback_write(FAILBACK_FILE, exe, id, is_bin, cfg, pidf, script, note, FAILBACK_FILE))
+    return false;
+  FILE *f;
+  /* The state first: a tick that finds none takes the script away again.  exec
+   * keeps this pid, so it already names the upgrade script. */
+  remove(FAILBACK_CONFIRM);
+  f = fopen(FAILBACK_STATE ".tmp", "w");
+  if (!f) {
+    remove(FAILBACK_FILE);
+    return false;
+  }
+  fprintf(f, "%s|installing|%lld|%d|\n", id, (long long)time(NULL), (int)getpid());
+  if (fclose(f) != 0 || rename(FAILBACK_STATE ".tmp", FAILBACK_STATE) != 0) {
+    remove(FAILBACK_STATE ".tmp");
+    remove(FAILBACK_FILE);
+    return false;
+  }
+  return true;
+}
+
 static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
-                                     const char *archive, const char *prev_path,
-                                     bool selftest) {
+                                     const char *archive, bool selftest) {
   /* 0700 at creation: no umask-dependent window on a script we are about to
    * exec (same reasoning as the standalone path). */
   int fd = open("upgrade.sh", O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0700);
@@ -1513,6 +2326,7 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   }
   const char *exe = state->executable_path;
   bool is_bin = (strcasecmp(kind, "bin") == 0);
+  bool is_staged = (strcasecmp(kind, "staged") == 0);
 
   fprintf(f, "#!/bin/bash\n");
   fprintf(f, "set -u\n");
@@ -1531,18 +2345,26 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
    * it, so a bot that cannot upgrade still comes back on the old build. */
   fprintf(f, "rollback() {\n");
   fprintf(f, "  echo \"[UPGRADE] FAILED: $1 — restoring previous build\"\n");
-  fprintf(f, "  mv -f \"%s\" \"%s\" 2>/dev/null\n", prev_path, exe);
-  /* The marker stays: the old build reports "version-mismatch" on its first
-   * hub link, so the driver learns of the failure at once. */
-  fprintf(f, "  rm -f \"%s\"\n", PID_FILE);
+  fprintf(f, "  ./" FAILBACK_FILE " restore \"$1\"\n");
   fprintf(f, "  rm -rf \"$UPGRADE_DIR\" \"%s\"\n", archive);
-  fprintf(f, "  exec \"%s\"\n", exe);
+  fprintf(f, "  wait\n");
+  fprintf(f, "  rm -f \"./upgrade.sh\"\n");
+  fprintf(f, "  exit 0\n");
   fprintf(f, "}\n");
+  /* The failback's loop runs through every phase, so a hung build or a new
+   * build that never confirms is undone even with no cron on this host. */
+  fprintf(f, "./" FAILBACK_FILE " phase installing $$\n");
+  fprintf(f, "( while ./" FAILBACK_FILE " tick; do sleep 10; done ) </dev/null >/dev/null 2>&1 &\n");
+  if (!is_staged)
   fprintf(f, "tar -xzf \"%s\" --strip-components=1 -C \"$UPGRADE_DIR\" "
              "2>/dev/null || rollback \"could not extract artifact\"\n",
           archive);
 
-  if (is_bin) {
+  if (is_staged) {
+    /* Fetched, built and selftested while the old build ran: only the swap is left. */
+    fprintf(f, "NEW_BIN=\"" STAGE_DIR "/new\"\n");
+    fprintf(f, "[ -x \"$NEW_BIN\" ] || rollback \"the staged build is gone\"\n");
+  } else if (is_bin) {
     /* Prebuilt: the tarball holds the binary itself, no toolchain needed. */
     fprintf(f, "NEW_BIN=\"$UPGRADE_DIR/ircbot\"\n");
     fprintf(f, "[ -f \"$NEW_BIN\" ] || rollback \"artifact contains no ircbot binary\"\n");
@@ -1571,29 +2393,13 @@ static bool write_hub_upgrade_script(const bot_state_t *state, const char *kind,
   fprintf(f, "chmod 700 \"%s\"\n", exe);
   fprintf(f, "rm -f \"%s\"\n", PID_FILE);
   fprintf(f, "rm -rf \"$UPGRADE_DIR\" \"%s\" 2>/dev/null\n", archive);
-  /* Startup watchdog.  The new build daemonizes, so the script outlives it:
-   * start it, give it UPGRADE_WATCH_SECS, and if its daemon is not alive by
-   * then put the retained build (and config) back and start that instead.  A
-   * build that cannot come up on this host costs one restart, not a dead
-   * node only an admin can revive.  The marker is kept, so the old build
-   * reports "version-mismatch" at once. */
+  /* From here the failback decides.  The marker stays either way, so a restored
+   * build reports why on its first link. */
+  fprintf(f, "rm -rf " STAGE_DIR " 2>/dev/null\n");
+  fprintf(f, "./" FAILBACK_FILE " phase started $$\n");
   fprintf(f, "\"%s\" </dev/null >/dev/null 2>&1\n", exe);
-  fprintf(f, "sleep %d\n", UPGRADE_WATCH_SECS);
-  fprintf(f, "P=$(cat \"%s\" 2>/dev/null | tr -dc 0-9)\n", PID_FILE);
-  fprintf(f, "if [ -z \"$P\" ] || ! kill -0 \"$P\" 2>/dev/null; then\n");
-  /* Nothing retained (an admin put a build back by hand): the binary in
-   * place is the only one there is, so it is never moved aside. */
-  fprintf(f, "  [ -f \"%s\" ] || exit 1\n", prev_path);
-  fprintf(f, "  echo \"[UPGRADE] new build did not stay up — restoring previous build\"\n");
-  fprintf(f, "  mv -f \"%s\" \"%s.failed\" 2>/dev/null\n", exe, exe);
-  fprintf(f, "  mv -f \"%s\" \"%s\" || { mv -f \"%s.failed\" \"%s\"; exit 1; }\n",
-          prev_path, exe, exe, exe);
-  fprintf(f, "  [ -f \"%s%s\" ] && cp -f \"%s%s\" \"%s\"\n", CONFIG_FILE,
-          UPGRADE_PREV_SUFFIX, CONFIG_FILE, UPGRADE_PREV_SUFFIX, CONFIG_FILE);
-  fprintf(f, "  rm -f \"%s\" ./upgrade.sh\n", PID_FILE);
-  fprintf(f, "  exec \"%s\"\n", exe);
-  fprintf(f, "fi\n");
-  fprintf(f, "rm -f ./upgrade.sh\n");
+  fprintf(f, "wait\n");
+  fprintf(f, "rm -f \"./upgrade.sh\"\n");
   fprintf(f, "exit 0\n");
 
   (void)fchmod(fileno(f), 0700);
@@ -1625,6 +2431,15 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   log_message(L_INFO, state, "[UPGRADE] Hub commit %s: %s -> %s (variant %s)\n",
               upgrade_id, BOT_VERSION, target_ver, want_variant);
 
+  manifest_row_t row;
+  memset(&row, 0, sizeof(row));
+  char archive[256] = "";
+  bool staged = stage_ready_for(upgrade_id, target_ver);
+  if (staged) {
+    snprintf(row.kind, sizeof(row.kind), "staged");
+    log_message(L_INFO, state, "[UPGRADE] Using the build staged for %s\n", target_ver);
+  } else {
+  updater_stage_clear();
   const char *verr = NULL;
   char *manifest = fetch_verified_manifest(&verr);
   if (!manifest) {
@@ -1632,8 +2447,6 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     return false;
   }
 
-  manifest_row_t row;
-  memset(&row, 0, sizeof(row));
   static char why[320];
   g_select_variant = want_variant;
   bool picked = manifest_select(manifest, target_ver, &row, why, sizeof(why));
@@ -1644,7 +2457,6 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     return false;
   }
 
-  char archive[256];
   const char *slash = strrchr(row.url, '/');
   if (!sanitize_filename(slash ? slash + 1 : "ircbot.tar.gz", archive,
                          sizeof(archive))) {
@@ -1691,11 +2503,18 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     log_message(L_INFO, state, "[UPGRADE] Staged %s passed its selftest\n",
                 target_ver);
   }
+  }
 
   /* Flush the live config, then snapshot the pair we may have to restore.
-   * The config is copied (the running bot still needs it); the binary is
-   * renamed, which is atomic and leaves <exe>.prev ready for a rollback. */
+   * Both are copied: <exe> stays in place until the new one is renamed over it,
+   * so there is never a moment with no binary there. */
+  unsigned long saves = config_saves();
   config_write_with_state_pass(state);
+  if (config_saves() == saves) {
+    if (archive[0]) remove(archive);
+    *err = "could not save the config before the swap";
+    return false;
+  }
   char prev_cfg[PATH_MAX];
   char prev_exe[PATH_MAX + 8];
   if (snprintf(prev_cfg, sizeof(prev_cfg), "%s%s", CONFIG_FILE,
@@ -1711,7 +2530,11 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     *err = "could not snapshot config for rollback";
     return false;
   }
-  if (rename(state->executable_path, prev_exe) != 0) {
+  char prev_tmp[PATH_MAX + 16];
+  snprintf(prev_tmp, sizeof(prev_tmp), "%s.tmp", prev_exe);
+  if (!copy_file(state->executable_path, prev_tmp, 0700) ||
+      rename(prev_tmp, prev_exe) != 0) {
+    remove(prev_tmp);
     remove(prev_cfg);
     remove(archive);
     *err = "could not retain previous binary";
@@ -1729,16 +2552,24 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
     snprintf(ops + ol, sizeof(ops) - ol, "%s%s", ol ? " " : "", c->name);
   }
   if (!upgrade_marker_write(upgrade_id, target_ver, want_variant, ops) ||
-      !write_hub_upgrade_script(state, row.kind, archive, prev_exe,
-                                true)) {
+      !write_hub_upgrade_script(state, row.kind, archive, true) ||
+      !failback_stage(state->executable_path, upgrade_id,
+                      strcasecmp(row.kind, "src") != 0, CONFIG_FILE, PID_FILE,
+                      "upgrade.sh", state->hub_count ? "no hub link and IRC" : "no IRC")) {
+    failback_clear();
     remove(UPGRADE_MARKER_FILE);
-    rename(prev_exe, state->executable_path);
+    remove(prev_exe);
     remove(prev_cfg);
     remove(archive);
     *err = "could not stage the upgrade script";
     return false;
   }
 
+  int cron = failback_run("install");
+  if (cron != 0)
+    log_message(L_INFO, state,
+                "[UPGRADE] No cron failback on this host (%d): it will not survive "
+                "a reboot during this upgrade\n", cron);
   log_message(L_INFO, state, "[UPGRADE] Installing %s and restarting\n",
               target_ver);
   irc_printf(state, "QUIT :Upgrading to %s (hub-managed)...\r\n", target_ver);
@@ -1749,8 +2580,9 @@ bool updater_hub_commit(bot_state_t *state, const char *upgrade_id,
   sleep(1);
 
   execl("./upgrade.sh", "./upgrade.sh", NULL);
-  /* exec failed: put the old binary back so the node is not left dead. */
-  rename(prev_exe, state->executable_path);
+  /* exec failed: <exe> was never moved, so this node is still whole. */
+  failback_clear();
+  remove(prev_exe);
   remove(UPGRADE_MARKER_FILE);
   handle_fatal_error("execl upgrade.sh");
 }
@@ -1776,6 +2608,16 @@ bool updater_hub_prepare_check(bot_state_t *state, const char *target_ver,
                                char *reason, size_t reason_size) {
   (void)state; (void)target_ver; (void)variant; (void)min_from;
   snprintf(reason, reason_size, "bot compiled without curl support");
+  return false;
+}
+
+void updater_stage_start(const char *exe, const char *id, const char *ver, const char *variant) {
+  (void)exe; (void)id; (void)ver; (void)variant;
+}
+void updater_stage_clear(void) {}
+void updater_stage_boot_clean(void) {}
+bool updater_stage_tick(char *id, size_t id_size, char *out, size_t out_size) {
+  (void)id; (void)id_size; (void)out; (void)out_size;
   return false;
 }
 

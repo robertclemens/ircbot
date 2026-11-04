@@ -993,6 +993,11 @@ int main(int argc, char *argv[]) {
 
   if (do_identity) return run_identity(startup_password);
 
+  if (updater_install_in_progress()) {
+    fprintf(stderr, "An upgrade is installing here; not starting\n");
+    return 0;
+  }
+  updater_stage_boot_clean();
   printf("%s %s\n", BOT_NAME, BOT_VERSION);
   fflush(stdout); /* or the buffered lines are written again by the fork */
   daemonize();
@@ -1057,6 +1062,9 @@ int main(int argc, char *argv[]) {
     commands_activity_tick(&state, time(NULL));
     chanenf_tick(&state);
     hub_client_upgrade_report_tick(&state);
+    if (updater_cron_tick(state.executable_path)) hub_client_send_presence(&state, true);
+    updater_standalone_tick(&state);
+    hub_client_stage_tick(&state);
 
     /* Debounced config flush.  auth_mark_used() sets config_dirty whenever it
      * bumps last_seen / last_used, which happens on every successful admin
