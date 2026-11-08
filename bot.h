@@ -37,7 +37,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.5.2"
+#define BOT_VERSION "2.5.3"
 #endif
 
 // Only edit this section
