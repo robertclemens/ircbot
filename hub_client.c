@@ -504,8 +504,13 @@ static void hub_client_send_upgrade_progress(bot_state_t *state, const char *id,
 void hub_client_stage_tick(bot_state_t *state) {
   char id[64], status[256];
   if (!updater_stage_tick(id, sizeof(id), status, sizeof(status))) return;
+  /* No link: keep it owed, so the hub hears it once the link is back. */
+  if (!state->hub_authenticated) {
+    updater_stage_unsaid();
+    return;
+  }
   log_message(L_DEBUG, state, "[UPGRADE] Stage of %s: %s\n", id, status);
-  if (state->hub_authenticated) hub_client_send_upgrade_progress(state, id, status);
+  hub_client_send_upgrade_progress(state, id, status);
 }
 
 static void hub_client_send_upgrade_ready(bot_state_t *state, const char *id,

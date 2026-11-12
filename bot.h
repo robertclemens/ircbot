@@ -1745,6 +1745,8 @@ bool updater_install_in_progress(void);
 void updater_stage_start(const char *exe, const char *id, const char *ver, const char *variant);
 void updater_stage_clear(void);
 void updater_stage_boot_clean(void);
+void updater_stage_unsaid(void);
+int updater_stage_main(const char *ver, const char *variant);
 void hub_client_stage_tick(bot_state_t *state);
 bool updater_stage_tick(char *id, size_t id_size, char *out, size_t out_size);
 bool updater_failback_note(char *out, size_t out_size);

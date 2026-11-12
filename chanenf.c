@@ -540,6 +540,8 @@ static ban_track_t *track_get(bot_state_t *state, const char *chan,
     if (state->ban_track_count < state->ban_track_cap)
       t = &state->ban_track[state->ban_track_count++];
   }
+  if (!t && !oldest && !state->ban_track)
+    handle_fatal_error("realloc failed for ban_track");
   if (!t)
     t = oldest ? oldest : &state->ban_track[0]; /* full (or no memory) */
   memset(t, 0, sizeof(*t));
