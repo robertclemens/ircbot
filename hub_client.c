@@ -418,6 +418,57 @@ void hub_client_sync_hostmask(bot_state_t *state) {
                         state->actual_hostname_ts);
 }
 
+/* Phase 4 (presence v2 J): the bot's link-order counter.  Read from
+ * LINK_ORD_FILE, and bumped+persisted once per hub link (hub_client_link_ord_bump),
+ * so a bot that moves hubs carries a strictly larger value to its new hub than
+ * the stale one its old hub still gossips.  Persisted so a restart (also a new
+ * link) keeps climbing and never loses to a sighting that predates it. */
+static uint64_t hub_client_link_ord_read(bot_state_t *state) {
+  FILE *f = fopen(LINK_ORD_FILE, "r");
+  if (!f) return 0;
+  char buf[32] = "";
+  bool got = fgets(buf, sizeof(buf), f) != NULL;
+  fclose(f);
+  buf[strcspn(buf, "\r\n")] = '\0';
+  char *end = NULL;
+  errno = 0;
+  unsigned long long v = strtoull(buf, &end, 10);
+  if (!got || errno || !end || *end || end == buf) {
+    /* Restarting from 1 loses moved-bot ordering until it climbs past the
+     * old value; the hubs' clocks decide meanwhile. */
+    log_message(L_INFO, state, "[HUB] %s unreadable: link-order counter restarts\n",
+                LINK_ORD_FILE);
+    return 0;
+  }
+  return (uint64_t)v;
+}
+
+static void hub_client_link_ord_bump(bot_state_t *state) {
+  /* Above both the file and this process's own value, so a counter that could
+   * not be saved still rises for this process. */
+  uint64_t v = hub_client_link_ord_read(state);
+  if (state->link_ord > v) v = state->link_ord;
+  v++;
+  char tmp[64], buf[32];
+  snprintf(tmp, sizeof(tmp), "%s.tmp", LINK_ORD_FILE);
+  int n = snprintf(buf, sizeof(buf), "%llu\n", (unsigned long long)v);
+  int fd = open(tmp, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+  bool ok = fd >= 0;
+  if (ok) {
+    ok = write(fd, buf, (size_t)n) == (ssize_t)n && fsync(fd) == 0;
+    ok = close(fd) == 0 && ok;
+  }
+  if (ok) ok = rename(tmp, LINK_ORD_FILE) == 0;
+  if (!ok) {
+    /* The worst case is a restart that reuses a value, which the clock
+     * fallback then settles. */
+    log_message(L_INFO, state, "[HUB] cannot write %s: %s\n", LINK_ORD_FILE,
+                strerror(errno));
+    unlink(tmp);
+  }
+  state->link_ord = v;
+}
+
 /* Tell the hub what we are running: version, the IRC server we are actually
  * on, and when this process started.  Volatile on both sides -- it feeds the
  * 'bots' tree and nothing else, and is never written to either config.
@@ -455,9 +506,10 @@ void hub_client_send_presence(bot_state_t *state, bool force) {
   /* The variant rides last: a hub that predates it reads the start time
    * with atoll(), which stops at the '|', so older hubs are unaffected. */
   char payload[TREE_VERSION_MAX + TREE_SERVER_MAX + TREE_VARIANT_MAX + 128];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld|%s|%s",
+  int pay_len = snprintf(payload, sizeof(payload), "%s|%s|%lld|%s|%s|%llu",
                          BOT_VERSION, server, (long long)state->bot_start_time,
-                         BOT_UPDATE_VARIANT, updater_cron_status());
+                         BOT_UPDATE_VARIANT, updater_cron_status(),
+                         (unsigned long long)state->link_ord);
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload)) return;
 
   if (hub_send_frame(state, CMD_BOT_PRESENCE, payload, pay_len)) {
@@ -882,6 +934,18 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
   if (!payload || payload_len <= 0) return;
   payload[payload_len] = '\0';
 
+  /* Phase 5: keep the raw bytes before strtok_r mangles them, so a later
+   * CMD_BOT_TREE_DELTA edits and re-hashes exactly what the hub hashed.  Too
+   * large to hold (-1) means the delta fast-path is off: a delta pulls the
+   * whole tree, and the keepalive hash is not checked (it could only pull the
+   * same tree again every PING). */
+  if (payload_len <= TREE_RAW_MAX) {
+    memcpy(state->bot_tree_raw, payload, (size_t)payload_len);
+    state->bot_tree_raw_len = payload_len;
+  } else {
+    state->bot_tree_raw_len = -1;
+  }
+
   int count = 0;
   char *saveptr = NULL;
   for (char *line = strtok_r(payload, "\n", &saveptr);
@@ -957,6 +1021,181 @@ static void hub_client_process_tree(bot_state_t *state, char *payload,
   state->bot_tree_count = count;
   state->bot_tree_ts = time(NULL);
  /* This logs excessively without much use; commented out for now. log_message(L_DEBUG, state, "[HUB] Bot tree updated (%d rows)\n", count); */
+}
+
+/* Phase 5: FNV-1a 64 over the raw tree, matching the hub's tree_fnv64. */
+static uint64_t bot_tree_fnv64(const char *s, int n) {
+  uint64_t h = 0xcbf29ce484222325ULL; /* FNV-1a 64 offset basis: both hubs and ircbot.rs must match */
+  for (int i = 0; i < n; i++) {
+    h ^= (unsigned char)s[i];
+    h *= 1099511628211ULL;
+  }
+  return h;
+}
+
+/* uuid of a NUL-terminated row line, "" if malformed: field 3 of
+ * KIND|depth|name|uuid|..., field 2 of an offline row D|nick|uuid|last_seen.
+ * Must match the hubs' tree_row_uuid, which keys the delta ops. */
+static void bot_row_uuid(const char *line, char *out, size_t cap) {
+  out[0] = '\0';
+  int bars = 0;
+  int want = line[0] == 'D' ? 2 : 3;
+  for (const char *p = line; *p; p++)
+    if (*p == '|' && ++bars == want) {
+      const char *q = p + 1;
+      size_t o = 0;
+      while (*q && *q != '|' && o + 1 < cap) out[o++] = *q++;
+      out[o] = '\0';
+      return;
+    }
+}
+
+/* A pull should be rare (a delta always hashes right in order); log why at
+ * debug so a pull rate in the hub stats can be traced to its cause. */
+static void hub_client_request_tree_pull(bot_state_t *state, const char *why) {
+  log_message(L_DEBUG, state, "[HUB] Tree delta not applied (%s); pulling the whole tree\n", why);
+  hub_seal_frame(state, CMD_BOT_TREE_PULL, "", 0);
+}
+
+/* A hub keepalive's "t|<fnv64hex>": our tree hashing to it is a refresh (the
+ * stale clock restarts, nothing is sent); anything else pulls the whole tree.
+ * An empty or other payload (an older hub) is ignored. */
+static void hub_client_check_tree_hash(bot_state_t *state, const char *p) {
+  if (strncmp(p, "t|", 2) != 0) return;
+  char *end = NULL;
+  errno = 0;
+  unsigned long long want = strtoull(p + 2, &end, 16);
+  if (errno || !end || end == p + 2 || *end) return;
+  int clen = state->bot_tree_raw_len;
+  if (clen < 0) return; /* too large to hold: nothing to compare */
+  if (clen == 0 || clen > TREE_RAW_MAX) {
+    hub_client_request_tree_pull(state, "keepalive: no tree yet");
+    return;
+  }
+  if (bot_tree_fnv64(state->bot_tree_raw, clen) != (uint64_t)want) {
+    hub_client_request_tree_pull(state, "keepalive hash mismatch");
+    return;
+  }
+  state->bot_tree_ts = time(NULL);
+}
+
+/* Ingest a CMD_BOT_TREE_DELTA: `<fnvhex>\n` then `-|uuid` / `+|anchor|row` ops.
+ * Apply them to our raw tree, and accept only if the result hashes to <fnvhex>;
+ * any divergence (a missed or mis-ordered row, no base tree yet, overflow)
+ * pulls the whole tree instead.  Correctness never depends on the delta: the
+ * hash is the gate, the pull the fallback. */
+static void hub_client_process_tree_delta(bot_state_t *state, char *payload, int payload_len) {
+  if (!payload || payload_len <= 0) return;
+  payload[payload_len] = '\0';
+  int clen = state->bot_tree_raw_len;
+  if (clen <= 0 || clen > TREE_RAW_MAX) {
+    hub_client_request_tree_pull(state, clen < 0 ? "tree too large to hold" : "no base tree");
+    return;
+  }
+  char *saveptr = NULL;
+  char *first = strtok_r(payload, "\n", &saveptr);
+  char *end = NULL;
+  errno = 0;
+  unsigned long long want = first ? strtoull(first, &end, 16) : 0;
+  if (!first || errno || !end || *end) {
+    hub_client_request_tree_pull(state, "bad header");
+    return;
+  }
+
+  static char cur[TREE_RAW_MAX + 1];
+  memcpy(cur, state->bot_tree_raw, (size_t)clen);
+  cur[clen] = '\0';
+  /* The rows as the hub keys them (bot_row_uuid); every key is unique and
+   * non-empty, or the hub sends the whole tree instead of a delta. */
+  typedef struct {
+    char *line;
+    char  uuid[64];
+  } drow_t;
+  enum { DROWS_MAX = MAX_BOT_TREE_ROWS + 8 };
+  static drow_t rows[DROWS_MAX];
+  int nl = 0;
+  bool overflow = false;
+  char *sp = NULL;
+  for (char *ln = strtok_r(cur, "\n", &sp); ln; ln = strtok_r(NULL, "\n", &sp)) {
+    if (nl >= DROWS_MAX) {
+      overflow = true; /* more rows than we track: pull rather than drop some */
+      break;
+    }
+    rows[nl].line = ln;
+    bot_row_uuid(ln, rows[nl].uuid, sizeof(rows[nl].uuid));
+    nl++;
+  }
+
+  for (char *op = strtok_r(NULL, "\n", &saveptr); op && !overflow;
+       op = strtok_r(NULL, "\n", &saveptr)) {
+    char *u = NULL, *row = NULL, ru[64] = "";
+    if (op[0] == '-' && op[1] == '|') {
+      u = op + 2;
+    } else if (op[0] == '+' && op[1] == '|') {
+      char *bar = strchr(op + 2, '|');
+      if (!bar) continue;
+      *bar = '\0';
+      row = bar + 1;
+      bot_row_uuid(row, ru, sizeof(ru));
+      if (!ru[0]) {
+        overflow = true; /* a row with no key cannot be one the hub sent */
+        break;
+      }
+      u = ru;
+    } else {
+      continue;
+    }
+    /* `-` removes the row; `+` replaces it, after its anchor (`^` = head). */
+    for (int i = 0; i < nl; i++)
+      if (strcmp(rows[i].uuid, u) == 0) {
+        memmove(&rows[i], &rows[i + 1], (size_t)(nl - i - 1) * sizeof(rows[0]));
+        nl--;
+        break;
+      }
+    if (!row) continue;
+    const char *anchor = op + 2;
+    int pos = nl;
+    if (strcmp(anchor, "^") == 0)
+      pos = 0;
+    else
+      for (int i = 0; i < nl; i++)
+        if (strcmp(rows[i].uuid, anchor) == 0) {
+          pos = i + 1;
+          break;
+        }
+    if (nl >= DROWS_MAX) {
+      overflow = true;
+      break;
+    }
+    memmove(&rows[pos + 1], &rows[pos], (size_t)(nl - pos) * sizeof(rows[0]));
+    rows[pos].line = row;
+    memcpy(rows[pos].uuid, ru, sizeof(ru));
+    nl++;
+  }
+
+  static char nraw[TREE_RAW_MAX + 1];
+  int o = 0;
+  for (int i = 0; i < nl && !overflow; i++) {
+    int w = snprintf(nraw + o, sizeof(nraw) - (size_t)o, "%s\n", rows[i].line);
+    if (w < 0 || w >= (int)sizeof(nraw) - o)
+      overflow = true;
+    else
+      o += w;
+  }
+  if (overflow || bot_tree_fnv64(nraw, o) != (uint64_t)want) {
+    hub_client_request_tree_pull(state, "hash mismatch");
+    return;
+  }
+
+  /* Accept: the applied tree matches the hub's.  Re-parse it for the renderer
+   * (a separate copy; process_tree mangles what it parses). */
+  if (o < 0 || o > TREE_RAW_MAX) {
+    hub_client_request_tree_pull(state, "tree too large");
+    return;
+  }
+  static char parsebuf[TREE_RAW_MAX + 1];
+  memcpy(parsebuf, nraw, (size_t)o);
+  hub_client_process_tree(state, parsebuf, o);
 }
 
 /* Push a single key=value change to the hub via CMD_BOT_DELTA.
@@ -1253,11 +1492,6 @@ bool hub_client_send_chan_reply(bot_state_t *state, const char *request_id,
     ok = hub_send_frame(state, CMD_CHAN_REPLY, payload, pay_len);
   secure_wipe(payload, sizeof(payload));
   return ok;
-}
-
-// Alias for promoting local config to hub (e.g. on connect)
-void hub_client_promote_local_config(bot_state_t *state) {
-  hub_client_push_config(state);
 }
 
 /* Push all user/mask records to hub via CMD_CONFIG_PUSH so the hub can store
@@ -2348,6 +2582,10 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     hub_client_process_tree(state, payload, payload_len);
     break;
 
+  case CMD_BOT_TREE_DELTA:
+    hub_client_process_tree_delta(state, payload, payload_len);
+    break;
+
   case CMD_UPGRADE_STAGE:
     hub_client_handle_upgrade_stage(state, payload);
     break;
@@ -2457,25 +2695,6 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
       if (c->op_request_pending) {
         c->op_request_pending = false;
         c->last_op_request_time = time(NULL) - 30;
-      }
-    }
-    break;
-
-  case CMD_INVITE_REQUEST:
-    if (payload && payload_len > 0) {
-      /* a nick that does not fit is refused, never cut to someone else's */
-      char inv_nick[MAX_MEMBER_NICK], inv_chan[MAX_CHAN];
-      if (wire_field(payload, 0, inv_nick, sizeof(inv_nick)) && inv_nick[0] &&
-          sscanf(payload, "%*[^|]|%64[^\n]", inv_chan) == 1) {
-        chan_t *ic = channel_find(state, inv_chan);
-        if (ic && ic->status == C_IN) {
-          if (ic->i_am_opped) {
-            log_message(L_INFO, state,
-                        "[INVITE] Inviting %s into %s (hub request)\n",
-                        inv_nick, inv_chan);
-            irc_printf(state, "INVITE %s %s\r\n", inv_nick, inv_chan);
-          }
-        }
       }
     }
     break;
@@ -2912,6 +3131,9 @@ static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
           auth_state = HUB_AUTH_COMPLETE;
           state->last_hub_activity = time(NULL);
           state->hub_connect_time = time(NULL);
+          /* Phase 4: a new hub link — bump the persisted link-order counter
+           * before the first presence carries it. */
+          hub_client_link_ord_bump(state);
           log_message(L_INFO, state, "[HUB] Authenticated (Curve25519 v2)!\n");
           /* Review 6: first frame on the link; a 2.5.1 hub ignores it. */
           hub_seal_frame(state, CMD_LINK_SEQ, "offer", 5);
@@ -2998,6 +3220,19 @@ static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
         hub_client_retire(state);
         return;
       } else if (cmd == CMD_PING) {
+        /* A hub keepalive may carry "t|<fnv64hex>", the tree we should hold:
+         * the check that replaced the periodic whole-tree push. */
+        if (plain_len > 5) {
+          uint32_t pl_net;
+          memcpy(&pl_net, &plain[1], 4);
+          int pl = (int)ntohl(pl_net);
+          if (pl > 0 && pl <= plain_len - 5 && pl < 64) {
+            char tp[64];
+            memcpy(tp, &plain[5], (size_t)pl);
+            tp[pl] = '\0';
+            hub_client_check_tree_hash(state, tp);
+          }
+        }
         // RATE LIMIT: Only respond to ping once per 5 seconds
         time_t now = time(NULL);
         if (now - last_pong_sent >= 5) {

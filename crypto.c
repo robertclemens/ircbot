@@ -517,23 +517,6 @@ int crypto_reply_seal(const unsigned char key[32], const unsigned char *aad,
     return n + GCM_TAG_LEN;
 }
 
-int crypto_reply_open(const unsigned char key[32], const unsigned char *aad,
-                      size_t aad_len, const unsigned char *frame,
-                      size_t frame_len, unsigned char *pt_out, size_t pt_cap) {
-    if (frame_len < A2R_OVERHEAD) return -1;
-    size_t ct_len = frame_len - A2R_OVERHEAD;
-    if (ct_len > A2R_PT_MAX || ct_len > pt_cap) return -1;
-    unsigned char tag[GCM_TAG_LEN];
-    memcpy(tag, frame + frame_len - GCM_TAG_LEN, GCM_TAG_LEN);
-    int n = crypto_aes_gcm_decrypt_aad(frame, (int)(GCM_IV_LEN + ct_len), aad,
-                                       (int)aad_len, key, pt_out, tag);
-    if (n != (int)ct_len) {
-        if (ct_len) secure_wipe(pt_out, ct_len);
-        return -1;
-    }
-    return n;
-}
-
 unsigned char *base64_decode(const char *input, int *out_len) {
     BIO *b64, *bmem;
     size_t slen = strlen(input);

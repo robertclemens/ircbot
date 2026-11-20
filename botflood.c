@@ -58,10 +58,6 @@ static bool quiet_at(bot_state_t *state, long long now_ms) {
   return state->quiet_until_ms != 0;
 }
 
-bool botflood_quiet(bot_state_t *state) {
-  return quiet_at(state, flood_now_ms());
-}
-
 static const ignore_ent_t *ignore_find(const bot_state_t *state, const char *key,
                                        long long now_ms) {
   for (int i = 0; i < MAX_IGNORES; i++) {

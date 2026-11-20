@@ -78,10 +78,6 @@ void sendq_set_limits(bot_state_t *state, int burst, int interval_ms) {
     q->credit_ms = cap;
 }
 
-bool sendq_pending(const bot_state_t *state) {
-  return state->sendq.total > 0;
-}
-
 static void refill(sendq_t *q) {
   long long now = mono_ms();
   long long cap = (long long)q->burst * q->interval_ms;

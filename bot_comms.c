@@ -133,8 +133,11 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
       char *bot_command = strtok_r(cmd, " ", &sp);
       char *bot_arg1 = strtok_r(NULL, " ", &sp);
       if (bot_command && bot_arg1 && strcasecmp(bot_command, "OPME") == 0) {
-        if (sender_nick)
-          irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, sender_nick);
+        /* Only where we can: in the channel and opped (as OPUSER).  The
+         * sender is a trusted bot, so +bitch does not apply to it. */
+        chan_t *mc = sender_nick ? channel_find(state, bot_arg1) : NULL;
+        if (mc && mc->status == C_IN && mc->i_am_opped)
+          irc_printf(state, "MODE %s +o %s\r\n", mc->name, sender_nick);
       } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "SETNICK") == 0) {
         if (is_rfc_nick(bot_arg1)) {

@@ -116,15 +116,6 @@ static void rremove(chan_t *c, const char *nick) {
   }
 }
 
-bool chanenf_nuh_authorised(const bot_state_t *state, const char *nuh) {
-  char nick[MAX_MEMBER_NICK];
-  if (!nuh || !nuh_nick(nuh, nick, sizeof(nick)))
-    return false;
-  if (is_me(state, nick))
-    return true;
-  return auth_is_authorised(state, nuh, NULL);
-}
-
 /* What "authorised" depends on: the trusted bots, the user, mask and oper
  * binding records (none of which has one change hook) and cfg_gen.  The records are hashed
  * at most every 200 ms; a change bumps state->auth_gen, which retires every

@@ -4,59 +4,6 @@
 
 #include "bot.h"
 
-// Look up the hub UUID for a roster entry whose IRC nick may carry trailing '_'
-// suffixes from nick collisions.  Tries exact hostmask match first, then exact
-// nick-prefix match, then base-nick match (strips trailing '_' from both sides).
-// Returns true and populates uuid_out if a match is found.
-static bool find_uuid_for_helper(const bot_state_t *state,
-                                  const roster_entry_t *helper,
-                                  char *uuid_out, size_t uuid_len) {
-  for (int tb = 0; tb < state->trusted_bot_count; tb++) {
-    const char *mask = state->trusted_bots[tb].mask;
-    const char *uuid = state->trusted_bots[tb].uuid;
-    if (!uuid[0])
-      continue;
-
-    // 1. Exact hostmask match
-    if (strcasecmp(mask, helper->hostmask) == 0) {
-      snprintf(uuid_out, uuid_len, "%s", uuid);
-      return true;
-    }
-
-    // 2. Nick-prefix match: stored entry starts with "helper_nick!"
-    char pfx[MAX_MEMBER_NICK + 1];
-    snprintf(pfx, sizeof(pfx), "%s!", helper->nick);
-    if (strncasecmp(mask, pfx, strlen(pfx)) == 0) {
-      snprintf(uuid_out, uuid_len, "%s", uuid);
-      return true;
-    }
-
-    // 3. Base-nick match: strip trailing '_' from both nicks and compare.
-    // Handles ghost "bot6" matching stored "bot6_!~ircbot@..." and vice-versa.
-    char stored_nick[MAX_NICK] = "";
-    const char *bang = strchr(mask, '!');
-    if (bang) {
-      size_t n = (size_t)(bang - mask);
-      if (n >= MAX_NICK) n = MAX_NICK - 1;
-      memcpy(stored_nick, mask, n);
-      stored_nick[n] = '\0';
-    }
-    // Strip trailing underscores
-    char base_stored[MAX_NICK], base_helper[MAX_MEMBER_NICK];
-    snprintf(base_stored, sizeof(base_stored), "%s", stored_nick);
-    snprintf(base_helper, sizeof(base_helper), "%s", helper->nick);
-    size_t ls = strlen(base_stored), lh = strlen(base_helper);
-    while (ls > 0 && base_stored[ls - 1] == '_') base_stored[--ls] = '\0';
-    while (lh > 0 && base_helper[lh - 1] == '_') base_helper[--lh] = '\0';
-
-    if (ls > 0 && strcasecmp(base_stored, base_helper) == 0) {
-      snprintf(uuid_out, uuid_len, "%s", uuid);
-      return true;
-    }
-  }
-  return false;
-}
-
 // [UPDATED] Helper to handle mode changes securely + immediate Op Recovery.
 // True when a managed channel's learned key / +k+i changed (K|, to be pushed).
 static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
@@ -658,8 +605,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
                     "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
                     chosen_helper->nick, chosen_helper->hostmask);
         {
+          /* the trusted entry that matched this helper (auth.c: an exact
+           * mask before a wildcard) names the bot to ask */
           char uuid[64];
-          if (find_uuid_for_helper(state, chosen_helper, uuid, sizeof(uuid))) {
+          if (auth_is_trusted_bot(state, chosen_helper->hostmask, uuid, sizeof(uuid)) &&
+              uuid[0]) {
             log_message(L_DEBUG, state, "[OP-REQ] Found UUID, trying hub request\n");
             sent_via_hub = hub_client_request_op(state, uuid, c->name);
             log_message(L_DEBUG, state,
@@ -798,7 +748,10 @@ void parser_handle_line(bot_state_t *state, char *line) {
     /* Our own JOIN: current_nick is what the server knows us as (001, NICK).
      * Whoever holds target_nick while we run on a fallback is someone else. */
     if (nick && strcasecmp(nick, state->current_nick) == 0) {
+      /* the channel is the first word (extended-join adds account and
+       * realname after it) */
       char *chan_name = (*params == ':') ? params + 1 : params;
+      chan_name[strcspn(chan_name, " ")] = '\0';
       chan_t *c = channel_find(state, chan_name);
       if (c && !c->is_managed) {
         /* Removed while this JOIN was on its way (a hub batch can carry the

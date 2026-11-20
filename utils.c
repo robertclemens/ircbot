@@ -2,8 +2,8 @@
 #include <ctype.h>
 #ifdef HAVE_CURL
 #include <curl/curl.h>
-#include <dirent.h>
 #endif
+#include <dirent.h> /* cron_work_rm: used with or without curl */
 #include <netdb.h>
 #include <openssl/crypto.h>
 #include <openssl/evp.h>
@@ -40,10 +40,6 @@ void bot_set_startup_pass(bot_state_t *s, const char *pass) {
 void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]) {
   memcpy(out, s->startup_password, MAX_PASS);
   out[MAX_PASS - 1] = '\0';
-}
-
-bool bot_has_startup_pass(const bot_state_t *s) {
-  return s->startup_password[0] != '\0';
 }
 
 void config_write_with_state_pass(bot_state_t *s) {
@@ -210,7 +206,11 @@ bool updater_take_pending_upgrade(char *id_out, size_t id_size, char *ver_out,
     ops_line[strcspn(ops_line, "\r\n")] = '\0';
     const char *p = ops_line + 3;
     while (*p == ' ') p++;
-    snprintf(ops_out, ops_size, "%s", p);
+    size_t n = ops_size ? strnlen(p, ops_size - 1) : 0; /* cut to the caller's room */
+    if (ops_size) {
+      memcpy(ops_out, p, n);
+      ops_out[n] = '\0';
+    }
   }
   fclose(f);
   /* Consumed whatever it said: a marker we cannot parse must not be retried
@@ -316,7 +316,7 @@ static const char *const FAILBACK_BODY[] = {
   "}\n",
   "cron_edit() { # add|remove tag line\n",
   "  command -v crontab >/dev/null 2>&1 || return 3\n",
-  "  take_lock \"$HLOCK\" 15 || return 1\n",
+  "  take_lock \"$HLOCK\" 15 || return 5  # busy: the binary runs it again soon\n",
   "  T=\".upgrade.cron.$$\"; rc=1; n=0\n",
   "  while [ \"$n\" -lt 3 ]; do\n",
   "    n=$((n + 1))\n",
@@ -619,7 +619,7 @@ void updater_standalone_tick(bot_state_t *state) {
 static pid_t g_cron_pid = 0;
 static time_t g_cron_started = 0, g_cron_next = 0, g_cron_stat = 0;
 static int g_cron_wanted = -1;  /* -1 no hub has said, 0 off, 1 on */
-static char g_cron_status[64] = "";
+static char g_cron_status[CRON_STATUS_MAX + 1] = "";
 static bool g_cron_ours = false;
 
 static const char *cron_helper_run_arg(const char *exe, const char **fail) {
@@ -644,11 +644,20 @@ static void cron_note(int rc, time_t now) {
   else if (rc == 11 || (rc == 3 && g_cron_wanted != 1)) snprintf(next, sizeof(next), "no");
   else if (rc == 3) snprintf(next, sizeof(next), "failed:no crontab tool");
   else if (rc == 4) snprintf(next, sizeof(next), "failed:unsafe path");
+  else if (rc == CRON_RC_BUSY) snprintf(next, sizeof(next), "busy");
   else snprintf(next, sizeof(next), "failed:cannot read crontab");
   snprintf(g_cron_status, sizeof(g_cron_status), "%s", next);
   /* Ours: look at the stamp in this same pass, so a host whose cron is dead
    * stays "silent" instead of reading "yes" for a minute after every check. */
   g_cron_stat = g_cron_ours ? 0 : now;
+  /* Another node held the lock: soon, not in an hour, and never later than an
+   * order that arrived meanwhile has already asked for. */
+  if (rc == CRON_RC_BUSY) {
+    time_t at = now + CRON_BUSY_RETRY_MIN +
+                (time_t)(((unsigned long)getpid() * 2654435761UL + (unsigned long)now) %
+                         CRON_BUSY_RETRY_SPAN);
+    if (at < g_cron_next) g_cron_next = at;
+  }
 }
 
 /* The helper's work files are .upgrade.cron.<its pid>.*: a helper that was
@@ -671,7 +680,7 @@ static void cron_helper_kill(pid_t pid) {
   if (kill(-pid, SIGKILL) != 0) kill(pid, SIGKILL);
 }
 
-/* What updater_cron_tick last found: yes, silent, manual, no or failed:<why>. */
+/* What updater_cron_tick last found: yes, silent, manual, no, busy or failed:<why>. */
 const char *updater_cron_status(void) { return g_cron_status; }
 
 /* A hub's order. */

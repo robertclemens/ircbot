@@ -55,6 +55,11 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 // #define GECOS "ircbot"         // Gecos field storage
 #define CONFIG_FILE ".ircbot.cnf" // Config file name
 #define PID_FILE ".ircbot.pid"    // PID file name
+/* Phase 4 (presence v2 J): a monotonic counter bumped and persisted each time
+ * the bot links to a hub, reported in CMD_BOT_PRESENCE.  When a bot moves
+ * hubs, the hub mesh orders the two sightings by this counter, not by comparing
+ * the hubs' wall clocks; a bot too old to send it falls back to those clocks. */
+#define LINK_ORD_FILE ".ircbot.linkord"
 /* Hand-off note written just before a hub-driven upgrade execs the new
  * binary: the restarted process has no memory of the run that replaced it,
  * so it reads the upgrade id from here and answers CMD_UPGRADE_RESULT. */
@@ -77,12 +82,18 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define UPGRADE_CONFIRM_SECS    300
 #define UPGRADE_FAILBACK_EXPIRY 1800
 #define UPGRADE_STAGE_BEAT   20    /* a node says it is staging this often */
-#define UPGRADE_STAGE_SILENCE 90   /* a node silent this long has left the run */
-#define UPGRADE_STAGE_GATE   180   /* a prebuilt's stage limit */
 #define UPGRADE_STAGE_KEEP   900   /* a stage no COMMIT came for is removed */
 #define CRON_HELPER_TIMEOUT 60   /* a crontab edit that takes longer is killed */
+/* yes, silent, manual, no, busy, failed:<why>: the cap irchub reads (hub.h) */
+#define CRON_STATUS_MAX     31
 #define CRON_CHECK_SECS     3600 /* how often a node looks at its line */
 #define CRON_SILENT_SECS    900  /* no stamp for this long: no cron daemon */
+/* Every node of one account edits its one crontab under one lock: a helper that
+ * cannot get it exits CRON_RC_BUSY and is run again this soon, spread by pid so
+ * a queue of nodes does not meet again at the same second. */
+#define CRON_RC_BUSY        5
+#define CRON_BUSY_RETRY_MIN 10
+#define CRON_BUSY_RETRY_SPAN 21  /* 10..30 s */
 /* What preflight asks of the disk, in bytes.  A build's own needs come from the
  * manifest's size column; these cover what it cannot say. */
 #define UPGRADE_SPACE_MARGIN      (16ULL * 1024 * 1024)
@@ -192,7 +203,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 
 // Limits
 #define MAX_SERVERS 10 // Max number of servers to store
-#define MAX_MASKS 20   // Max number of admin masks to store (kept for migration)
 #define MAX_USER_RECORDS 40   // max combined admin + oper records
 #define MAX_USER_MASKS   200  // max total usermask records across all users
 /* Admin flags and oper channel bindings (irchub docs/plans/
@@ -216,7 +226,6 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define MAX_PASS 128 // Max password length.
 #define MAX_KEY 31   // Max length for a channel key
 #define MAX_MASK_LEN 256    // Max usermask length
-#define MAX_OP_MASKS 20     // Max number of operators
 #define MAX_TRUSTED_BOTS 200 // Max number of trusted bots
 
 /* ==========================================================================
@@ -358,7 +367,6 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  * true  = never log it; false = log it like any other line.  Only the logging
  * is suppressed -- the keepalives themselves still run. */
 #define HIDEPINGPONG true
-#define MAX_IRC_CHANNELS 10     // Realistic per-bot IRC channel ceiling (server CHANLIMIT)
 #define OP_REQUEST_MIN_INTERVAL 5 // Minimum seconds between any OP-REQ sent by this bot
 #define MAX_CONFIG_SIZE                                                        \
   (1024 * 1024) // Limit config file size to 1MB to provent OOM
@@ -378,7 +386,8 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_UPDATE_PUBKEY 0x05
 #define CMD_PEER_SYNC 0x06
 #define CMD_MESH_STATE 0x07
-#define CMD_INVITE_REQUEST 0x09 // Bot -> Hub: Request invite for nick into channel
+/* 0x09 was CMD_INVITE_REQUEST (a hub asking every bot to invite a nick); removed
+ * in 2.5.3, the channel-request election does invites.  Never reuse the value. */
 
 #define CMD_ADMIN_AUTH 0x10
 #define CMD_ADMIN_LIST_FULL 0x11
@@ -450,6 +459,10 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
 #define CMD_UPGRADE_STAGE 0x88 // Hub -> Bot: id, get the build ready while the old one runs
 #define CMD_UPGRADE_PROGRESS 0x89 // Bot -> Hub: id|uuid|phase|code|note
 #define CMD_CRON_SET     0x8B  // Hub -> Bot: on|off, this bot's production crontab line
+/* Phase 5 (presence v2 K): the bots tree arrives as row deltas with the new
+ * tree's hash; a bot whose hash mismatches pulls the whole tree. */
+#define CMD_BOT_TREE_DELTA 0x8F // Hub -> Bot: <seq>|<fnv64> + +/- row ops
+#define CMD_BOT_TREE_PULL  0x90 // Bot -> Hub: send me the whole tree
 
 /* ---- Channel-access requests (unban / invite / key) ----------------------
  * A bot locked out of a managed channel -- 474 banned, 473 invite-only, 475
@@ -1031,6 +1044,10 @@ typedef struct {
  * is the last child at its level when no later row shares its depth before a
  * shallower one appears.  Purely for display -- nothing here grants trust. */
 #define MAX_BOT_TREE_ROWS  256
+/* Phase 5: the raw tree buffer — MAX_BOT_TREE_ROWS rows at a generous row cap.
+ * A tree larger than this still renders (parsed straight from the frame); only
+ * the delta fast-path turns off for it (every delta then pulls the whole tree). */
+#define TREE_RAW_MAX       (MAX_BOT_TREE_ROWS * 288)
 /* Deepest row we draw.  A hub hangs every hub further out beneath the hub
  * that links to it, so a chain of N hubs is N levels deep (plus its bots);
  * a deeper row is drawn at this depth rather than dropped. */
@@ -1315,10 +1332,20 @@ struct bot_state {
   bot_tree_row_t bot_tree[MAX_BOT_TREE_ROWS];
   int    bot_tree_count;
   time_t bot_tree_ts;
+  /* Phase 5: the raw tree text exactly as the hub serialized it — the canonical
+   * copy a CMD_BOT_TREE_DELTA edits (by row) and re-hashes.  Keeping the bytes,
+   * not just the parsed rows, lets our FNV-1a 64 match the hub's; a mismatch
+   * means we diverged and must CMD_BOT_TREE_PULL the whole tree. */
+  char   bot_tree_raw[TREE_RAW_MAX];
+  int    bot_tree_raw_len;   /* 0 none yet, -1 the last tree was too large */
   /* Last presence we reported, so a reconnect or server change re-reports and
    * an idle bot does not spam the hub with identical frames. */
   char   presence_server[TREE_SERVER_MAX + 1];
   time_t last_presence_sent;
+  /* Phase 4: this bot's link-order counter (LINK_ORD_FILE), bumped once per
+   * hub link and sent in CMD_BOT_PRESENCE so the mesh orders a moved bot's
+   * two sightings without trusting hub clocks.  0 until the first link. */
+  uint64_t link_ord;
   /* The hub-driven upgrade this bot has acknowledged (CMD_UPGRADE_PREPARE).
    * COMMIT carries only the id and the version, so the release base the hub
    * named at PREPARE time is remembered here; an id that never went through
@@ -1597,7 +1624,6 @@ bool chanenf_admin_ban(bot_state_t *state, const char *chan, const char *mask,
  * after bantime; returns the count (1 = first offence). */
 unsigned chanenf_offence(bot_state_t *state, const char *chan, const char *nuh);
 /* True for this bot itself or an authorised user/bot (nick!user@host). */
-bool chanenf_nuh_authorised(const bot_state_t *state, const char *nuh);
 /* Same, using the roster's cached verdict when nuh is a member of c. */
 bool chanenf_chan_nuh_authorised(bot_state_t *state, const chan_t *c,
                                  const char *nuh);
@@ -1633,7 +1659,6 @@ bool botflood_host_ignored(bot_state_t *state, const char *nuh);
  * run.  BF_DROP also sends the one "slow down" notice per window to `nick`. */
 int  botflood_cmd(bot_state_t *state, const user_record_t *who, const char *nick);
 /* Quiet mode: unauthorised sources get no reply at all. */
-bool botflood_quiet(bot_state_t *state);
 /* Testable cores (now_ms injected). */
 int  botflood_msg_at(bot_state_t *state, const char *nuh, bool authorised,
                      long long now_ms);
@@ -1677,7 +1702,6 @@ int  sendq_enqueue(bot_state_t *state, const char *line, int len);
 int  sendq_drain(bot_state_t *state);            /* lines written now */
 void sendq_hold(bot_state_t *state);             /* queue only, so MODEs pack */
 void sendq_release(bot_state_t *state);          /* undo one hold; drain at 0 */
-bool sendq_pending(const bot_state_t *state);
 /* True when lines wait AND credit allows one now (select write-set hint). */
 bool sendq_ready(bot_state_t *state);
 int  sendq_lane_of(const char *line);            /* SENDQ_LANE_* for a line */
@@ -1846,9 +1870,6 @@ int crypto_open_rk(const unsigned char r_x_priv[32], const unsigned char r_x_pub
 int crypto_reply_seal(const unsigned char key[32], const unsigned char *aad,
                       size_t aad_len, const unsigned char *pt, size_t pt_len,
                       unsigned char *out, size_t out_cap);
-int crypto_reply_open(const unsigned char key[32], const unsigned char *aad,
-                      size_t aad_len, const unsigned char *frame,
-                      size_t frame_len, unsigned char *pt_out, size_t pt_cap);
 /* Volatile-pointer secure zero. Compiler may NOT elide. */
 void secure_wipe(void *ptr, size_t len);
 char *base64_encode(const unsigned char *input, int length);
@@ -1856,7 +1877,6 @@ unsigned char *base64_decode(const char *input, int *out_len);
 void hub_client_init(bot_state_t *state);
 void hub_client_connect(bot_state_t *state);
 void hub_client_process(bot_state_t *state);
-void hub_client_promote_local_config(bot_state_t *state);
 void hub_client_push_config(bot_state_t *state);
 void hub_client_push_admin_delta(bot_state_t *state);
 bool hub_client_push_delta(bot_state_t *state, const char *key,
@@ -1950,7 +1970,6 @@ bool bot_comms_handle_privmsg(bot_state_t *state, const char *nick,
                               const char *user_host, const char *message);
 void bot_set_startup_pass(bot_state_t *s, const char *pass);
 void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]);
-bool bot_has_startup_pass(const bot_state_t *s);
 void config_write_with_state_pass(bot_state_t *s);
 void config_write_local_with_state_pass(bot_state_t *s);
 

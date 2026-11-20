@@ -120,14 +120,20 @@ static int trusted_bot_index_by_host(const bot_state_t *state,
   if (state->trusted_bot_count == 0) return -1;
   char norm_user_host[MAX_MASK_LEN];
   strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
+  /* The entry whose mask IS this host wins over an earlier wildcard that also
+   * matches it: the index picks the uuid and key, and two bots on one host
+   * must not answer for each other. */
+  int first = -1;
   for (int i = 0; i < state->trusted_bot_count; i++) {
     char norm_hostmask[MAX_MASK_LEN];
     strip_ident_tilde(state->trusted_bots[i].mask, norm_hostmask,
                       sizeof(norm_hostmask));
-    if (auth_wildcard_match(norm_hostmask, norm_user_host))
+    if (strcasecmp(norm_hostmask, norm_user_host) == 0)
       return i;
+    if (first < 0 && auth_wildcard_match(norm_hostmask, norm_user_host))
+      first = i;
   }
-  return -1;
+  return first;
 }
 
 trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
