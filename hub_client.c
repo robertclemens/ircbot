@@ -1,5 +1,6 @@
 #define _POSIX_C_SOURCE 200809L
 #include "bot.h"
+#include "cfg_delta.h"
 #include <arpa/inet.h>
 #include <ctype.h>
 #include <errno.h>
@@ -248,10 +249,13 @@ static bool retire_wipe_file(const char *path) {
 /* CMD_BOT_RETIRE: this bot was deleted on the hub (bot del).  Wipe every
  * config file (keys, hubs, channels), tell the hub, leave IRC and exit.  A
  * cron restart then finds no config and stops at once. */
+static void cfg_text_wipe(bot_state_t *state);
+
 static void hub_client_retire(bot_state_t *state) {
   log_message(L_INFO, state, "[HUB] This bot was deleted on the hub: wiping its config "
                              "and exiting\n");
   state->retired = true;
+  cfg_text_wipe(state);
   int cron = updater_cron_drop(state->executable_path);
   if (cron == 10)
     log_message(L_INFO, state, "[HUB] A hand-written crontab line still runs this binary\n");
@@ -366,6 +370,8 @@ void hub_client_disconnect(bot_state_t *state) {
   hub_rx_reset();
   hub_dial_free();
   secure_wipe(state->hub_session_key, 32);
+  cfg_text_wipe(state); /* the next hub sends a full config first */
+  state->cfg_pull_at = 0;
   state->hub_link_offered = state->hub_link_tx_seq = state->hub_link_rx_seq = false;
   state->hub_link_tx_ctr = state->hub_link_rx_ctr = 0;
   state->current_hub[0] = '\0'; // Clear current hub tracking
@@ -561,7 +567,10 @@ void hub_client_stage_tick(bot_state_t *state) {
     updater_stage_unsaid();
     return;
   }
-  log_message(L_DEBUG, state, "[UPGRADE] Stage of %s: %s\n", id, status);
+  /* A build staged after another failed says so at INFO: the operator should
+   * know this host could not take its first choice. */
+  bool fell_back = strncmp(status, "staged|", 7) == 0 && strstr(status, "; the ") != NULL;
+  log_message(fell_back ? L_INFO : L_DEBUG, state, "[UPGRADE] Stage of %s: %s\n", id, status);
   hub_client_send_upgrade_progress(state, id, status);
 }
 
@@ -1059,7 +1068,8 @@ static void hub_client_request_tree_pull(bot_state_t *state, const char *why) {
 
 /* A hub keepalive's "t|<fnv64hex>": our tree hashing to it is a refresh (the
  * stale clock restarts, nothing is sent); anything else pulls the whole tree.
- * An empty or other payload (an older hub) is ignored. */
+ * A payload without t| (the hub has a tree frame for us still queued, or no
+ * tree yet) is ignored. */
 static void hub_client_check_tree_hash(bot_state_t *state, const char *p) {
   if (strncmp(p, "t|", 2) != 0) return;
   char *end = NULL;
@@ -1077,6 +1087,116 @@ static void hub_client_check_tree_hash(bot_state_t *state, const char *p) {
     return;
   }
   state->bot_tree_ts = time(NULL);
+}
+
+/* ---- Config deltas (CMD_CONFIG_DELTA 0x91, 2.5.4) --------------------------
+ * cfg_text is the exact text the hub's last full config (or the last delta we
+ * rebuilt) left us holding.  Plan: irchub/docs/plans/2026-11-20_config_delta_plan.md
+ * §4.3a — a delta is applied only when our text hashes to its base and the
+ * rebuilt one to its result, all in scratch, then through the unchanged
+ * full-config apply; anything else is one CMD_CONFIG_PULL. */
+static void cfg_text_wipe(bot_state_t *state) {
+  if (state->cfg_text) {
+    secure_wipe(state->cfg_text, state->cfg_text_len);
+    free(state->cfg_text);
+  }
+  state->cfg_text = NULL;
+  state->cfg_text_len = 0;
+}
+
+/* Take `t` (malloc'd, `n` bytes) as the text we hold. */
+static void cfg_text_take(bot_state_t *state, char *t, size_t n) {
+  cfg_text_wipe(state);
+  state->cfg_text = t;
+  state->cfg_text_len = n;
+}
+
+static bool cfg_sha_hex(const char *t, size_t n, char out[CFGD_HASH_HEX + 1]) {
+  static const char hx[] = "0123456789abcdef";
+  unsigned char h[32];
+  unsigned int hl = 0;
+  if (EVP_Digest(t, n, h, &hl, EVP_sha256(), NULL) != 1 || hl != 32) return false;
+  for (int i = 0; i < 32; i++) {
+    out[2 * i] = hx[h[i] >> 4];
+    out[2 * i + 1] = hx[h[i] & 15];
+  }
+  out[CFGD_HASH_HEX] = '\0';
+  return true;
+}
+
+/* One pull per CFG_PULL_MIN_GAP: a burst of bad frames is one full push. */
+static void hub_client_request_config_pull(bot_state_t *state, const char *why) {
+  time_t now = time(NULL);
+  if (state->cfg_pull_at && now - state->cfg_pull_at < CFG_PULL_MIN_GAP) return;
+  state->cfg_pull_at = now;
+  log_message(L_DEBUG, state, "[HUB] Config delta not applied (%s); pulling the whole config\n",
+              why);
+  hub_seal_frame(state, CMD_CONFIG_PULL, "", 0);
+}
+
+/* A keepalive's "c|<sha256hex>": the text we should hold.  Ours hashing to
+ * anything else (or holding none) pulls a full config. */
+static void hub_client_check_config_hash(bot_state_t *state, const char *hex) {
+  if (strlen(hex) != CFGD_HASH_HEX) return;
+  char mine[CFGD_HASH_HEX + 1];
+  if (!state->cfg_text) {
+    hub_client_request_config_pull(state, "keepalive: no config yet");
+    return;
+  }
+  if (!cfg_sha_hex(state->cfg_text, state->cfg_text_len, mine)) return;
+  if (memcmp(mine, hex, CFGD_HASH_HEX) != 0)
+    hub_client_request_config_pull(state, "keepalive hash mismatch");
+}
+
+static void hub_client_process_config_data(bot_state_t *state, const char *payload);
+
+/* Ingest a CMD_CONFIG_DELTA: rebuild the full text, check it, apply it. */
+static void hub_client_process_config_delta(bot_state_t *state, const char *payload, int plen) {
+  char base_hex[CFGD_HASH_HEX], new_hex[CFGD_HASH_HEX], mine[CFGD_HASH_HEX + 1];
+  if (plen <= 0 || cfgd_header(payload, (size_t)plen, base_hex, new_hex) != 0) {
+    hub_client_request_config_pull(state, "bad header");
+    return;
+  }
+  if (!state->cfg_text) {
+    hub_client_request_config_pull(state, "no base config");
+    return;
+  }
+  if (!cfg_sha_hex(state->cfg_text, state->cfg_text_len, mine) ||
+      memcmp(mine, base_hex, CFGD_HASH_HEX) != 0) {
+    hub_client_request_config_pull(state, "base mismatch");
+    return;
+  }
+  /* +1: the apply takes a NUL-terminated string. */
+  char *scratch = malloc((size_t)MAX_CONFIG_PAYLOAD + 1);
+  if (!scratch) {
+    hub_client_request_config_pull(state, "out of memory");
+    return;
+  }
+  const char *why = NULL;
+  long n = cfgd_patch(state->cfg_text, state->cfg_text_len, payload, (size_t)plen, scratch,
+                      (size_t)MAX_CONFIG_PAYLOAD, &why);
+  if (n < 0 || !cfg_sha_hex(scratch, (size_t)n, mine) ||
+      memcmp(mine, new_hex, CFGD_HASH_HEX) != 0) {
+    secure_wipe(scratch, (size_t)MAX_CONFIG_PAYLOAD + 1);
+    free(scratch);
+    hub_client_request_config_pull(state, n < 0 ? why : "result mismatch");
+    return;
+  }
+  scratch[n] = '\0';
+  log_message(L_INFO, state, "[HUB] Received config delta from hub (%d bytes -> %ld)\n", plen, n);
+  /* Hold an exact-size copy; the apply gets the scratch buffer itself. */
+  char *held = malloc((size_t)n + 1);
+  if (!held) {
+    secure_wipe(scratch, (size_t)MAX_CONFIG_PAYLOAD + 1);
+    free(scratch);
+    hub_client_request_config_pull(state, "out of memory");
+    return;
+  }
+  memcpy(held, scratch, (size_t)n + 1);
+  cfg_text_take(state, held, (size_t)n);
+  hub_client_process_config_data(state, scratch);
+  secure_wipe(scratch, (size_t)n + 1);
+  free(scratch);
 }
 
 /* Ingest a CMD_BOT_TREE_DELTA: `<fnvhex>\n` then `-|uuid` / `+|anchor|row` ops.
@@ -2609,8 +2729,23 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     log_message(L_INFO, state, "[HUB] Received config from hub (%d bytes)\n",
                 payload_len);
     if (payload && payload_len > 0) {
+      /* The text a later CMD_CONFIG_DELTA edits: every full config, never a
+       * PURGE line (its own frame, after the purged config). */
+      if (!(payload_len >= 6 && memcmp(payload, "PURGE|", 6) == 0)) {
+        char *held = malloc((size_t)payload_len + 1);
+        if (held) {
+          memcpy(held, payload, (size_t)payload_len + 1);
+          cfg_text_take(state, held, (size_t)payload_len);
+        } else {
+          cfg_text_wipe(state); /* hold nothing rather than something stale */
+        }
+      }
       hub_client_process_config_data(state, payload);
     }
+    break;
+
+  case CMD_CONFIG_DELTA:
+    if (payload && payload_len > 0) hub_client_process_config_delta(state, payload, payload_len);
     break;
 
   case CMD_UPDATE_PUBKEY:
@@ -3220,17 +3355,23 @@ static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
         hub_client_retire(state);
         return;
       } else if (cmd == CMD_PING) {
-        /* A hub keepalive may carry "t|<fnv64hex>", the tree we should hold:
-         * the check that replaced the periodic whole-tree push. */
+        /* A hub keepalive may carry "t|<fnv64hex>", the tree we should hold
+         * (the check that replaced the periodic whole-tree push), and from a
+         * 2.5.4 hub a "c|<sha256hex>" line, the config text we should hold.
+         * Either may be absent; each is its own line. */
         if (plain_len > 5) {
           uint32_t pl_net;
           memcpy(&pl_net, &plain[1], 4);
           int pl = (int)ntohl(pl_net);
-          if (pl > 0 && pl <= plain_len - 5 && pl < 64) {
-            char tp[64];
+          if (pl > 0 && pl <= plain_len - 5 && pl < 160) {
+            char tp[160];
             memcpy(tp, &plain[5], (size_t)pl);
             tp[pl] = '\0';
-            hub_client_check_tree_hash(state, tp);
+            char *sp = NULL;
+            for (char *ln = strtok_r(tp, "\n", &sp); ln; ln = strtok_r(NULL, "\n", &sp)) {
+              if (strncmp(ln, "t|", 2) == 0) hub_client_check_tree_hash(state, ln);
+              else if (strncmp(ln, "c|", 2) == 0) hub_client_check_config_hash(state, ln + 2);
+            }
           }
         }
         // RATE LIMIT: Only respond to ping once per 5 seconds

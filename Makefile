@@ -68,6 +68,20 @@ CFLAGS += -I/usr/local/include
 LDFLAGS += -L/usr/local/lib
 endif
 
+
+# Only code that is used ends up in the binary: every function and object in
+# a section of its own, and the linker drops each section nothing references
+# — ours, and the objects it pulls from static libraries.  Its own variable,
+# on the link line itself, so a release build that sets LDFLAGS on the
+# command line (tools/relcommon.py) keeps it.  macOS's linker calls it
+# -dead_strip.
+CFLAGS += -ffunction-sections -fdata-sections
+ifeq ($(UNAME_S),Darwin)
+GC_LDFLAGS = -Wl,-dead_strip
+else
+GC_LDFLAGS = -Wl,--gc-sections
+endif
+
 # Add HAVE_CURL flag if curl support is enabled
 ifeq ($(USE_CURL),1)
 CFLAGS += -DHAVE_CURL
@@ -77,7 +91,7 @@ LDFLAGS += -lssl -lcrypto
 endif
 
 # Source files
-SRCS = main.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c sendq.c chanlive.c chancfg.c glob_overlap.c chanenf.c chanflood.c botflood.c chancmd.c access.c
+SRCS = main.c cfg_delta.c elf_needs.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c sendq.c chanlive.c chancfg.c glob_overlap.c chanenf.c chanflood.c botflood.c chancmd.c access.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)
@@ -102,10 +116,10 @@ utils/keygen: utils/keygen.c utils/bcrypt_pbkdf.c utils/bcrypt_pbkdf.h
 	$(CC) $(CFLAGS) $(WARNFLAGS) -o $@ utils/keygen.c utils/bcrypt_pbkdf.c -lcrypto
 
 $(TARGET): $(OBJS)
-	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS)
+	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS) $(GC_LDFLAGS)
 	@chmod 700 $(TARGET)
 
-%.o: %.c bot.h
+%.o: %.c bot.h cfg_delta.h elf_needs.h
 	$(CC) $(CFLAGS) $(WARNFLAGS) -c $< -o $@
 
 clean:

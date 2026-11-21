@@ -37,7 +37,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * way).  This is the version the bot reports in CMD_BOT_PRESENCE, and the
  * one every upgrade comparison is made against. */
 #ifndef BOT_VERSION
-#define BOT_VERSION "2.5.3"
+#define BOT_VERSION "2.5.4"
 #endif
 
 // Only edit this section
@@ -117,10 +117,10 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define UPGRADE_OPS_WAIT 180
 /* The staged new binary's -selftest must finish within this many seconds. */
 #define UPGRADE_SELFTEST_SECS 15
-/* The oldest upgrade target: 2.5.0 cannot link with a 2.5.2 hub
- * (MESH_MIN_VERSION 2.5.1), and anything older cannot read this config or
+/* The oldest upgrade target: anything below 2.5.3 cannot link with a 2.5.4
+ * hub (MESH_MIN_VERSION 2.5.3), and below 2.5.0 cannot read this config or
  * pass file (PBKDF2 600k since 2.5.0). */
-#define UPGRADE_TARGET_MIN "2.5.1"
+#define UPGRADE_TARGET_MIN "2.5.3"
 /* Marker ops line capacity: channel names, space-separated. */
 #define UPGRADE_OPS_MAX 1024
 #define SALT_SIZE 16          // Modern standard: 128-bit entropy (matches hub)
@@ -463,6 +463,13 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  * tree's hash; a bot whose hash mismatches pulls the whole tree. */
 #define CMD_BOT_TREE_DELTA 0x8F // Hub -> Bot: <seq>|<fnv64> + +/- row ops
 #define CMD_BOT_TREE_PULL  0x90 // Bot -> Hub: send me the whole tree
+/* 2.5.4: the hub sends our config as a line edit of the text we hold
+ * (cfg_delta.h).  We check the base hash, patch into scratch, check the
+ * result hash, then run the same full-config apply as CMD_CONFIG_DATA; any
+ * doubt is a CMD_CONFIG_PULL.  A keepalive's "c|<sha256hex>" line is the hash
+ * of the text we should hold; a mismatch pulls too. */
+#define CMD_CONFIG_DELTA   0x91 // Hub -> Bot: config text delta
+#define CFG_PULL_MIN_GAP   5    // seconds between two CMD_CONFIG_PULLs
 
 /* ---- Channel-access requests (unban / invite / key) ----------------------
  * A bot locked out of a managed channel -- 474 banned, 473 invite-only, 475
@@ -1338,6 +1345,13 @@ struct bot_state {
    * means we diverged and must CMD_BOT_TREE_PULL the whole tree. */
   char   bot_tree_raw[TREE_RAW_MAX];
   int    bot_tree_raw_len;   /* 0 none yet, -1 the last tree was too large */
+  /* 2.5.4 config deltas: the exact text of the last full config the hub sent
+   * (or the last delta rebuilt), what CMD_CONFIG_DELTA edits and the
+   * keepalive's c| hashes; NULL none.  A PURGE line is not a config text and
+   * never replaces it.  Wiped on replace, disconnect and retire. */
+  char  *cfg_text;
+  size_t cfg_text_len;
+  time_t cfg_pull_at;        /* last CMD_CONFIG_PULL sent (CFG_PULL_MIN_GAP) */
   /* Last presence we reported, so a reconnect or server change re-reports and
    * an idle bot does not spam the hub with identical frames. */
   char   presence_server[TREE_SERVER_MAX + 1];
