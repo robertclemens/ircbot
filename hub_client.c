@@ -2498,6 +2498,7 @@ static const char *chan_elect_cannot(bot_state_t *state, const char *kind,
   chan_t *c = channel_find(state, channel);
   if (!c || c->status != C_IN) return "not in channel";
   if (strcmp(kind, "key") == 0) return c->key[0] ? NULL : "no key";
+  if (strcmp(kind, "who") == 0) return c->who_done ? NULL : "names not synced";
   if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0 ||
       strcmp(kind, "unban") == 0 || strcmp(kind, "mode") == 0 ||
       strcmp(kind, "kick") == 0 || strcmp(kind, "ban") == 0)
@@ -2525,6 +2526,53 @@ static void chan_done_send(bot_state_t *state, const char *id, bool ok,
   if (n > 0 && n < (int)sizeof(out)) hub_send_frame(state, CMD_CHAN_DONE, out, n);
 }
 
+/* `channel who`: our view of the channel as CMD_CHAN_WHO chunks (the body
+ * split anywhere, CHAN_WHO_CHUNK bytes each), then DONE.  bot.h has the
+ * body format. */
+static void chan_who_send(bot_state_t *state, const char *id, const char *chan) {
+  chan_t *c = channel_find(state, chan);
+  if (!c) {
+    chan_done_send(state, id, false, "not in channel");
+    return;
+  }
+  size_t cap = CHAN_TOPIC_MAX + 2 * MAX_MASK_LEN + 256 +
+               (size_t)MAX_ROSTER_SIZE * (MAX_MEMBER_NICK + 2);
+  char *body = malloc(cap);
+  if (!body) {
+    chan_done_send(state, id, false, "out of memory");
+    return;
+  }
+  int len = chanlive_who_body(state, c, body, cap);
+  if (len < 0) {
+    free(body);
+    chan_done_send(state, id, false, "too large");
+    return;
+  }
+  char *frame = malloc(CHAN_WHO_CHUNK + 128);
+  if (!frame) {
+    free(body);
+    chan_done_send(state, id, false, "out of memory");
+    return;
+  }
+  bool sent = true;
+  int seq = 0;
+  for (int off = 0; sent && (off < len || seq == 0); seq++) {
+    int part = len - off > CHAN_WHO_CHUNK ? CHAN_WHO_CHUNK : len - off;
+    bool more = off + part < len;
+    int n = snprintf(frame, CHAN_WHO_CHUNK + 128, "%s|%d|%d|", id, seq, more ? 1 : 0);
+    if (n <= 0 || n >= 128) { sent = false; break; }
+    memcpy(frame + n, body + off, (size_t)part);
+    sent = hub_send_frame(state, CMD_CHAN_WHO, frame, n + part);
+    off += part;
+  }
+  free(frame);
+  free(body);
+  if (!sent) return; /* the link is gone: the hub's timeout answers */
+  char note[32];
+  snprintf(note, sizeof(note), "%d nicks", c->roster_count);
+  chan_done_send(state, id, true, note);
+}
+
 /* We were picked: eid|kind|channel|requester|nick|hostmask.  Re-check (the
  * channel may have changed since the probe), act once, report. */
 static void chan_elect_do(bot_state_t *state, const char *payload) {
@@ -2540,6 +2588,10 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
   const char *why = chan_elect_cannot(state, kind, chan);
   if (why) {
     chan_done_send(state, id, false, why);
+    return;
+  }
+  if (strcmp(kind, "who") == 0) {
+    chan_who_send(state, id, chan);
     return;
   }
   if (strcmp(kind, "op") == 0 || strcmp(kind, "invite") == 0) {

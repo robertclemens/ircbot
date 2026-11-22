@@ -497,12 +497,27 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  *   PROBE_ACK  bot->hub  eid|1| or eid|0|reason
  *   DO         hub->bot  eid|kind|channel|requester|nick|hostmask
  *   DONE       bot->hub  eid|ok|detail or eid|fail|detail
- * kind = op / invite / unban / key. */
+ * kind = op / invite / unban / key / mode / kick / ban / who. */
 #define CMD_CHAN_PROBE     0x6D
 #define CMD_CHAN_PROBE_ACK 0x6E
 #define CMD_CHAN_DO        0x6F
 #define CMD_CHAN_DONE      0x70
 #define CHAN_DO_NICK_MAX   30   /* a nick the hub hands us, any network     */
+/* 2.5.4 `channel who` (irchub docs/plans/2026-11-21_channel_who_plan.md):
+ * election kind "who" -- any bot in the channel whose WHO list is complete
+ * (315 seen) is ready, ops not needed.  The picked bot sends its view as
+ * CMD_CHAN_WHO chunks, then DONE.  Mirrors irchub/hub.h.
+ *   CHAN_WHO   bot->hub  eid|seq|more|<body>, body lines:
+ *              t|<topic known 0/1>|<set_at>
+ *              B|<setter>          T|<topic>
+ *              M|<modes known 0/1>|<limit>|<+modes>
+ *              K|<key>             C|<members>|<capped 0/1>
+ *              N|<@%+ prefix><nick> ...  (space separated, highest prefix)
+ *              Free text (setter, topic, key) is the rest of its own line.
+ *              The body is split anywhere into chunks; the hub joins them. */
+#define CMD_CHAN_WHO       0x95
+#define CHAN_WHO_CHUNK     8192 /* body bytes per CHAN_WHO frame            */
+#define CHAN_TOPIC_MAX     512  /* a topic is kept to this (IRC caps ~390)  */
 
 /* ---- Network-wide upgrade coordination (console-initiated rolling upgrade).
  * The bot answers PREPARE with READY/UNABLE, runs the updater on COMMIT (the
@@ -1020,6 +1035,11 @@ struct chan_t {
   bool   ban_list_known;       /* a full list was received */
   bool   ban_overflow_logged;
   bool   who_done;             /* the channel WHO finished (315) this stay */
+  /* `channel who`: the topic as 332/333/331/TOPIC told us, this stay. */
+  char   topic[CHAN_TOPIC_MAX];
+  char   topic_by[MAX_MASK_LEN];
+  time_t topic_at;
+  bool   topic_known;          /* a 332/331/TOPIC was seen */
   /* A key / mode this bot learned (K|) and has not yet got to a hub. */
   bool   enf_pending;
   /* chanflood.c: per-source flood windows, heap, MAX_FLOOD_TRACK slots,
@@ -1433,7 +1453,7 @@ trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick);
 /* Nick part of a trusted bot's mask (up to '!'), bounded to MAX_NICK. */
 void auth_trusted_bot_nick(const trusted_bot_t *tb, char out[MAX_NICK]);
 /* Log label for another bot or a user named by uuid (irchub hub_who):
- * "bot bunny_ (<uuid>)", "admin robert (<uuid>)"; a name nobody knows reads
+ * "bot bunny_ (<uuid>)", "admin admin (<uuid>)"; a name nobody knows reads
  * "?".  kind: 'b' bot, 'u' admin/oper.  One of BOT_WHO_SLOTS rotating
  * buffers, so one log line can carry several. */
 #define BOT_WHO_SLOTS 4
@@ -1509,6 +1529,9 @@ void chanlive_ban_del(chan_t *c, const char *mask);
 void chanlive_ban_list_end(chan_t *c);
 /* 324 / 329 / 367 / 368 numerics: params after the command word. */
 void chanlive_numeric(bot_state_t *state, const char *command, char *params);
+void chanlive_topic(bot_state_t *state, const char *chan, const char *setter,
+                    const char *topic);
+int chanlive_who_body(const bot_state_t *state, const chan_t *c, char *out, size_t size);
 /* Ask the server for a channel's modes and ban list (own JOIN). */
 void chanlive_request(bot_state_t *state, chan_t *c);
 /* Election kind `mode` (CMD_CHAN_DO): queue the MODE lines that move the live

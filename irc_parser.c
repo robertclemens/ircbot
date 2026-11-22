@@ -378,6 +378,24 @@ void parser_handle_line(bot_state_t *state, char *line) {
   } else if (strcmp(command, "324") == 0 || strcmp(command, "329") == 0) {
     /* RPL_CHANNELMODEIS / RPL_CREATIONTIME: live state only. */
     chanlive_numeric(state, command, params);
+  } else if (strcmp(command, "331") == 0 || strcmp(command, "332") == 0 ||
+             strcmp(command, "333") == 0) {
+    /* RPL_NOTOPIC / RPL_TOPIC / RPL_TOPICWHOTIME: for `channel who` */
+    chanlive_numeric(state, command, params);
+  } else if (strcmp(command, "TOPIC") == 0 && prefix && params) {
+    /* "<chan> :<new topic>" */
+    char tbuf[1024];
+    if (strlen(params) < sizeof(tbuf)) {
+      memcpy(tbuf, params, strlen(params) + 1);
+      char *sp = strchr(tbuf, ' ');
+      const char *text = "";
+      if (sp) {
+        *sp = '\0';
+        text = sp + 1;
+        if (*text == ':') text++;
+      }
+      chanlive_topic(state, tbuf, prefix, text);
+    }
   } else if (strcmp(command, "367") == 0) {
     chanlive_numeric(state, command, params); /* our own ban list copy */
     /* RPL_BANLIST: "<me> <channel> <mask> [setter ts]" -- only of interest

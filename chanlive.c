@@ -232,6 +232,9 @@ void channel_live_reset(chan_t *c) {
   c->ban_list_known = false;
   c->ban_overflow_logged = false;
   c->who_done = false;
+  c->topic[0] = c->topic_by[0] = '\0';
+  c->topic_at = 0;
+  c->topic_known = false;
 }
 
 void chanlive_ban_add(bot_state_t *state, chan_t *c, const char *mask,
@@ -358,6 +361,25 @@ void chanlive_apply(bot_state_t *state, chan_t *c, const char *modes,
   }
 }
 
+/* A topic / setter as text the hub can show: control bytes go, and so do the
+ * colour digits after ^C ("^C04,12").  Bounded to `size`. */
+static void topic_copy(char *dst, size_t size, const char *src) {
+  size_t o = 0;
+  for (const unsigned char *p = (const unsigned char *)src; *p && o + 1 < size; p++) {
+    if (*p == 0x03) {
+      for (int k = 0; k < 2 && isdigit(p[1]); k++) p++;
+      if (p[1] == ',' && isdigit(p[2])) {
+        p++;
+        for (int k = 0; k < 2 && isdigit(p[1]); k++) p++;
+      }
+      continue;
+    }
+    if (*p < 0x20 || *p == 0x7f) continue;
+    dst[o++] = (char)*p;
+  }
+  dst[o] = '\0';
+}
+
 /* "<me> <chan> <rest...>": split off nick and channel, return the rest. */
 static chan_t *numeric_chan(bot_state_t *state, char *params, char **rest) {
   char *save;
@@ -405,7 +427,63 @@ void chanlive_numeric(bot_state_t *state, const char *command, char *params) {
   } else if (strcmp(command, "368") == 0) {
     chanlive_ban_list_end(c);
     c->enf_dirty = true;
+  } else if (strcmp(command, "332") == 0) {
+    /* RPL_TOPIC "<me> <chan> :<topic>" */
+    topic_copy(c->topic, sizeof(c->topic), rest[0] == ':' ? rest + 1 : rest);
+    c->topic_known = true;
+  } else if (strcmp(command, "331") == 0) {
+    /* RPL_NOTOPIC */
+    c->topic[0] = c->topic_by[0] = '\0';
+    c->topic_at = 0;
+    c->topic_known = true;
+  } else if (strcmp(command, "333") == 0) {
+    /* RPL_TOPICWHOTIME "<me> <chan> <setter> <ts>" */
+    char *save;
+    char *by = strtok_r(rest, " ", &save);
+    char *ts = strtok_r(NULL, " ", &save);
+    if (by) topic_copy(c->topic_by, sizeof(c->topic_by), by);
+    c->topic_at = parse_ts(ts);
   }
+}
+
+/* TOPIC from IRC: "<setter mask>", "<chan>", "<new topic>". */
+void chanlive_topic(bot_state_t *state, const char *chan, const char *setter,
+                    const char *topic) {
+  chan_t *c = chan ? channel_find(state, chan) : NULL;
+  if (!c) return;
+  topic_copy(c->topic, sizeof(c->topic), topic ? topic : "");
+  topic_copy(c->topic_by, sizeof(c->topic_by), setter ? setter : "");
+  c->topic_at = time(NULL);
+  c->topic_known = true;
+}
+
+/* `channel who` body (bot.h CMD_CHAN_WHO): what this bot sees in `c` right
+ * now.  Returns the length, or -1 when it does not fit `size`. */
+int chanlive_who_body(const bot_state_t *state, const chan_t *c, char *out, size_t size) {
+  (void)state;
+  char modes[64];
+  size_t m = 0;
+  modes[m++] = '+';
+  for (char ch = 'a'; ch <= 'z' && m < sizeof(modes) - 1; ch++)
+    if (c->live_flags & chan_live_bit(ch)) modes[m++] = ch;
+  for (char ch = 'A'; ch <= 'Z' && m < sizeof(modes) - 1; ch++)
+    if (c->live_flags & chan_live_bit(ch)) modes[m++] = ch;
+  modes[m == 1 ? 0 : m] = '\0';
+  size_t len = 0;
+  int n = snprintf(out, size, "t|%d|%lld\nB|%s\nT|%s\nM|%d|%ld|%s\nK|%s\nC|%d|%d\nN|",
+                   c->topic_known ? 1 : 0, (long long)c->topic_at, c->topic_by, c->topic,
+                   c->live_known ? 1 : 0, c->live_limit, modes, c->live_key, c->roster_count,
+                   c->roster_count >= MAX_ROSTER_SIZE ? 1 : 0);
+  if (n < 0 || (size_t)n >= size) return -1;
+  len = (size_t)n;
+  for (int i = 0; i < c->roster_count; i++) {
+    const roster_entry_t *r = &c->roster[i];
+    const char *pfx = r->is_op ? "@" : r->is_halfop ? "%" : r->is_voice ? "+" : "";
+    n = snprintf(out + len, size - len, "%s%s%s", i ? " " : "", pfx, r->nick);
+    if (n < 0 || (size_t)n >= size - len) return -1;
+    len += (size_t)n;
+  }
+  return (int)len;
 }
 
 void chanlive_request(bot_state_t *state, chan_t *c) {

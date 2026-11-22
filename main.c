@@ -679,16 +679,16 @@ static void run_config_wizard(void) {
       }
       printf("\n✓ Hub configuration saved (%d hub%s).\n",
              state.hub_count, state.hub_count == 1 ? "" : "s");
-      printf("\n  Admins, usermasks and channels for this bot are added with\n");
-      printf("  the hub console (admin/mask/chan), not here. This wizard assumes\n");
-      printf("  the hub network runs with opt 'h' (hub-only mutations), which\n");
-      printf("  is the default — it cannot verify that until the first sync.\n");
-      printf("  If your hub does not set opt 'h', you can also add them later\n");
-      printf("  from IRC with '+admin' and 'join'.\n");
+      printf("\n  Admins, usermasks and channels for this bot are added on the\n");
+      printf("  hub console ('user add', 'user mask', 'channel add'), not here.\n");
+      printf("  This wizard assumes the hub network runs with opt 'h' (hub-only\n");
+      printf("  mutations), which is the default — it cannot verify that until\n");
+      printf("  the first sync. If your hub does not set opt 'h', you can also\n");
+      printf("  add them later from IRC with '+admin' and 'join'.\n");
     } else {
       printf("\n--- Setup First Admin ---\n");
       while (true) {
-        get_input("Enter admin friendly name (no spaces, e.g. robert)", admin_name, sizeof(admin_name));
+        get_input("Enter admin friendly name (no spaces, e.g. admin)", admin_name, sizeof(admin_name));
         if (strlen(admin_name) > 0 && !strchr(admin_name,' ') && !strchr(admin_name,'|'))
           break;
         printf("ERROR: Name cannot contain spaces or '|'.\n");
