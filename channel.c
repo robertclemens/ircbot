@@ -111,6 +111,9 @@ void channel_list_reset_status(bot_state_t *state) {
 void channel_manager_check_joins(bot_state_t *state) {
   if (!(state->status & S_AUTHED))
     return;
+  /* No channel before the NETWORK= check says this is the right network. */
+  if (!netcheck_passed(state))
+    return;
 
   time_t now = time(NULL);
   /* Close out ban-list walks whose 368 never arrived. */
@@ -199,8 +202,10 @@ chan_req_kind_t chan_req_kind_from_token(const char *tok) {
 /* One trusted bot per attempt, advancing each time so a bot that is offline
  * or unhelpful does not absorb every retry.  Returns false when the roster is
  * empty or none of the entries yields a usable nick. */
+/* why: logged; irc_only: PRIVMSG even with a hub link (a failback because
+ * the hub did not get it done). */
 static bool chan_access_fallback(bot_state_t *state, chan_req_kind_t kind,
-                                 const char *channel) {
+                                 const char *channel, const char *why, bool irc_only) {
   if (state->trusted_bot_count <= 0)
     return false;
 
@@ -217,25 +222,26 @@ static bool chan_access_fallback(bot_state_t *state, chan_req_kind_t kind,
         strcasecmp(tb_nick, state->current_nick) == 0)
       continue;
 
+    void (*send)(bot_state_t *, const char *, const char *, ...) =
+        irc_only ? bot_comms_send_command_irc : bot_comms_send_command;
     switch (kind) {
     case CHAN_REQ_UNBAN:
-      bot_comms_send_command(state, tb_nick, "UNBAN %s", channel);
+      send(state, tb_nick, "UNBAN %s", channel);
       break;
     case CHAN_REQ_INVITE:
       /* Nothing to invite without a nick the server has accepted. */
       if (state->current_nick[0] == '\0')
         return false;
-      bot_comms_send_command(state, tb_nick, "INVITE %s %s", channel,
-                             state->current_nick);
+      send(state, tb_nick, "INVITE %s %s", channel, state->current_nick);
       break;
     case CHAN_REQ_KEY:
-      bot_comms_send_command(state, tb_nick, "KEY %s", channel);
+      send(state, tb_nick, "KEY %s", channel);
       break;
     default:
       return false;
     }
-    log_message(L_INFO, state, "[CHANREQ] %s for %s via %s (no hub)\n",
-                chan_req_kind_token(kind), channel, tb_nick);
+    log_message(L_INFO, state, "[B2-FAILBACK] %s for %s via %s (%s)\n",
+                chan_req_kind_token(kind), channel, tb_nick, why);
     return true;
   }
   return false;
@@ -269,10 +275,17 @@ bool chan_access_request(bot_state_t *state, chan_t *chan,
   if (now - state->last_chan_request_sent < CHAN_REQUEST_MIN_INTERVAL)
     return false;
 
+  /* A 2.5.4 hub (it sent an N|) answers; an older one gets no third field. */
+  char rid[USER_CHAN_RID_MAX + 1] = "";
+  if (state->pool_hub_seen && !hub_client_new_rid(rid, sizeof(rid))) rid[0] = '\0';
   bool sent = hub_client_send_chan_request(state, chan_req_kind_token(kind),
-                                           chan->name);
-  if (!sent)
-    sent = chan_access_fallback(state, kind, chan->name);
+                                           chan->name, rid);
+  if (sent) {
+    snprintf(chan->own_rid[kind], sizeof(chan->own_rid[kind]), "%s", rid);
+    chan->own_sent[kind] = now;
+  } else {
+    sent = chan_access_fallback(state, kind, chan->name, "no hub", false);
+  }
   if (!sent)
     return false;
 
@@ -280,6 +293,183 @@ bool chan_access_request(bot_state_t *state, chan_t *chan,
   chan->access_retry_count[kind]++;
   state->last_chan_request_sent = now;
   return true;
+}
+
+/* ---- Our own requests: the hub's answer, or ~B2 when there is none ------ */
+
+static const char *own_slot_word(int slot) {
+  return slot == OWN_REQ_OP ? "op" : chan_req_kind_token((chan_req_kind_t)slot);
+}
+
+/* op over IRC: a trusted bot this bot sees opped in the channel. */
+static bool own_op_b2(bot_state_t *state, chan_t *c, const char *why) {
+  roster_entry_t *helpers[MAX_ROSTER_SIZE];
+  int n = 0;
+  for (int i = 0; i < c->roster_count; i++) {
+    roster_entry_t *r = &c->roster[i];
+    if (r->is_op && auth_is_trusted_bot(state, r->hostmask, NULL, 0) && n < MAX_ROSTER_SIZE)
+      helpers[n++] = r;
+  }
+  if (n == 0) {
+    log_message(L_INFO, state, "[B2-FAILBACK] op for %s: no trusted bot opped here (%s)\n",
+                c->name, why);
+    return false;
+  }
+  roster_entry_t *h = helpers[rand() % n];
+  log_message(L_INFO, state, "[B2-FAILBACK] op for %s via %s (%s)\n", c->name, h->nick, why);
+  bot_comms_send_to_host_irc(state, h->hostmask, h->nick, "OPME %s", c->name);
+  return true;
+}
+
+/* The hub did not get it done (none / silent / failed): ask over IRC now.
+ * Nothing if it already worked. */
+void chan_own_failback(bot_state_t *state, chan_t *c, int slot, const char *why) {
+  if (!c || slot < 0 || slot >= OWN_REQ_SLOTS) return;
+  c->own_sent[slot] = 0;
+  c->own_rid[slot][0] = '\0';
+  if (slot == OWN_REQ_OP) {
+    if (c->status == C_IN && !c->i_am_opped) own_op_b2(state, c, why);
+    return;
+  }
+  if (c->status != C_IN)
+    chan_access_fallback(state, (chan_req_kind_t)slot, c->name, why, true);
+}
+
+/* CMD_USER_CHAN_RESULT for a rid of ours: ok -- done; denied -- policy, no
+ * ~B2 around it; none (anything else) -- nobody on a hub could: ~B2. */
+bool chan_own_result(bot_state_t *state, const char *rid, const char *status,
+                     const char *detail) {
+  if (!rid || !rid[0]) return false;
+  for (chan_t *c = state->chanlist; c != NULL; c = c->next)
+    for (int s = 0; s < OWN_REQ_SLOTS; s++) {
+      if (!c->own_sent[s] || strcmp(c->own_rid[s], rid) != 0) continue;
+      char d[200];
+      snprintf(d, sizeof(d), "%s", detail ? detail : "");
+      for (char *p = d; *p; p++)
+        if ((unsigned char)*p < 0x20 || *p == 0x7f) *p = ' ';
+      if (strcmp(status, "ok") == 0 || strcmp(status, "denied") == 0) {
+        log_message(L_INFO, state, "[CHANREQ] %s for %s: %s%s%s\n", own_slot_word(s), c->name,
+                    strcmp(status, "ok") == 0 ? "done" : "denied, not asking over IRC",
+                    d[0] ? " - " : "", d);
+        c->own_sent[s] = 0;
+        c->own_rid[s][0] = '\0';
+      } else {
+        char why[240];
+        snprintf(why, sizeof(why), "hub: %.200s", d[0] ? d : status);
+        chan_own_failback(state, c, s, why);
+      }
+      return true;
+    }
+  return false;
+}
+
+/* Each second: a request that worked is dropped quietly; one the hub left
+ * unanswered past its wait goes over IRC. */
+void chan_own_tick(bot_state_t *state) {
+  time_t now = time(NULL);
+  for (chan_t *c = state->chanlist; c != NULL; c = c->next)
+    for (int s = 0; s < OWN_REQ_SLOTS; s++) {
+      if (!c->own_sent[s]) continue;
+      bool done = s == OWN_REQ_OP ? (c->status == C_IN && c->i_am_opped) : c->status == C_IN;
+      if (done) {
+        c->own_sent[s] = 0;
+        c->own_rid[s][0] = '\0';
+        continue;
+      }
+      int wait = s == OWN_REQ_OP ? OWN_REQ_WAIT_OP : OWN_REQ_WAIT_CHAN;
+      if (now - c->own_sent[s] < wait) continue;
+      chan_own_failback(state, c, s, c->own_rid[s][0] ? "no answer from the hub"
+                                                      : "no result through an older hub");
+    }
+}
+
+/* Our own op through the hub's election (a 2.5.4 hub).  False: not sent
+ * (no such hub link) -- the caller takes the older path. */
+bool chan_own_op_request(bot_state_t *state, chan_t *c) {
+  if (!state->pool_hub_seen) return false;
+  char rid[USER_CHAN_RID_MAX + 1];
+  if (!hub_client_new_rid(rid, sizeof(rid))) return false;
+  if (!hub_client_send_chan_request(state, "op", c->name, rid)) return false;
+  snprintf(c->own_rid[OWN_REQ_OP], sizeof(c->own_rid[OWN_REQ_OP]), "%s", rid);
+  c->own_sent[OWN_REQ_OP] = time(NULL);
+  return true;
+}
+
+/* ---- An invite only for the mask the request was for ------------------- */
+
+/* The nick is outside the channel, so its mask comes from `WHO <nick>`: the
+ * 352 carries the nick!ident@host every client is shown (request_own_hostmask
+ * explains why not USERHOST).  id "" = a ~B2 invite. */
+void invite_check_start(bot_state_t *state, const char *id, const char *chan, const char *nick,
+                        const char *mask, const char *user) {
+  invite_check_t *slot = NULL;
+  for (int i = 0; i < INVITE_CHECKS && !slot; i++)
+    if (!state->invite_checks[i].active) slot = &state->invite_checks[i];
+  if (!slot) {
+    log_message(L_INFO, state, "[INVITE] Too many invite checks in flight; not inviting %s\n",
+                nick);
+    if (id && id[0]) chan_done_send(state, id, false, "busy");
+    return;
+  }
+  memset(slot, 0, sizeof(*slot));
+  slot->active = true;
+  snprintf(slot->id, sizeof(slot->id), "%s", id ? id : "");
+  snprintf(slot->chan, sizeof(slot->chan), "%s", chan);
+  snprintf(slot->nick, sizeof(slot->nick), "%s", nick);
+  snprintf(slot->mask, sizeof(slot->mask), "%s", mask);
+  snprintf(slot->user, sizeof(slot->user), "%s", user ? user : "");
+  slot->sent = time(NULL);
+  irc_printf(state, "WHO %s\r\n", nick);
+}
+
+static void invite_check_close(bot_state_t *state, invite_check_t *k, bool ok, const char *why) {
+  if (ok) {
+    log_message(L_INFO, state, "[INVITE] Inviting %s into %s (%s checked)\n", k->nick, k->chan,
+                k->mask);
+    irc_printf(state, "INVITE %s %s\r\n", k->nick, k->chan);
+  } else {
+    log_message(L_INFO, state, "[INVITE] Not inviting %s into %s: %s\n", k->nick, k->chan, why);
+  }
+  if (k->id[0]) chan_done_send(state, k->id, ok, ok ? "INVITE sent" : why);
+  memset(k, 0, sizeof(*k));
+}
+
+/* A 352: the live mask of a nick we may be about to invite. */
+void invite_check_who(bot_state_t *state, const char *nick, const char *ident, const char *host) {
+  char live[MAX_MASK_LEN];
+  if (snprintf(live, sizeof(live), "%s!%s@%s", nick, ident, host) >= (int)sizeof(live)) return;
+  for (int i = 0; i < INVITE_CHECKS; i++) {
+    invite_check_t *k = &state->invite_checks[i];
+    if (!k->active || strcasecmp(k->nick, nick) != 0) continue;
+    k->seen = true;
+    chan_t *c = channel_find(state, k->chan);
+    if (!c || c->status != C_IN || !c->i_am_opped)
+      invite_check_close(state, k, false, "not opped there");
+    else if (k->user[0] ? !auth_mask_equal(live, k->mask) : !auth_bot_mask_ok(state, k->mask, live))
+      invite_check_close(state, k, false, "the nick is not the requester now");
+    else if (k->user[0] && !auth_user_live_ok(state, k->user, live, k->chan))
+      invite_check_close(state, k, false, "the user's masks do not cover it");
+    else
+      invite_check_close(state, k, true, "");
+  }
+}
+
+/* The 315 after it: a nick no 352 answered for is not on IRC. */
+void invite_check_end(bot_state_t *state, const char *nick) {
+  for (int i = 0; i < INVITE_CHECKS; i++) {
+    invite_check_t *k = &state->invite_checks[i];
+    if (k->active && !k->seen && strcasecmp(k->nick, nick) == 0)
+      invite_check_close(state, k, false, "the nick is not on IRC");
+  }
+}
+
+void invite_check_tick(bot_state_t *state) {
+  time_t now = time(NULL);
+  for (int i = 0; i < INVITE_CHECKS; i++) {
+    invite_check_t *k = &state->invite_checks[i];
+    if (k->active && now - k->sent >= INVITE_CHECK_WAIT)
+      invite_check_close(state, k, false, "no WHO answer");
+  }
 }
 
 /* ---- Servicing a request another bot made of us ------------------------- */

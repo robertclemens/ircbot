@@ -153,13 +153,26 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
       } else if (bot_command && bot_arg1 &&
                  strcasecmp(bot_command, "INVITE") == 0) {
         char *bot_arg2 = strtok_r(NULL, " ", &sp);
+        char *imask = strtok_r(NULL, " ", &sp), *iuser = strtok_r(NULL, " ", &sp);
+        char snick[MAX_NICK];
+        auth_trusted_bot_nick(sender, snick);
         if (bot_arg2) {
           chan_t *ic = channel_find(state, bot_arg1);
           if (ic && ic->status == C_IN && ic->i_am_opped) {
-            log_message(L_INFO, state,
-                        "[BOT-COMMS] Inviting %s to %s (bot req)\n", bot_arg2,
-                        bot_arg1);
-            irc_printf(state, "INVITE %s %s\r\n", bot_arg2, bot_arg1);
+            if (imask && iuser) {
+              /* a person the sender validated: its mask, checked live */
+              invite_check_start(state, "", bot_arg1, bot_arg2, imask, iuser);
+            } else if (strcasecmp(bot_arg2, snick) == 0) {
+              /* the sender itself: its published mask, checked live */
+              invite_check_start(state, "", bot_arg1, bot_arg2, sender->mask, "");
+            } else {
+              /* a 2.5.3 sender's person invite (no mask): as before,
+               * unchecked -- 2.5.5 drops this form */
+              log_message(L_INFO, state,
+                          "[BOT-COMMS] Inviting %s to %s (older bot's request, unchecked)\n",
+                          bot_arg2, bot_arg1);
+              irc_printf(state, "INVITE %s %s\r\n", bot_arg2, bot_arg1);
+            }
           }
         }
       } else if (bot_command && bot_arg1 &&
@@ -168,8 +181,25 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
          * an oper bound to the channel, user_flags plan §5).  +bitch still
          * holds here: only an authorised member is opped. */
         char *bot_arg2 = strtok_r(NULL, " ", &sp);
+        char *omask = strtok_r(NULL, " ", &sp), *ouser = strtok_r(NULL, " ", &sp);
         chan_t *oc = bot_arg2 ? channel_find(state, bot_arg1) : NULL;
-        if (oc && oc->status == C_IN && oc->i_am_opped) {
+        if (oc && oc->status == C_IN && oc->i_am_opped && omask && ouser) {
+          /* the nick's mask here must be the one the sender validated, and
+           * still that user's (2026-11-23) */
+          const char *hm = NULL;
+          for (int i = 0; i < oc->roster_count; i++)
+            if (strcasecmp(oc->roster[i].nick, bot_arg2) == 0) hm = oc->roster[i].hostmask;
+          if (hm && auth_mask_equal(hm, omask) && auth_user_live_ok(state, ouser, hm, bot_arg1)) {
+            log_message(L_INFO, state, "[BOT-COMMS] Opping %s in %s (bot req, %s checked)\n",
+                        bot_arg2, bot_arg1, hm);
+            irc_printf(state, "MODE %s +o %s\r\n", bot_arg1, bot_arg2);
+          } else {
+            log_message(L_INFO, state, "[BOT-COMMS] Not opping %s in %s: not the requester here\n",
+                        bot_arg2, bot_arg1);
+          }
+        } else if (oc && oc->status == C_IN && oc->i_am_opped) {
+          /* a 2.5.3 sender (no mask): as before, +bitch only -- 2.5.5 drops
+           * this form */
           bool found = false;
           bool auth = chan_member_authorised(state, oc, bot_arg2, &found);
           if (!chancfg_get(state, oc, CS_BITCH) || (found && auth)) {
@@ -254,13 +284,15 @@ bool bot_comms_handle_privmsg(bot_state_t *state, const char *nick,
 }
 
 /* Seal `format` to trusted bot `tb` and send it to IRC nick `target_nick`
- * (hub relay when connected, else PRIVMSG). */
+ * (hub relay when connected and the target is on a hub, else PRIVMSG).
+ * irc_only: PRIVMSG whatever the hub link -- a failback because the hub did
+ * not get the job done (bot chan request plan 2026-11-23). */
 static void b2_vsend(bot_state_t *state, const trusted_bot_t *tb,
-                     const char *target_nick, const char *format,
+                     const char *target_nick, bool irc_only, const char *format,
                      va_list args)
-    __attribute__((format(printf, 4, 0)));
+    __attribute__((format(printf, 5, 0)));
 static void b2_vsend(bot_state_t *state, const trusted_bot_t *tb,
-                     const char *target_nick, const char *format,
+                     const char *target_nick, bool irc_only, const char *format,
                      va_list args) {
   if (!tb || !tb->has_pub || tb->uuid[0] == '\0') {
     log_message(L_DEBUG, state,
@@ -309,9 +341,11 @@ static void b2_vsend(bot_state_t *state, const trusted_bot_t *tb,
   free(b64);
   if (ll <= 0 || ll >= (int)sizeof(line)) return;
 
-  /* Route through hub if connected; PRIVMSG is the fallback for hub-less bots */
+  /* Route through hub if connected and the target is on a hub (the bot
+   * tree); PRIVMSG for hub-less bots and for a target no hub holds. */
   bool sent_via_hub = false;
-  if (state->hub_connected && state->hub_authenticated && state->hub_fd != -1) {
+  if (!irc_only && state->hub_connected && state->hub_authenticated && state->hub_fd != -1 &&
+      hub_client_bot_on_hub(state, tb->uuid)) {
     log_message(L_DEBUG, state, "[BOT-COMM] Relaying %s to %s via hub\n",
                 command_part, target_nick);
     sent_via_hub = hub_client_relay_bot_command(state, tb->uuid, line);
@@ -329,7 +363,17 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
   if (!target_nick || !format) return;
   va_list args;
   va_start(args, format);
-  b2_vsend(state, auth_trusted_bot_by_nick(state, target_nick), target_nick,
+  b2_vsend(state, auth_trusted_bot_by_nick(state, target_nick), target_nick, false,
+           format, args);
+  va_end(args);
+}
+
+void bot_comms_send_command_irc(bot_state_t *state, const char *target_nick,
+                                const char *format, ...) {
+  if (!target_nick || !format) return;
+  va_list args;
+  va_start(args, format);
+  b2_vsend(state, auth_trusted_bot_by_nick(state, target_nick), target_nick, true,
            format, args);
   va_end(args);
 }
@@ -342,7 +386,17 @@ void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
   if (!hostmask || !target_nick || !format) return;
   va_list args;
   va_start(args, format);
-  b2_vsend(state, auth_trusted_bot_by_host(state, hostmask), target_nick,
+  b2_vsend(state, auth_trusted_bot_by_host(state, hostmask), target_nick, false,
+           format, args);
+  va_end(args);
+}
+
+void bot_comms_send_to_host_irc(bot_state_t *state, const char *hostmask,
+                                const char *target_nick, const char *format, ...) {
+  if (!hostmask || !target_nick || !format) return;
+  va_list args;
+  va_start(args, format);
+  b2_vsend(state, auth_trusted_bot_by_host(state, hostmask), target_nick, true,
            format, args);
   va_end(args);
 }
@@ -351,15 +405,17 @@ void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
  * answered): every trusted bot gets it over ~B2; one that is in the channel
  * and opped does it (user_flags plan §5). */
 void bot_comms_user_chan_fallback(bot_state_t *state, const char *kind, const char *chan,
-                                  const char *nick, const char *mask) {
+                                  const char *nick, const char *mask, const char *uuid) {
+  /* op / invite carry the person's validated mask and uuid: the bot that
+   * acts checks the nick's live mask against them first (2026-11-23) */
   for (int i = 0; i < state->trusted_bot_count; i++) {
     char tb_nick[MAX_NICK];
     auth_trusted_bot_nick(&state->trusted_bots[i], tb_nick);
     if (!tb_nick[0]) continue;
     if (strcmp(kind, "invite") == 0)
-      bot_comms_send_command(state, tb_nick, "INVITE %s %s", chan, nick);
+      bot_comms_send_command(state, tb_nick, "INVITE %s %s %s %s", chan, nick, mask, uuid);
     else if (strcmp(kind, "op") == 0)
-      bot_comms_send_command(state, tb_nick, "OPUSER %s %s", chan, nick);
+      bot_comms_send_command(state, tb_nick, "OPUSER %s %s %s %s", chan, nick, mask, uuid);
     else if (strcmp(kind, "unban") == 0)
       bot_comms_send_command(state, tb_nick, "UNBANUSER %s %s", chan, mask);
   }

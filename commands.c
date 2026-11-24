@@ -1189,7 +1189,7 @@ static const struct {
 } BOT_CMD_FLAGS[] = {
   {"die", 'b'},      {"jump", 'b'},      {"+bot", 'b'},      {"-bot", 'b'},
   {"givenick", 'b'}, {"chnick", 'b'},    {"rekey", 'b'},
-  {"+server", 'b'},  {"-server", 'b'},
+  {"+server", 's'},  {"-server", 's'},
   {"join", 'c'},     {"part", 'c'},      {"op", 'c'},        {"invite", 'c'},
   {"unban", 'c'},    {"key", 'c'},       {"chanmode", 'c'},  {"chanset", 'c'},
   {"+ban", 'c'},     {"-ban", 'c'},
@@ -1207,6 +1207,7 @@ static const char *bot_flag_word(char f) {
   case 'c': return "channels";
   case 'h': return "hub";
   case 'o': return "opers";
+  case 's': return "servers";
   case 'u': return "upgrades";
   default:  return "?";
   }
@@ -1296,7 +1297,7 @@ static void user_chan_command(bot_state_t *state, const char *nick, const char *
     irc_printf(state, "PRIVMSG %s :I am not opped in %s; asked the network.\r\n", nick, chan);
     return;
   }
-  bot_comms_user_chan_fallback(state, kind, chan, nick, user_host);
+  bot_comms_user_chan_fallback(state, kind, chan, nick, user_host, me->uuid);
   irc_printf(state, "PRIVMSG %s :I am not opped in %s; asked the other bots.\r\n", nick, chan);
 }
 
@@ -1455,20 +1456,37 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         dcc_offer(state, nick, user_host, auth_user);
     } else if (strcasecmp(command, "jump") == 0) {
       if (arg1) {
-        /* Jump to named server: match by hostname only, ignore stored port */
+        /* Jump to a named server: host:port as listed when a port is given
+         * (servers on one host differ by port), else the first slot of that
+         * host whatever its port. */
         char arg_host[256];
         snprintf(arg_host, sizeof(arg_host), "%s", arg1);
         char *arg_colon = strrchr(arg_host, ':');
+        bool arg_port = arg_colon && arg_host[0] != '[';
+        if (arg_colon && !arg_port) arg_colon = NULL;
         if (arg_colon) *arg_colon = '\0';
         int target_idx = -1;
-        for (int i = 0; i < state->server_count; i++) {
+        for (int i = 0; i < state->server_count && target_idx < 0; i++)
+          if (arg_port && strcasecmp(arg1, state->server_list[i]) == 0) target_idx = i;
+        for (int i = 0; i < state->server_count && target_idx < 0; i++) {
+          if (arg_port) break;
           char srv_host[256];
           snprintf(srv_host, sizeof(srv_host), "%s", state->server_list[i]);
           char *srv_colon = strrchr(srv_host, ':');
-          if (srv_colon) *srv_colon = '\0';
-          if (strcasecmp(arg_host, srv_host) == 0) { target_idx = i; break; }
+          if (srv_colon && srv_host[0] != '[') *srv_colon = '\0';
+          if (strcasecmp(arg_host, srv_host) == 0) target_idx = i;
         }
-        if (target_idx == -1) {
+        char jh[POOL_HOST_MAX + 1];
+        int jp = 0;
+        if (target_idx == -1 && state->hub_count > 0 &&
+            pool_hostport_parse(arg1, jh, sizeof(jh), &jp)) {
+          /* Hub-managed: an operator override to a host outside the pool,
+           * dialed once and not added to it (plan §5.6). */
+          snprintf(state->jump_once, sizeof(state->jump_once), "%s", arg1);
+          irc_printf(state, "QUIT :Jumping to %s...\r\n", arg1);
+          irc_disconnect(state);
+          state->last_irc_attempt = 0;
+        } else if (target_idx == -1) {
           irc_printf(state, "PRIVMSG %s :Error: Server '%s' not in list.\r\n",
                      nick, arg1);
         } else {
@@ -1480,6 +1498,8 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                         state->server_list[target_idx], held);
           irc_server_block_clear(state, target_idx);
           state->current_server_index = target_idx;
+          /* hub-managed: the load-based pick would ignore the cursor */
+          state->jump_slot1 = target_idx + 1;
           irc_printf(state, "QUIT :Jumping to %s...\r\n", arg1);
           irc_disconnect(state);
         }
@@ -2644,8 +2664,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         next_idx = state->current_server_index;
         if (next_idx < 0 || next_idx >= state->server_count) next_idx = 0;
       }
-      irc_printf(state, "PRIVMSG %s :| ircbot %s servers\r\n", nick,
-                 BOT_VERSION);
+      irc_printf(state, "PRIVMSG %s :| ircbot %s servers (%s)\r\n", nick,
+                 BOT_VERSION,
+                 pool_local_fallback(state) ? "local list, until the hub's pool arrives"
+                 : state->hub_count > 0     ? "hub pool"
+                                            : "local list");
       irc_printf(state, "PRIVMSG %s :+----------------------------------------------------------------------------\r\n", nick);
       int shown = 0;
       for (int i = 0; i < state->server_count && shown < BOT_STATUS_MAX_LINES;
@@ -2675,7 +2698,24 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
                    marker, host_w, host, port, note);
         shown++;
       }
-      if (shown == 0)
+      if (state->hub_count > 0 && !pool_local_fallback(state)) {
+        /* Pool entries the dial list leaves out, and the dormant local list. */
+        const pool_entry_t *un[MAX_POOL_SERVERS];
+        int nu = pool_unlisted(state, un, MAX_POOL_SERVERS);
+        for (int i = 0; i < nu && shown < BOT_STATUS_MAX_LINES; i++, shown++)
+          irc_printf(state, "PRIVMSG %s :|   %-*s  port %-7d  [%s%s%s]\r\n", nick, host_w,
+                     un[i]->s.host, un[i]->s.port, pool_state_name(un[i]->s.state),
+                     un[i]->s.seen[0] ? ": " : "", un[i]->s.seen);
+        for (int i = 0; i < state->local_server_count && shown < BOT_STATUS_MAX_LINES;
+             i++, shown++)
+          irc_printf(state, "PRIVMSG %s :|   %-*s  local (unused: hub-managed)\r\n", nick,
+                     host_w, state->local_servers[i]);
+        if (state->server_count == 0)
+          irc_printf(state, "PRIVMSG %s :| %s\r\n", nick,
+                     state->pool_known ? "no usable server in the pool: waiting for one"
+                                       : "no server pool from the hub yet");
+      }
+      if (shown == 0 && state->hub_count == 0)
         irc_printf(state, "PRIVMSG %s :| (no servers configured)\r\n", nick);
       else if (connected_idx >= 0)
         irc_printf(state, "PRIVMSG %s :| '*' connected, [..] on hold\r\n", nick);
@@ -2686,49 +2726,31 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       irc_printf(state, "PRIVMSG %s :`----------------------------------------------------------------------------\r\n", nick);
 
     } else if (strcasecmp(command, "+server") == 0) {
+      /* Hub-managed: an S| add pushed to the hub's pool (refused under opt
+       * h).  Standalone: the local s| list.  pool.c, plan §5.5. */
       if (!arg1) {
         irc_printf(state,
-                   "PRIVMSG %s :Syntax: +server <irc.server.net:6667>\r\n",
+                   "PRIVMSG %s :Syntax: +server <irc.server.net[:port]>\r\n",
                    nick);
         return;
       }
-      if (state->server_count < MAX_SERVERS) {
-        char *dup = strdup(arg1);
-        if (!dup) return;
-        irc_server_block_clear(state, state->server_count); /* fresh slot */
-        state->server_list[state->server_count++] = dup;
-        state->server_list[state->server_count] = NULL;
-        config_write_with_state_pass(state);
-        irc_printf(state, "PRIVMSG %s :Added server '%s' and saved config.\r\n",
-                   nick, arg1);
-      } else
-        irc_printf(state, "PRIVMSG %s :Error: Server list is full.\r\n", nick);
+      char err[256];
+      if (servers_add(state, arg1, err, sizeof(err)))
+        irc_printf(state, "PRIVMSG %s :Added server '%s' to the %s.\r\n", nick, arg1,
+                   state->hub_count > 0 ? "hub's pool" : "server list and saved config");
+      else
+        irc_printf(state, "PRIVMSG %s :Error: %s.\r\n", nick, err);
     } else if (strcasecmp(command, "-server") == 0) {
       if (!arg1) {
-        irc_printf(state, "PRIVMSG %s :Syntax: -server <server>\r\n", nick);
+        irc_printf(state, "PRIVMSG %s :Syntax: -server <server[:port]|uuid>\r\n", nick);
         return;
       }
-      int found_index = -1;
-      for (int i = 0; i < state->server_count; i++)
-        if (strcasecmp(state->server_list[i], arg1) == 0) {
-          found_index = i;
-          break;
-        }
-      if (found_index != -1) {
-        irc_server_block_remove(state, found_index); /* before compaction */
-        free(state->server_list[found_index]);
-        for (int i = found_index; i < state->server_count - 1; i++)
-          state->server_list[i] = state->server_list[i + 1];
-        state->server_count--;
-        state->server_list[state->server_count] = NULL;
-        config_write_with_state_pass(state);
-        irc_printf(state,
-                   "PRIVMSG %s :Removed server '%s' and saved config.\r\n",
-                   nick, arg1);
-      } else {
-        irc_printf(state, "PRIVMSG %s :Error: Server '%s' not found.\r\n",
-                   nick, arg1);
-      }
+      char err[320];
+      if (servers_del(state, arg1, err, sizeof(err)))
+        irc_printf(state, "PRIVMSG %s :Removed server '%s' from the %s.\r\n", nick, arg1,
+                   state->hub_count > 0 ? "hub's pool" : "server list and saved config");
+      else
+        irc_printf(state, "PRIVMSG %s :Error: %s.\r\n", nick, err);
     } else if (strcasecmp(command, "update") == 0) {
       /* In-place 'update' is for standalone bots only.  A hub-configured bot is
        * upgraded by its hub (console-initiated rolling upgrade), never via an
@@ -2787,7 +2809,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         if (dec) free(dec);
         return;
       }
-      if (state->hub_count >= MAX_SERVERS) {
+      if (state->hub_count >= MAX_HUBS) {
         secure_wipe(dec, (size_t)dec_len);
         free(dec);
         irc_printf(state, "PRIVMSG %s :Error: Hub list is full.\r\n", nick);
@@ -2801,6 +2823,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       secure_wipe(dec, (size_t)dec_len);
       free(dec);
       state->hub_count++;
+      /* The first hub: hub-managed from now on, so the dial list is the pool
+       * (none yet: it stays on its current server, plan D13). */
+      if (state->hub_count == 1) servers_rebuild(state);
       config_write_with_state_pass(state); /* pushes: its hl| list changed */
       irc_printf(state,
                  "PRIVMSG %s :Added Hub: %s (pubkey pinned)\r\n", nick, arg1);
@@ -2839,8 +2864,14 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         state->hub_count--;
         memset(&state->hubs[state->hub_count], 0,
                sizeof(state->hubs[state->hub_count]));
+        /* The last hub gone: the bot is standalone and keeps the servers it
+         * knew -- the usable pool becomes its s| list (plan §5.1, Q4). */
+        if (state->hub_count == 0) pool_go_hubless(state);
         config_write_with_state_pass(state); /* pushes: its hl| list changed */
         irc_printf(state, "PRIVMSG %s :Removed Hub: %s\r\n", nick, arg1);
+        if (state->hub_count == 0)
+          irc_printf(state, "PRIVMSG %s :Now standalone: %d local server%s.\r\n", nick,
+                     state->local_server_count, state->local_server_count == 1 ? "" : "s");
 
         // If we disconnected and there are other hubs available, reconnect
         if (is_current_hub && state->hub_count > 0) {

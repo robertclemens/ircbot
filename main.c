@@ -148,6 +148,8 @@ static void state_init(bot_state_t *state) {
 static void state_destroy(bot_state_t *state) {
   for (int i = 0; i < state->server_count; i++)
     free(state->server_list[i]);
+  for (int i = 0; i < state->local_server_count; i++)
+    free(state->local_servers[i]);
   /* hubs[] is an embedded array (no heap), but wipe the pinned key bytes. */
   for (int i = 0; i < state->hub_count; i++)
     OPENSSL_cleanse(state->hubs[i].ed_pub, sizeof(state->hubs[i].ed_pub));
@@ -562,15 +564,6 @@ static void run_config_wizard(void) {
     get_input("Enter VHOST IP (optional, press Enter for default [no vhost])",
               state.vhost, sizeof(state.vhost));
 
-    printf("\n--- Setup IRC Server ---\n");
-    while (true) {
-      get_input("Enter IRC server (e.g., irc.efnet.org)", server_buf,
-                MAX_BUFFER);
-      if (strlen(server_buf) > 3 && strchr(server_buf, '.'))
-        break;
-      printf("🚨 ERROR: Invalid server format.\n");
-    }
-
     /* Management mode decides the rest of the wizard.  A hub-managed bot owns
      * none of the records the hub is authoritative for, so prompting for them
      * only produces local state the first sync discards — or, under opt 'h'
@@ -578,10 +571,10 @@ static void run_config_wizard(void) {
      * re-pushes forever with no way to notice.  Ask first, collect only what
      * this bot actually owns. */
     printf("\n--- Management Mode ---\n");
-    printf("Hub-managed: admins, usermasks and channels live on the hub and are\n");
-    printf("  managed on the hub console. This bot only needs hub addresses and\n");
-    printf("  their pinned public keys.\n");
-    printf("Standalone:  this bot owns its own admin list and channels.\n\n");
+    printf("Hub-managed: admins, usermasks, channels and IRC servers live on the\n");
+    printf("  hub and are managed on the hub console. This bot only needs hub\n");
+    printf("  addresses and their pinned public keys.\n");
+    printf("Standalone:  this bot owns its own IRC servers, admin list and channels.\n\n");
 
     char mode_choice[16];
     get_input("Hub-managed? (Y/n)", mode_choice, sizeof(mode_choice));
@@ -594,7 +587,7 @@ static void run_config_wizard(void) {
       printf("in its console. Each hub has its own keypair, so the key is pinned\n");
       printf("per hub.\n");
 
-      while (state.hub_count < MAX_SERVERS) {
+      while (state.hub_count < MAX_HUBS) {
         char hub_addr[256];
         char hub_pub_input[256];
         bool addr_valid = false;
@@ -661,8 +654,8 @@ static void run_config_wizard(void) {
           printf("\n✓ Hub added: %s\n", hub_addr);
         }
 
-        if (state.hub_count >= MAX_SERVERS) {
-          printf("Reached hub limit (%d).\n", MAX_SERVERS);
+        if (state.hub_count >= MAX_HUBS) {
+          printf("Reached hub limit (%d).\n", MAX_HUBS);
           break;
         }
         char more[16];
@@ -686,6 +679,18 @@ static void run_config_wizard(void) {
       printf("  the first sync. If your hub does not set opt 'h', you can also\n");
       printf("  add them later from IRC with '+admin' and 'join'.\n");
     } else {
+      printf("\n--- Setup IRC Server ---\n");
+      while (true) {
+        get_input("Enter IRC server (e.g., irc.efnet.org or irc.efnet.org:6697)",
+                  server_buf, MAX_BUFFER);
+        char wh[POOL_HOST_MAX + 1];
+        int wp = 0;
+        if (strchr(server_buf, '.') &&
+            pool_hostport_parse(server_buf, wh, sizeof(wh), &wp))
+          break;
+        printf("🚨 ERROR: Invalid server format (host or host:port).\n");
+      }
+
       printf("\n--- Setup First Admin ---\n");
       while (true) {
         get_input("Enter admin friendly name (no spaces, e.g. admin)", admin_name, sizeof(admin_name));
@@ -737,7 +742,10 @@ static void run_config_wizard(void) {
     printf("     Configuration Summary (Review)         \n");
     printf("==========================================\n");
     printf("Bot Nick: %s\n", state.target_nick);
-    printf("IRC Server: %s\n", server_buf);
+    if (hub_managed)
+      printf("IRC servers: from the hub pool\n");
+    else
+      printf("IRC Server: %s\n", server_buf);
     if (hub_managed) {
       printf("Mode: HUB-MANAGED (%d hub%s)\n", state.hub_count,
              state.hub_count == 1 ? "" : "s");
@@ -805,7 +813,12 @@ static void run_config_wizard(void) {
    * standalone branch fills them. */
   secure_wipe(admin_masks, sizeof(admin_masks));
 #undef WIZARD_MAX_MASKS
-  state.server_list[state.server_count++] = strdup(server_buf);
+  /* Standalone: its one local server.  Hub-managed: none -- the hub's pool
+   * arrives with the first sync (server pool plan §5.5a). */
+  if (!hub_managed && server_buf[0]) {
+    char *d = strdup(server_buf);
+    if (d) state.local_servers[state.local_server_count++] = d;
+  }
 
   if (strlen(chan_buf) > 0) {
     chan_t *c = channel_add(&state, chan_buf);
@@ -822,9 +835,15 @@ static void run_config_wizard(void) {
   printf("You can now start the bot:\n");
   printf("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'\n");
   printf("  Or run './ircbot' directly and enter the password when prompted.\n");
+  if (hub_managed) {
+    printf("\nThis bot joins IRC once its first hub sync brings the server pool.\n");
+    printf("If the hub has no servers yet, add one on the hub console first\n");
+    printf("('server add <host[:port]>').\n");
+  }
 
-  /* Release the wizard's local state: frees server_list[] entries (the strdup
-   * at the server_buf line) and the channel list, and cleanses key material. */
+  /* Release the wizard's local state: frees the local_servers[] entry (the
+   * strdup at the server_buf line) and the channel list, and cleanses key
+   * material. */
   state_destroy(&state);
   config_key_forget();
 }
@@ -1104,6 +1123,8 @@ int main(int argc, char *argv[]) {
       hub_client_connect(&state);   // Attempts connection if needed
       hub_client_heartbeat(&state); // Sends pings if authenticated
       hub_client_user_chan_tick(&state); // unanswered person requests -> ~B2
+      chan_own_tick(&state);             // our own unanswered requests -> ~B2
+      invite_check_tick(&state);         // invites whose WHO never came back
     }
 
     fd_set read_fds, write_fds;

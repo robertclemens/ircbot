@@ -68,6 +68,13 @@ static void isupport_token(bot_state_t *state, const char *tok) {
   const char *val = eq ? eq + 1 : "";
   size_t vl = strlen(val);
 
+  if (nl == 7 && strncmp(tok, "NETWORK", 7) == 0) {
+    /* the network check (pool.c) compares it; an unusable value reads as
+     * none sent */
+    is->network[0] = '\0';
+    if (!neg && pool_net_name_ok(val)) snprintf(is->network, sizeof(is->network), "%s", val);
+    return;
+  }
   if (nl == 5 && strncmp(tok, "MODES", 5) == 0) {
     if (neg) { is->modes = ISUPPORT_MODES_DEFAULT; return; }
     if (vl == 0) { is->modes = ISUPPORT_MODES_MAX; return; } /* no limit */

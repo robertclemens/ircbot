@@ -187,6 +187,8 @@ static void request_own_hostmask(bot_state_t *state) {
 }
 
 /* The trailing parameter ("... :text"), or all of params if there is none. */
+
+
 static const char *irc_trailing(const char *params) {
   if (params[0] == ':') return params + 1;
   const char *t = strstr(params, " :");
@@ -294,6 +296,12 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * (pre-resolution / pre-cloak) host that no other client is ever shown.
      * Ask instead, and take the answer only from the 352. */
     request_own_hostmask(state);
+    netcheck_arm(state);
+    state->irc_attempt_ok = true;
+    pool_link_note(state, "up", NULL);
+  } else if (strcmp(command, "376") == 0 || strcmp(command, "422") == 0) {
+    /* End of MOTD (or none): the 005 lines are in, so the network is known. */
+    netcheck_end_of_motd(state);
   } else if (strcmp(command, "433") == 0 || strcmp(command, "432") == 0 ||
              strcmp(command, "437") == 0) {
     /* A NICK was refused: 433 in use, 437 held (nick delay, jupe), 432
@@ -493,6 +501,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
         is_voice = strchr(modes, state->isup.prefix_syms[vp - state->isup.prefix_modes]) != NULL;
     }
 
+    /* An invite waiting on this nick's live mask (invite_check_*). */
+    invite_check_who(state, nick, ident, host);
+
     /* Self-mask capture, ahead of the channel lookup on purpose: the reply to
      * `WHO <nick>` (request_own_hostmask) carries "*" as the channel, so
      * gating this on channel_find would discard the one authoritative,
@@ -541,6 +552,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (!chan_name)
       return;
+    /* end of `WHO <nick>`: a nick no 352 answered for is not on IRC */
+    if (chan_name[0] != '#' && chan_name[0] != '&')
+      invite_check_end(state, chan_name);
 
     chan_t *c = channel_find(state, chan_name);
     if (!c)
@@ -617,28 +631,41 @@ void parser_handle_line(bot_state_t *state, char *line) {
       c->op_request_pending = true;
 
       if (now - state->last_op_request_sent >= OP_REQUEST_MIN_INTERVAL) {
-        // Try hub first - look up UUID for this helper
-        bool sent_via_hub = false;
-        log_message(L_DEBUG, state,
-                    "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
-                    chosen_helper->nick, chosen_helper->hostmask);
-        {
+        /* A 2.5.4 hub: the election picks a bot that can (linked, opped,
+         * +bitch) and answers ok / none / denied (chan_own_*).  An older
+         * hub: the named-helper request, with the same wait for a result. */
+        bool sent_via_hub = chan_own_op_request(state, c);
+        if (sent_via_hub) {
+          log_message(L_DEBUG, state, "[OP-REQ] Asked the hub's election for ops in %s\n",
+                      c->name);
+        } else {
+          log_message(L_DEBUG, state,
+                      "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
+                      chosen_helper->nick, chosen_helper->hostmask);
           /* the trusted entry that matched this helper (auth.c: an exact
            * mask before a wildcard) names the bot to ask */
           char uuid[64];
           if (auth_is_trusted_bot(state, chosen_helper->hostmask, uuid, sizeof(uuid)) &&
-              uuid[0]) {
+              uuid[0] && hub_client_bot_on_hub(state, uuid)) {
             log_message(L_DEBUG, state, "[OP-REQ] Found UUID, trying hub request\n");
             sent_via_hub = hub_client_request_op(state, uuid, c->name);
             log_message(L_DEBUG, state,
                         "[OP-REQ] hub_client_request_op returned: %d\n", sent_via_hub);
+            if (sent_via_hub) {
+              c->own_rid[OWN_REQ_OP][0] = '\0'; /* an older hub: no answer comes */
+              c->own_sent[OWN_REQ_OP] = now;
+            }
           }
         }
 
         // Fallback to PRIVMSG if hub unavailable
         if (!sent_via_hub) {
           log_message(L_DEBUG, state,
-                      "[OP-REQ] Hub unavailable or no UUID match, falling back to PRIVMSG\n");
+                      "[OP-REQ] Hub unavailable, no UUID match or helper on no hub; "
+                      "falling back to PRIVMSG\n");
+          log_message(L_INFO, state, "[B2-FAILBACK] op for %s via %s (%s)\n", c->name,
+                      chosen_helper->nick,
+                      state->hub_authenticated ? "helper on no hub" : "no hub");
           bot_comms_send_to_host(state, chosen_helper->hostmask,
                                  chosen_helper->nick, "OPME %s", c->name);
         }

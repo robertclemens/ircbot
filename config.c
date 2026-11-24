@@ -288,10 +288,21 @@ bool config_load(bot_state_t *state, const char *password,
         snprintf(state->target_nick, MAX_NICK, "%s", data);
         break;
 
-      case 's': // Server (bot-specific)
-        if (state->server_count < MAX_SERVERS) {
-          state->server_list[state->server_count++] = strdup(data);
+      case 's': // Server (bot-specific): the local list (servers_rebuild dials it)
+        if (state->local_server_count < MAX_SERVERS) {
+          char *d = strdup(data);
+          if (d) state->local_servers[state->local_server_count++] = d;
         }
+        break;
+
+      case 'N': /* N|/S|: the hub's server pool, cached (pool.c) */
+      case 'S':
+        if (!pool_ingest_line(state, type, data))
+          log_message(L_INFO, state, "[CFG] Ignoring invalid %c| line\n", type);
+        break;
+
+      case 'P': /* P|1: local s| already offered to the pool */
+        state->pool_migrated = strcmp(data, "1") == 0;
         break;
 
       case 'c': // Channel (global, with timestamp)
@@ -436,7 +447,7 @@ bool config_load(bot_state_t *state, const char *password,
                  * (combined 64-byte Curve25519 pubkey — we take the first 32,
                  * matching hub_public.b64). A line with no pubkey leaves the
                  * hub unpinned: the bot will not link to it until one is set. */
-        if (state->hub_count < MAX_SERVERS) {
+        if (state->hub_count < MAX_HUBS) {
           hub_entry_t *he = &state->hubs[state->hub_count];
           memset(he, 0, sizeof(*he));
           char *bar = strchr(data, '|');
@@ -600,8 +611,13 @@ bool config_load(bot_state_t *state, const char *password,
       !g_config_readonly)
     config_write(state, password);
 
-  // Validation changed
-  if (state->target_nick[0] == '\0' || state->server_count == 0 ||
+  /* The dial list: the pool when hub-managed, else the local s| lines. */
+  servers_rebuild(state);
+
+  /* A hub-managed bot needs no IRC server of its own: it waits for the hub's
+   * pool (server pool plan §5.5a).  A standalone one needs at least one. */
+  if (state->target_nick[0] == '\0' ||
+      (state->local_server_count == 0 && state->hub_count == 0) ||
       state->user[0] == '\0') {
     log_message(L_INFO, state,
                 "[CFG] Config file is missing required fields (Nick, Server, "
@@ -651,8 +667,15 @@ static void config_write_file(const bot_state_t *state, const char *password) {
 
   CFG_WRITE("n|%s\n", state->target_nick);
 
-  for (int i = 0; i < state->server_count; i++)
-    CFG_WRITE("s|%s\n", state->server_list[i]);
+  for (int i = 0; i < state->local_server_count; i++)
+    CFG_WRITE("s|%s\n", state->local_servers[i]);
+  if (state->pool_migrated) CFG_WRITE("P|1\n");
+  {
+    static char pl[POOL_RECORDS_MAX];
+    int pn = pool_format_lines(state, pl, sizeof(pl));
+    if (pn < 0) overflow = true;
+    else if (pn > 0) CFG_WRITE("%s", pl);
+  }
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     /* A channel known only from its C| line (no c| yet) has no record of

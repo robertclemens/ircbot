@@ -110,30 +110,67 @@ static void strip_ident_tilde(const char *in, char *out, size_t out_size) {
   snprintf(out + prefix, out_size - prefix, "%s", bang + 2); // skip '~'
 }
 
-// auth_trusted_bot_by_host: wildcard-match user_host against the stored
-// trusted-bot hostmasks.  Strict on the full mask by design (see
-// ARCHITECTURE.md): the mask a peer publishes is the server-displayed one.
-// trusted_bot_index_by_host returns the matching index or -1, so the
+/* Two full masks are the same identity: nick!ident@host part by part, the
+ * nick and the host ignoring ASCII case, the ident exactly.  Nothing is
+ * wildcarded and no '~' is dropped: a bot is the mask the server shows for
+ * it (2026-11-23: bots match exactly, users by their stored patterns). */
+bool auth_mask_equal(const char *a, const char *b) {
+  if (!a || !b) return false;
+  const char *ab = strchr(a, '!'), *bb = strchr(b, '!');
+  const char *aa = ab ? strchr(ab, '@') : NULL, *ba = bb ? strchr(bb, '@') : NULL;
+  if (!aa || !ba || ab == a || bb == b) return false;
+  size_t an = (size_t)(ab - a), bn = (size_t)(bb - b);
+  size_t ai = (size_t)(aa - ab - 1), bi = (size_t)(ba - bb - 1);
+  if (an != bn || ai != bi || ai == 0 || !aa[1] || !ba[1]) return false;
+  return strncasecmp(a, b, an) == 0 && strncmp(ab + 1, bb + 1, ai) == 0 &&
+         strcasecmp(aa + 1, ba + 1) == 0;
+}
+
+/* Whether a stored trusted-bot mask stands for live mask `live`.  A
+ * hub-configured bot (any h| line, linked now or not) holds the masks the
+ * other bots published: exactly (auth_mask_equal).  A purely standalone bot
+ * holds the masks an admin typed (+bot, config b|): as patterns, like user
+ * masks -- the ~B2 key is what authenticates (2026-11-23). */
+bool auth_bot_mask_ok(const bot_state_t *state, const char *stored, const char *live) {
+  if (auth_mask_equal(stored, live)) return true;
+  return state->hub_count == 0 && auth_wildcard_match(stored, live);
+}
+
+// auth_trusted_bot_by_host: the stored trusted-bot entry for user_host
+// (auth_bot_mask_ok); an entry whose mask IS the host wins over an earlier
+// pattern that also matches it (two bots on one host must not answer for
+// each other).  trusted_bot_index_by_host returns the index or -1, so the
 // const-state callers need no cast.
 static int trusted_bot_index_by_host(const bot_state_t *state,
                                      const char *user_host) {
-  if (state->trusted_bot_count == 0) return -1;
-  char norm_user_host[MAX_MASK_LEN];
-  strip_ident_tilde(user_host, norm_user_host, sizeof(norm_user_host));
-  /* The entry whose mask IS this host wins over an earlier wildcard that also
-   * matches it: the index picks the uuid and key, and two bots on one host
-   * must not answer for each other. */
   int first = -1;
   for (int i = 0; i < state->trusted_bot_count; i++) {
-    char norm_hostmask[MAX_MASK_LEN];
-    strip_ident_tilde(state->trusted_bots[i].mask, norm_hostmask,
-                      sizeof(norm_hostmask));
-    if (strcasecmp(norm_hostmask, norm_user_host) == 0)
-      return i;
-    if (first < 0 && auth_wildcard_match(norm_hostmask, norm_user_host))
-      first = i;
+    if (auth_mask_equal(state->trusted_bots[i].mask, user_host)) return i;
+    if (first < 0 && auth_bot_mask_ok(state, state->trusted_bots[i].mask, user_host)) first = i;
   }
   return first;
+}
+
+/* A person's live mask still stands for that user in chan: an active user
+ * record, one of its own active usermask patterns matches the live mask,
+ * and it may act there (an admin anywhere, an oper only where it is bound --
+ * as user_chan_command). */
+bool auth_user_live_ok(const bot_state_t *state, const char *uuid, const char *nuh,
+                       const char *chan) {
+  if (!state || !uuid || !uuid[0] || !nuh || !nuh[0]) return false;
+  const user_record_t *ur = NULL;
+  for (int j = 0; j < state->user_record_count && !ur; j++)
+    if (state->user_records[j].is_active && strcmp(state->user_records[j].uuid, uuid) == 0)
+      ur = &state->user_records[j];
+  if (!ur) return false;
+  bool mask_ok = false;
+  for (int i = 0; i < state->mask_record_count && !mask_ok; i++) {
+    const mask_record_t *mr = &state->mask_records[i];
+    mask_ok = mr->is_active && mr->mask[0] && strcmp(mr->uuid, uuid) == 0 &&
+              auth_wildcard_match(mr->mask, nuh);
+  }
+  if (!mask_ok) return false;
+  return ur->type == 'a' || (chan && access_user_chan_ok(state, uuid, chan));
 }
 
 trusted_bot_t *auth_trusted_bot_by_host(bot_state_t *state,
@@ -254,8 +291,9 @@ bool auth_mask_overlaps_authorised(const bot_state_t *state, const char *mask,
     who[0] = '\0';
   if (!state || !mask)
     return true; /* fail closed */
-  /* matching drops a leading '~' of the ident (strip_ident_tilde), so the
-   * overlap test does too, on both sides */
+  /* the overlap test drops a leading '~' of the ident on both sides
+   * (strip_ident_tilde), so a ban written with or without it is caught --
+   * protection is taken at its widest */
   char nmask[MAX_MASK_LEN], nother[MAX_MASK_LEN];
   strip_ident_tilde(mask, nmask, sizeof(nmask));
   for (int i = 0; i < state->trusted_bot_count; i++) {

@@ -252,19 +252,6 @@ void irc_server_block_clear(bot_state_t *state, int idx) {
   state->irc_blocked_logged = false;
 }
 
-/* -server: call BEFORE server_list[] is compacted (server_count unchanged). */
-void irc_server_block_remove(bot_state_t *state, int idx) {
-  int n = state->server_count;
-  if (idx < 0 || idx >= n) return;
-  memmove(&state->server_blocks[idx], &state->server_blocks[idx + 1],
-          (size_t)(n - 1 - idx) * sizeof(server_block_t));
-  memset(&state->server_blocks[n - 1], 0, sizeof(server_block_t));
-  if (state->irc_server_idx == idx)
-    state->irc_server_idx = -1; /* a refusal on this link now has no slot */
-  else if (state->irc_server_idx > idx)
-    state->irc_server_idx--;
-}
-
 /* "banned 42m", "throttled 55s", "banned, permanent", or "" if eligible. */
 void irc_server_block_desc(const bot_state_t *state, int idx, char *buf,
                            size_t len) {
@@ -274,6 +261,10 @@ void irc_server_block_desc(const bot_state_t *state, int idx, char *buf,
   const server_block_t *b = &state->server_blocks[idx];
   if (b->kind == SB_BANNED_PERM) {
     snprintf(buf, len, "banned, permanent");
+    return;
+  }
+  if (b->kind == SB_WRONG_NET && b->until > time(NULL)) {
+    snprintf(buf, len, "wrong network: %.40s", b->reason);
     return;
   }
   time_t now = time(NULL);
@@ -293,6 +284,15 @@ static int irc_pick_server(bot_state_t *state, time_t now) {
   if (start < 0 || start >= n) start = 0;
 
   time_t soonest = 0;
+  if (state->hub_count > 0 && !pool_local_fallback(state)) {
+    /* Hub-managed: by load on the pool's entries (plan §5.3). */
+    int pick = pool_pick_slot(state, now, &soonest);
+    if (pick >= 0) {
+      state->irc_blocked_logged = false;
+      return pick;
+    }
+    n = 0; /* every slot held: the report below */
+  }
   for (int k = 0; k < n; k++) {
     int i = (start + k) % n;
     const server_block_t *b = &state->server_blocks[i];
@@ -368,6 +368,8 @@ void irc_disconnect(bot_state_t *state) {
   state->is_ssl = false;
   sendq_clear(state);
   isupport_reset(state);
+  state->net_check = 0; /* the next link is checked afresh */
+  pool_link_note(state, "down", NULL);
   channel_list_reset_status(state);
 }
 
@@ -636,25 +638,89 @@ static void dial_next(bot_state_t *state) {
 void irc_connect(bot_state_t *state) {
   if (state->server_fd != -1 || g_dial.fd >= 0) return;
   time_t attempt_now = time(NULL);
-  int pick = irc_pick_server(state, attempt_now);
-  if (pick < 0) return; /* everything held; irc_pick_server logged why */
-  state->current_server_index = pick;
+  /* 'jump <host>' to a host outside a hub-managed bot's pool: once, no slot. */
+  bool once = state->jump_once[0] != '\0';
+  int jumped = state->jump_slot1 - 1; /* 'jump <server>': that slot, once */
+  state->jump_slot1 = 0;
+  if (jumped >= state->server_count) jumped = -1;
+  /* The last attempt never registered (refused, unreachable, dropped before
+   * 001): the load-based pick passes over that slot for POOL_FAIL_AVOID. */
+  if (!state->irc_attempt_ok && state->irc_server_idx >= 0 &&
+      state->irc_server_idx < state->server_count && state->last_irc_attempt &&
+      state->server_blocks[state->irc_server_idx].last_fail < state->last_irc_attempt)
+    state->server_blocks[state->irc_server_idx].last_fail = attempt_now;
+  /* Hub-managed: a random 0..5 s before each dial, so bots that dropped
+   * together do not all land on the server that was least loaded a moment
+   * ago (plan §5.3). */
+  /* Just started: the cached pool is there before the hub link, but the load
+   * on it is not.  Wait a little for the first view, so a restart does not
+   * pick blind -- but only while a hub link is coming up or up: a bot whose
+   * hub dial failed dials IRC at once (a mass restart with the hubs down must
+   * not take every bot off IRC together, test_80 restart storm). */
+  if (state->hub_count > 0 && !once && jumped < 0 && state->server_count > 0 &&
+      !state->pool_view_at && attempt_now - state->bot_start_time < POOL_VIEW_WAIT &&
+      (state->hub_connecting || state->hub_connected))
+    return;
+  if (state->hub_count > 0 && !once && jumped < 0 && state->server_count > 0) {
+    if (!state->pool_dial_at) {
+      state->pool_dial_at = attempt_now + (time_t)(rand() % POOL_DIAL_JITTER);
+      if (state->pool_dial_at > attempt_now) return;
+    } else if (attempt_now < state->pool_dial_at) {
+      return;
+    }
+    state->pool_dial_at = 0;
+  }
+  int pick = once ? -1 : jumped >= 0 ? jumped : irc_pick_server(state, attempt_now);
+  if (pick < 0 && !once) {
+    /* Hub-managed with nothing to dial (server pool plan §5.6): stay linked
+     * to the hub and wait; servers_rebuild logged the start, this repeats it
+     * hourly. */
+    if (state->hub_count > 0 && state->server_count == 0 &&
+        attempt_now - state->pool_idle_warned >= POOL_IDLE_WARN_EVERY) {
+      state->pool_idle_warned = attempt_now;
+      log_message(L_INFO, state,
+                  state->pool_known
+                      ? "[POOL] Network %s: no usable server, waiting for one\n"
+                      : "[POOL] Waiting for the hub's server pool before connecting to IRC\n",
+                  POOL_DEFAULT_NET);
+    }
+    return; /* everything held; irc_pick_server logged why */
+  }
+  state->irc_attempt_ok = false; /* set again by 001 */
+  if (!once) state->current_server_index = pick;
   state->irc_server_idx = pick;
+  /* Counted as on this entry before the dial, so other bots picking now see
+   * it (plan §5.3). */
+  pool_link_note(state, "connecting", pick >= 0 ? state->dial_uuid[pick] : "");
   state->last_irc_attempt = attempt_now;
   state->irc_refusal[0] = '\0';
   state->irc_refusal_ban = false;
   state->nick_refused[0] = '\0'; /* another server may take the target nick */
 
-  char server_str[256];
+  char server_str[POOL_HOST_MAX + 16];
   snprintf(server_str, sizeof(server_str), "%s",
-           state->server_list[state->current_server_index]);
+           once ? state->jump_once : state->server_list[state->current_server_index]);
+  state->jump_once[0] = '\0';
 
-  char *port_from_config = strrchr(server_str, ':');
+  /* host[:port], or [v6] / [v6]:port: a bracketed literal's own ':'s are not
+   * the port separator, and getaddrinfo wants it without the brackets. */
   char *host = server_str;
-  if (port_from_config) {
-    *port_from_config = '\0';
-    port_from_config++;
+  char *port_from_config = NULL;
+  if (server_str[0] == '[') {
+    char *rb = strchr(server_str, ']');
+    if (rb) {
+      if (rb[1] == ':') port_from_config = rb + 2;
+      *rb = '\0';
+      host = server_str + 1;
+    }
+  } else {
+    port_from_config = strrchr(server_str, ':');
+    if (port_from_config) {
+      *port_from_config = '\0';
+      port_from_config++;
+    }
   }
+  if (port_from_config && !*port_from_config) port_from_config = NULL;
 
   // If port specified: only try that port. Otherwise try 6667, then 6697
   memset(g_dial.ports, 0, sizeof(g_dial.ports));
@@ -665,7 +731,11 @@ void irc_connect(bot_state_t *state) {
     g_dial.ports[0] = "6667";
     g_dial.ports[1] = "6697";
   }
-  snprintf(g_dial.host, sizeof(g_dial.host), "%s", host);
+  if (strlen(host) >= sizeof(g_dial.host)) { /* > POOL_HOST_MAX: never from a valid entry */
+    log_message(L_INFO, state, "[WARN] Server name too long; skipped.\n");
+    return;
+  }
+  memcpy(g_dial.host, host, strlen(host) + 1);
 
   g_dial.vhost_family = AF_UNSPEC;
   memset(&g_dial.vhost, 0, sizeof(g_dial.vhost));
@@ -689,7 +759,7 @@ void irc_connect(bot_state_t *state) {
   g_dial.port_idx = -1;
   g_dial.res = g_dial.ai = NULL;
   dial_next(state);
-  state->current_server_index++;
+  if (!once) state->current_server_index++;
 }
 
 /* Review 9: the CA certificates the server's chain is checked against:
@@ -994,6 +1064,8 @@ void irc_check_status(bot_state_t *state) {
     return;
   }
   if (state->status & S_AUTHED) {
+    netcheck_tick(state);
+    if (!(state->status & S_CONNECTED)) return; /* the check dropped this link */
     channel_manager_check_joins(state);
     
     if (!state->nick_change_pending) {

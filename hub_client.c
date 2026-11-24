@@ -365,6 +365,9 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_connected = false;
   state->hub_authenticated = false;
   state->hub_connecting = false;
+  state->pool_hub_seen = false; /* the next hub proves it keeps a pool afresh */
+  state->irc_link_sent[0] = '\0'; /* ...and gets the IRC link state again */
+  state->pool_view_at = 0;
   state->hub_connect_time = 0;
   auth_state = HUB_AUTH_NONE;
   hub_rx_reset();
@@ -1150,6 +1153,16 @@ static void hub_client_check_config_hash(bot_state_t *state, const char *hex) {
 
 static void hub_client_process_config_data(bot_state_t *state, const char *payload);
 
+bool hub_client_send_irc_link(bot_state_t *state, const char *payload) {
+  if (!state->hub_authenticated || !state->pool_hub_seen) return false;
+  return hub_send_frame(state, CMD_BOT_IRC_LINK, payload, (int)strlen(payload));
+}
+
+bool hub_client_send_server_report(bot_state_t *state, const char *payload) {
+  if (!state->hub_authenticated || !state->pool_hub_seen) return false;
+  return hub_send_frame(state, CMD_SERVER_REPORT, payload, (int)strlen(payload));
+}
+
 /* Ingest a CMD_CONFIG_DELTA: rebuild the full text, check it, apply it. */
 static void hub_client_process_config_delta(bot_state_t *state, const char *payload, int plen) {
   char base_hex[CFGD_HASH_HEX], new_hex[CFGD_HASH_HEX], mine[CFGD_HASH_HEX + 1];
@@ -1356,7 +1369,7 @@ static int hub_client_hublist_line(const bot_state_t *state, char *out, size_t c
   if (w < 0 || (size_t)w >= cap) return 0;
   size_t o = (size_t)w;
   int n = 0;
-  for (int i = 0; i < state->hub_count && i < MAX_SERVERS; i++) {
+  for (int i = 0; i < state->hub_count && i < MAX_HUBS; i++) {
     const hub_entry_t *he = &state->hubs[i];
     if (!he->ed_pub_set) continue;
     unsigned char md[EVP_MAX_MD_SIZE];
@@ -1531,6 +1544,21 @@ void hub_client_grant_held_ops(bot_state_t *state, chan_t *c) {
  * Send an op request via hub to another bot
  * Returns true if request was sent via hub, false to fallback to PRIVMSG
  */
+/* Whether a frame for bot `uuid` can travel through the hub mesh: the bot
+ * tree the hubs sent us shows that bot linked under a hub.  A bot shown
+ * disconnected, or missing, cannot be reached that way (every hub drops an
+ * OP_REQUEST or a relayed ~B2 for it as "not found locally"), so the caller
+ * goes over IRC instead.  No tree yet: assume the hub can. */
+bool hub_client_bot_on_hub(const bot_state_t *state, const char *uuid) {
+  if (!uuid || !uuid[0]) return false;
+  if (state->bot_tree_count == 0) return true;
+  for (int i = 0; i < state->bot_tree_count; i++) {
+    const bot_tree_row_t *r = &state->bot_tree[i];
+    if (strcmp(r->uuid, uuid) == 0) return r->kind == 'b';
+  }
+  return false;
+}
+
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel) {
   if (!state->hub_connected || !state->hub_authenticated ||
@@ -1577,14 +1605,28 @@ bool hub_client_relay_bot_command(bot_state_t *state, const char *target_uuid,
 /* Ask the mesh to let us into a channel.  Only `kind|channel` goes on the
  * wire: the hub resolves our nick and hostmask from its own records, so this
  * frame cannot be used to ask for someone else's mask to be unbanned. */
+/* A request id the hub hands back in CMD_USER_CHAN_RESULT: 8 random bytes as
+ * 16 hex ([A-Za-z0-9-], USER_CHAN_RID_MAX).  Not a secret: the hub answers
+ * only on the link the request came in on. */
+bool hub_client_new_rid(char *out, size_t cap) {
+  unsigned char rnd[8];
+  if (cap < 2 * sizeof(rnd) + 1 || RAND_bytes(rnd, sizeof(rnd)) != 1) return false;
+  for (size_t i = 0; i < sizeof(rnd); i++) snprintf(out + 2 * i, 3, "%02x", rnd[i]);
+  return true;
+}
+
+/* rid: "" = `kind|channel` (an older hub: it reads the channel with %s, so a
+ * third field would become part of it); else `kind|channel|rid`, answered. */
 bool hub_client_send_chan_request(bot_state_t *state, const char *kind,
-                                  const char *channel) {
+                                  const char *channel, const char *rid) {
   if (!state->hub_connected || !state->hub_authenticated ||
       state->hub_fd == -1)
     return false;
 
-  char payload[MAX_CHAN + 16];
-  int pay_len = snprintf(payload, sizeof(payload), "%s|%s", kind, channel);
+  char payload[MAX_CHAN + 16 + USER_CHAN_RID_MAX + 2];
+  int pay_len = rid && rid[0]
+                    ? snprintf(payload, sizeof(payload), "%s|%s|%s", kind, channel, rid)
+                    : snprintf(payload, sizeof(payload), "%s|%s", kind, channel);
   if (pay_len <= 0 || pay_len >= (int)sizeof(payload))
     return false;
   if (!hub_send_frame(state, CMD_CHAN_REQUEST, payload, pay_len))
@@ -2019,9 +2061,10 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
    * When such lines ARE present the "replace to drop stale UUIDs" semantics
    * still hold, because parsing rebuilds the whole set. */
   bool has_user_lines = false, has_mask_lines = false, has_trust_set = false;
-  bool has_access_lines = false;
+  bool has_access_lines = false, has_pool_lines = false;
   for (const char *p = payload; p && *p; ) {
     if ((p[0] == 'a' || p[0] == 'o') && p[1] == '|') has_user_lines = true;
+    else if ((p[0] == 'N' || p[0] == 'S') && p[1] == '|') has_pool_lines = true;
     else if (p[0] == 'm' && p[1] == '|') has_mask_lines = true;
     else if (p[0] == 'u' && (p[1] == 'f' || p[1] == 'c') && p[2] == '|') has_access_lines = true;
     else if (p[0] == 'T' && p[1] == '|') has_trust_set = true;
@@ -2045,6 +2088,14 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   memcpy(saved_uchans, state->uchan_records, sizeof(uchan_record_t) * (size_t)saved_uchan_count);
   if (has_user_lines) state->user_record_count = 0;
   if (has_mask_lines) state->mask_record_count = 0;
+  /* N|/S|: the hub sends its whole pool (a 2.5.4 hub always sends an N|), so
+   * it replaces ours; the old text tells whether anything changed. */
+  static char pool_before[POOL_RECORDS_MAX], pool_after[POOL_RECORDS_MAX];
+  int pool_before_n = 0;
+  if (has_pool_lines) {
+    pool_before_n = pool_format_lines(state, pool_before, sizeof(pool_before));
+    pool_clear(state);
+  }
   /* uf| / uc| (user_flags plan): the hub's set replaces ours like a|/o|/m|. */
   if (has_access_lines) {
     state->uflag_record_count = 0;
@@ -2413,6 +2464,13 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
     case 'T': // T|<count>: end of the hub's complete trusted-bot list (swept below)
       break;
 
+    case 'N': /* N|/S|: the server pool (pool.c) */
+    case 'S':
+      if (type == 'N') state->pool_hub_seen = true;
+      if (!pool_ingest_line(state, type, data))
+        log_message(L_DEBUG, state, "[HUB-SYNC] Malformed %c| record ignored\n", type);
+      break;
+
     default:
       log_message(L_DEBUG, state, "[HUB-SYNC] Unrecognized line type '%c': %s\n", type, line);
       break;
@@ -2474,6 +2532,14 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   updates += mask_table_changes(state, saved_masks, saved_mask_count);
   updates += access_table_changes(state, saved_uflags, saved_uflag_count,
                                   saved_uchans, saved_uchan_count);
+  if (has_pool_lines) {
+    int pool_after_n = pool_format_lines(state, pool_after, sizeof(pool_after));
+    if (pool_after_n != pool_before_n ||
+        (pool_after_n > 0 && memcmp(pool_before, pool_after, (size_t)pool_after_n) != 0)) {
+      updates++;
+      pool_changed(state);
+    }
+  }
 
   if (updates > 0) {
     log_message(L_INFO, state, "[HUB] Applied %d config updates from hub\n",
@@ -2484,6 +2550,10 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   } else {
     log_message(L_DEBUG, state, "[HUB-SYNC] No updates applied (all timestamps older or equal)\n");
   }
+  /* The hub keeps a pool now: offer the local s| lines once (P|1), and tell
+   * it where the IRC link stands. */
+  pool_after_hub_config(state);
+  pool_link_resend(state);
   /* static: the config it held (keys, hashes) would outlive the call */
   secure_wipe(work_buf, work_len + 1);
 }
@@ -2519,8 +2589,7 @@ static bool chan_do_nick_ok(const char *n) {
   return true;
 }
 
-static void chan_done_send(bot_state_t *state, const char *id, bool ok,
-                           const char *detail) {
+void chan_done_send(bot_state_t *state, const char *id, bool ok, const char *detail) {
   char out[192];
   int n = snprintf(out, sizeof(out), "%s|%s|%s", id, ok ? "ok" : "fail", detail);
   if (n > 0 && n < (int)sizeof(out)) hub_send_frame(state, CMD_CHAN_DONE, out, n);
@@ -2626,10 +2695,39 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
     return;
   }
   if (strcmp(kind, "op") == 0) {
+    chan_t *bc = channel_find(state, chan);
+    /* A bot's own op (the requester is a trusted bot): op the nick only when
+     * its hostmask here is that same bot -- never a nick someone else holds. */
+    if (auth_trusted_bot_by_uuid(state, req)) {
+      const char *hm = NULL;
+      for (int i = 0; bc && i < bc->roster_count; i++)
+        if (strcasecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
+      char who[64] = "";
+      if (!hm || !auth_is_trusted_bot(state, hm, who, sizeof(who)) || strcmp(who, req) != 0) {
+        log_message(L_INFO, state, "[CHANREQ] Not opping %s in %s: not the requesting bot here\n",
+                    nick, chan);
+        chan_done_send(state, id, false, "not the requesting bot");
+        return;
+      }
+    }
+    /* A person's op (the requester is a user): the nick's mask here must be
+     * the one the requesting bot validated, and still one of that user's
+     * patterns with rights in the channel.  An admin's console op is the
+     * admin's own word ("ADMIN"). */
+    if (!auth_trusted_bot_by_uuid(state, req) && strcmp(req, "ADMIN") != 0) {
+      const char *hm = NULL;
+      for (int i = 0; bc && i < bc->roster_count; i++)
+        if (strcasecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
+      if (!mask[0] || !hm || !auth_mask_equal(hm, mask) || !auth_user_live_ok(state, req, hm, chan)) {
+        log_message(L_INFO, state, "[CHANREQ] Not opping %s in %s: not the requester here\n",
+                    nick, chan);
+        chan_done_send(state, id, false, "not the requester");
+        return;
+      }
+    }
     /* +bitch (D12): only an authorised member may hold ops.  The hub knows
      * the users but not the nick's hostmask -- this bot does.  A nick we
      * cannot find is not vouched for either (fail closed). */
-    chan_t *bc = channel_find(state, chan);
     if (bc && chancfg_get(state, bc, CS_BITCH)) {
       bool found = false;
       bool auth = chan_member_authorised(state, bc, nick, &found);
@@ -2656,6 +2754,20 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
     chan_done_send(state, id, false, "no hostmask to match");
     return;
   }
+  /* An invite goes to the nick only once `WHO <nick>` shows the requester's
+   * mask on it: a bot's published mask, or the person's validated one (and
+   * still that user's).  DONE follows the check (invite_check_*).  An
+   * admin's console invite is the admin's own word. */
+  if (k == CHAN_REQ_INVITE && strcmp(req, "ADMIN") != 0) {
+    trusted_bot_t *tb = auth_trusted_bot_by_uuid(state, req);
+    const char *want = tb ? tb->mask : mask;
+    if (!want[0]) {
+      chan_done_send(state, id, false, "no hostmask to check");
+      return;
+    }
+    invite_check_start(state, id, chan, nick, want, tb ? "" : req);
+    return;
+  }
   chan_access_service(state, id, k, chan, req, nick, mask, NULL);
   chan_done_send(state, id, true,
                  k == CHAN_REQ_INVITE  ? "INVITE sent"
@@ -2672,10 +2784,8 @@ bool hub_client_send_user_chan_request(bot_state_t *state, const char *kind, con
                                        const char *mask) {
   if (!state->hub_connected || !state->hub_authenticated || state->hub_fd == -1)
     return false;
-  unsigned char rnd[8];
-  if (RAND_bytes(rnd, sizeof(rnd)) != 1) return false;
   char rid[USER_CHAN_RID_MAX + 1];
-  for (size_t i = 0; i < sizeof(rnd); i++) snprintf(rid + 2 * i, 3, "%02x", rnd[i]);
+  if (!hub_client_new_rid(rid, sizeof(rid))) return false;
   char payload[MAX_BUFFER];
   int n = snprintf(payload, sizeof(payload), "%s|%s|%s|%s|%s|%s", rid, kind, chan, user_uuid,
                    nick, mask);
@@ -2690,6 +2800,7 @@ bool hub_client_send_user_chan_request(bot_state_t *state, const char *kind, con
   if (!hub_send_frame(state, CMD_USER_CHAN_REQUEST, payload, n)) return false;
   memset(slot, 0, sizeof(*slot));
   snprintf(slot->rid, sizeof(slot->rid), "%s", rid);
+  snprintf(slot->uuid, sizeof(slot->uuid), "%s", user_uuid);
   snprintf(slot->kind, sizeof(slot->kind), "%s", kind);
   snprintf(slot->chan, sizeof(slot->chan), "%s", chan);
   snprintf(slot->nick, sizeof(slot->nick), "%s", nick);
@@ -2719,6 +2830,8 @@ static void user_chan_result(bot_state_t *state, const char *payload) {
     memset(p, 0, sizeof(*p));
     return;
   }
+  /* not a person's: maybe one of our own (op / invite / key / unban) */
+  chan_own_result(state, rid, status, detail);
 }
 
 /* Requests the hub never answered (the link dropped, or the elected bot
@@ -2730,7 +2843,7 @@ void hub_client_user_chan_tick(bot_state_t *state) {
     if (!p->rid[0] || now - p->sent < USER_CHAN_REPLY_WAIT) continue;
     log_message(L_INFO, state, "[CHANREQ] No answer from the hub for %s %s on %s; asking "
                                "the bots directly\n", p->kind, p->nick, p->chan);
-    bot_comms_user_chan_fallback(state, p->kind, p->chan, p->nick, p->mask);
+    bot_comms_user_chan_fallback(state, p->kind, p->chan, p->nick, p->mask, p->uuid);
     memset(p, 0, sizeof(*p));
   }
 }
@@ -2775,6 +2888,10 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
 
   case CMD_CONFIG_PULL:
     log_message(L_INFO, state, "[HUB] Hub requested config sync\n");
+    break;
+
+  case CMD_POOL_VIEW:
+    if (payload && payload_len > 0) pool_view_apply(state, payload, payload_len);
     break;
 
   case CMD_CONFIG_DATA:
@@ -2883,6 +3000,9 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         c->op_request_pending = false;
         c->last_op_request_time = time(NULL) - 30;
       }
+      /* the old path (an older hub) said no: ask over IRC now */
+      if (c->own_sent[OWN_REQ_OP] && !c->own_rid[OWN_REQ_OP][0])
+        chan_own_failback(state, c, OWN_REQ_OP, "the hub's op request failed");
     }
     break;
 

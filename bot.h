@@ -16,6 +16,8 @@
 #include <sys/socket.h>
 #include <time.h>
 
+#include "pool_rec.h"   /* N| / S| server pool records (shared with irchub) */
+
 /* A non-blocking call with nothing to do.  POSIX lets EAGAIN and EWOULDBLOCK
  * differ; where they are one value (Linux) testing both trips -Wlogical-op. */
 #if EAGAIN == EWOULDBLOCK
@@ -202,15 +204,32 @@ static inline bool fd_isset(int fd, const fd_set *set) {
 #define IRC_BAN_GRACE 30              // Added to a stated ban length (clock skew)
 
 // Limits
-#define MAX_SERVERS 10 // Max number of servers to store
+/* Server pool (irchub docs/plans/2026-10-29_server_pool_plan.md, 2.5.4).
+ * Mirrors irchub/hub.h: one N| per network, live S| entries and their
+ * tombstones, as the hub sends them (the whole set, replaced wholesale). */
+#define MAX_NETWORKS        4
+#define MAX_POOL_SERVERS    64
+#define MAX_POOL_TOMBS      64
+#define POOL_RECORDS_MAX \
+  ( MAX_NETWORKS * POOL_N_LINE_MAX + \
+    (MAX_POOL_SERVERS + MAX_POOL_TOMBS) * POOL_S_LINE_MAX )
+#define POOL_IDLE_WARN_EVERY 3600 /* s between "no usable server" warnings */
+
+/* IRC servers a bot holds: its local s| list (standalone) and its dial list
+ * (the hub pool when hub-managed).  = MAX_POOL_SERVERS (server pool plan D16:
+ * the largest public networks run a few dozen client servers). */
+#define MAX_SERVERS 64
+/* Hubs a bot links to (hubs[], the hl| list).  Was MAX_SERVERS before 2.5.4;
+ * kept at 10 so the hl| value the hubs validate (HL_ENTRIES_MAX) is unchanged. */
+#define MAX_HUBS 10
 #define MAX_USER_RECORDS 40   // max combined admin + oper records
 #define MAX_USER_MASKS   200  // max total usermask records across all users
 /* Admin flags and oper channel bindings (irchub docs/plans/
  * 2026-10-16_user_flags_plan.md §3.1), mirrored from irchub/hub.h: the
  * letters in canonical order (a full, b bots, c channels, h hub, o opers,
  * u upgrades), one uf| per user, uc| live + tombstones, the migration stamp. */
-#define USER_FLAG_LETTERS   "abchou"
-#define USER_FLAGS_MAX      6
+#define USER_FLAG_LETTERS   "abchosu"  /* s: server pool (2.5.4) */
+#define USER_FLAGS_MAX      7
 #define MAX_USER_FLAGS      MAX_USER_RECORDS
 #define MAX_CHAN_BINDS      400
 #define USER_ACCESS_MIGRATE_TS 1
@@ -249,8 +268,8 @@ static inline bool fd_isset(int fd, const fd_set *set) {
  * hub console's hub del preview.  Mirrors irchub's hub.h. */
 #define HL_ADDR_MAX         80
 #define HL_FP_LEN           16    /* hex of SHA-256(hub Ed25519 key)[0..8] */
-#define HL_VALUE_MAX        (MAX_SERVERS * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1))
-#define CFG_BOT_SYNC_FIELDS 8
+#define HL_VALUE_MAX        (MAX_HUBS * (HL_ADDR_MAX + 1 + HL_FP_LEN + 1))
+#define CFG_BOT_SYNC_FIELDS 9   /* hub.h BOT_SYNC_FIELDS: {t,n,h,pub,seen,d,hl,pm} + slack */
 #define CFG_PAYLOAD_SLACK   8192
 /* modes.md §2: C| (per channel), D| (one) and B| (bans) lines.  The ceiling
  * stays derived from these macros, so the C| / D| / B| ingest caps below are
@@ -280,6 +299,7 @@ static inline bool fd_isset(int fd, const fd_set *set) {
     MAX_CHAN_BINDS      * CFG_UC_LINE_MAX     + \
     CFG_BOT_SYNC_FIELDS * CFG_BOT_FIELD_LINE  + \
     MAX_TRUSTED_BOTS    * CFG_BLINE_MAX       + \
+    POOL_RECORDS_MAX                          + \
     CFG_PAYLOAD_SLACK )
 /* Largest inbound hub frame = envelope(5) + payload + GCM tag, plus margin. */
 #define MAX_HUB_FRAME (MAX_CONFIG_PAYLOAD + 64)
@@ -516,6 +536,23 @@ typedef struct { uint64_t nonce; time_t ts; } nonce_entry_t;
  *              Free text (setter, topic, key) is the rest of its own line.
  *              The body is split anywhere into chunks; the hub joins them. */
 #define CMD_CHAN_WHO       0x95
+/* Server pool (2.5.4).  Bot -> hub, only to a hub that sent this link an N|
+ * (pool_hub_seen): what the NETWORK= check found on a pool entry.
+ *   <entry_uuid>|<kind>|<network>|<server>   kind ok / wrongnet / unverified
+ * Mirrors irchub/hub.h. */
+#define CMD_SERVER_REPORT  0x86
+/* Bot -> hub, volatile, gated like CMD_SERVER_REPORT: the IRC link's state.
+ *   <net_id>|<entry_uuid or ->|<connecting|up|down|idle>|<vs>
+ * vs (servers the bot sees friends on, split detection) is empty until 2.5.5.
+ * Mirrors irchub/hub.h. */
+#define CMD_BOT_IRC_LINK   0x96
+/* Hub -> bot: the load on each pool entry, E|<entry_uuid>|<up>|<connecting>
+ * per line, whole each time (pool.c pool_view_apply).  Mirrors irchub/hub.h. */
+#define CMD_POOL_VIEW      0x85
+#define POOL_DIAL_JITTER   6     /* dials wait 0..POOL_DIAL_JITTER-1 s (herding) */
+#define POOL_VIEW_WAIT     5     /* s after start a hub-managed bot waits for its first
+                                  * CMD_POOL_VIEW before dialing (else it picks blind) --
+                                  * only while a hub link is coming up or up */
 #define CHAN_WHO_CHUNK     8192 /* body bytes per CHAN_WHO frame            */
 #define CHAN_TOPIC_MAX     512  /* a topic is kept to this (IRC caps ~390)  */
 
@@ -616,6 +653,14 @@ typedef enum {
   CHAN_REQ_KEY,
   CHAN_REQ_KIND_COUNT
 } chan_req_kind_t;
+/* A request of our own the hub answers (CMD_USER_CHAN_RESULT ok / none /
+ * denied, irchub docs/plans/2026-11-23_bot_chan_request_election_plan.md):
+ * one slot per chan_req_kind_t plus op.  No answer in the wait (an older hub
+ * never answers) -> the next ask goes over IRC (~B2); never after denied. */
+#define OWN_REQ_OP        CHAN_REQ_KIND_COUNT
+#define OWN_REQ_SLOTS     (CHAN_REQ_KIND_COUNT + 1)
+#define OWN_REQ_WAIT_OP   15   /* s: op */
+#define OWN_REQ_WAIT_CHAN 45   /* s: invite / key / unban (CHAN_ELECT_TTL 40 + margin) */
 
 #define CHAN_REQUEST_MIN_INTERVAL 5  // Seconds between any two requests we send
 #define CHAN_REQUEST_RETRY_TIME  60  // Before re-asking for the same chan+kind
@@ -724,8 +769,26 @@ typedef struct {
   char   chan[MAX_CHAN];
   char   nick[MAX_MEMBER_NICK];
   char   mask[MAX_MASK_LEN];
+  char   uuid[37];            /* the user the request is for (~B2 failback) */
   time_t sent;
 } user_chan_pending_t;
+
+/* An invite that waits for `WHO <nick>`: the nick is invited only when the
+ * mask the server shows for it now is the one the request was for (a bot:
+ * its published mask, equal; a person: the validated mask, equal, and still
+ * one of that user's patterns).  id "" = a ~B2 invite (no DONE to send). */
+#define INVITE_CHECKS     8
+#define INVITE_CHECK_WAIT 10  /* s for the WHO answer */
+typedef struct {
+  bool   active;
+  char   id[64];
+  char   chan[MAX_CHAN];
+  char   nick[MAX_MEMBER_NICK];
+  char   mask[MAX_MASK_LEN];
+  char   user[37];            /* person's uuid, "" for a bot */
+  bool   seen;
+  time_t sent;
+} invite_check_t;
 
 /* Admin flags, uf|<user_uuid>|<flags>|<ts> (irchub hub_uflag_record_t). */
 typedef struct {
@@ -880,6 +943,7 @@ typedef struct {
   char prefix_syms[9];         /*                    "@%+" */
   int  nicklen;                /* NICKLEN=, default 30 */
   char cm_a[64], cm_b[64], cm_c[64], cm_d[64]; /* CHANMODES=A,B,C,D */
+  char network[POOL_NET_NAME_MAX + 1];         /* NETWORK=, "" = none sent */
 } isupport_t;
 
 /* Output send queue (sendq.c): three lanes, drained by pacing. */
@@ -1014,6 +1078,10 @@ struct chan_t {
    * both banned from and that is +i is chased on both counts independently. */
   time_t last_access_request[CHAN_REQ_KIND_COUNT];
   int access_retry_count[CHAN_REQ_KIND_COUNT];
+  /* Our own requests in flight (OWN_REQ_*): the rid the hub answers ("" on an
+   * older hub, which never does) and when it went; own_sent 0 = none. */
+  char own_rid[OWN_REQ_SLOTS][USER_CHAN_RID_MAX + 1];
+  time_t own_sent[OWN_REQ_SLOTS];
   /* C| record (modes.md §2): the stored modes string, the raw settings field
    * (unknown names kept verbatim) and its parse.  Written only by the
    * console; cfg_ts 0 = never seen. */
@@ -1181,19 +1249,33 @@ typedef enum {
   SB_THROTTLED,   /* "reconnecting too fast" / connection limits */
   SB_BANNED,      /* banned, no length stated: escalating backoff */
   SB_BANNED_TEMP, /* banned for a length the server stated */
-  SB_BANNED_PERM  /* server said permanent: never retried automatically */
+  SB_BANNED_PERM, /* server said permanent: never retried automatically */
+  SB_WRONG_NET    /* its NETWORK= is not this network's (pool.c netcheck) */
 } server_block_kind_t;
+#define NETCHECK_WAIT       30    /* s after 001 to decide without 376/422 */
+#define WRONGNET_HOLD       3600  /* s a wrong-network server is skipped    */
 
 #define IRC_REFUSAL_LEN 256 /* stored server refusal text, sanitized */
 
+/* One S| record as held by the bot (pool.c). */
+typedef struct {
+  pool_srv_t s;
+  time_t ts;
+  int load_up, load_conn;  /* CMD_POOL_VIEW, runtime */
+} pool_entry_t;
+
 /* Per-server hold, parallel to server_list[].  Runtime only (not in the
- * config): a restart, +server/-server, or 'jump <server>' clears it. */
+ * config): a restart, +server/-server, or 'jump <server>' clears it.  A
+ * rebuild of the dial list (servers_rebuild) keeps each server's hold. */
 typedef struct {
   server_block_kind_t kind;
   time_t until;                 /* not retried before this (0 for PERM) */
   int strikes;                  /* consecutive refusals since the last 001 */
   char reason[IRC_REFUSAL_LEN]; /* what the server said, sanitized */
+  time_t last_fail;             /* last attempt here that never reached 001 */
 } server_block_t;
+#define POOL_FAIL_AVOID     120   /* s a slot that failed is passed over     */
+#define POOL_PUSH_CHUNK     8192  /* S| push frames split at line boundaries */
 
 struct bot_state {
   int server_fd;
@@ -1205,7 +1287,37 @@ struct bot_state {
   char user[64];
   char gecos[128];
   char vhost[128];
+  /* The dial list irc_connect picks from (runtime, servers_rebuild): the
+   * pool's usable entries when hub-managed (hub_count > 0), else the local
+   * s| list.  dial_uuid[i] names the pool entry of slot i ("" = local). */
   char *server_list[MAX_SERVERS + 1];
+  char dial_uuid[MAX_SERVERS][POOL_UUID_LEN + 1];
+  /* The local s| lines (.cnf).  Dialed only while standalone; dormant while
+   * hub-managed (plan §5.1). */
+  char *local_servers[MAX_SERVERS + 1];
+  int local_server_count;
+  /* The hub's server pool, cached in the .cnf (N|/S| lines). */
+  pool_entry_t pool[MAX_POOL_SERVERS + MAX_POOL_TOMBS];
+  int pool_count;
+  pool_net_t pool_net;          /* POOL_DEFAULT_NET's N| record           */
+  time_t pool_net_ts;
+  bool pool_known;              /* an N| has arrived: the hub keeps a pool */
+  bool pool_migrated;           /* P|1: local s| sent to the pool once    */
+  bool pool_idle;               /* hub-managed with nothing to dial       */
+  bool pool_using_local;   /* dialing local s| until the first S| (pool_local_fallback) */
+  bool pool_hub_seen;           /* this hub link sent an N|: it is >= 2.5.4
+                                 * and takes S| pushes and 0x86 / 0x96      */
+  int net_check;                /* 0 none, 1 pending, 2 passed (this link) */
+  char irc_link[12];            /* connecting / up / down / idle           */
+  char irc_link_entry[POOL_UUID_LEN + 1];
+  char irc_link_sent[96];       /* last CMD_BOT_IRC_LINK to this hub link  */
+  time_t pool_view_at;          /* last CMD_POOL_VIEW, 0 = none this link  */
+  time_t pool_dial_at;          /* jittered dial time, 0 = not drawn yet    */
+  bool irc_attempt_ok;          /* the current/last attempt reached 001     */
+  time_t net_check_deadline;
+  time_t pool_idle_warned;
+  char jump_once[POOL_HOST_MAX + 8]; /* 'jump <host>' to a host not listed */
+  int jump_slot1;               /* 'jump <server>' in the list: slot + 1, 0 = none */
   char actual_server_name[256];
   char actual_hostname[MAX_MASK_LEN];
   time_t actual_hostname_ts;
@@ -1300,6 +1412,7 @@ struct bot_state {
   uchan_record_t uchan_records[MAX_CHAN_BINDS];
   int uchan_record_count;
   user_chan_pending_t user_chan_pending[USER_CHAN_PENDING];
+  invite_check_t invite_checks[INVITE_CHECKS];
   bool config_dirty;   // true when last_used/last_seen needs flushing
   time_t last_config_write; // last debounced flush (CONFIG_WRITE_DEBOUNCE_S)
 
@@ -1322,7 +1435,7 @@ struct bot_state {
    * authoritative per-hub keys live in hubs[]. */
   unsigned char hub_remote_ed_pub[32];
   bool          hub_remote_ed_pub_set;
-  hub_entry_t hubs[MAX_SERVERS];
+  hub_entry_t hubs[MAX_HUBS];
   int hub_count;
   int hub_fd;
   char current_hub[256]; // Track currently connected hub (ip:port)
@@ -1462,6 +1575,16 @@ const char *bot_who(const bot_state_t *state, char kind, const char *uuid);
 /* Case-insensitive IRC-style glob ('*', '?').  Used for usermasks and for
  * matching a requester's hostmask against channel ban masks. */
 bool auth_wildcard_match(const char *pattern, const char *text);
+bool auth_mask_equal(const char *a, const char *b);
+bool auth_bot_mask_ok(const bot_state_t *state, const char *stored, const char *live);
+void invite_check_start(bot_state_t *state, const char *id, const char *chan, const char *nick,
+                        const char *mask, const char *user);
+void invite_check_who(bot_state_t *state, const char *nick, const char *ident, const char *host);
+void invite_check_end(bot_state_t *state, const char *nick);
+void invite_check_tick(bot_state_t *state);
+void chan_done_send(bot_state_t *state, const char *id, bool ok, const char *detail);
+bool auth_user_live_ok(const bot_state_t *state, const char *uuid, const char *nuh,
+                       const char *chan);
 /* modes.md §1: true when nick!user@host matches a trusted-bot mask or an
  * active usermask of an active admin/oper -- "authorised".  Everyone else is
  * unauthorised.  The one test all channel protection is built on. */
@@ -1752,7 +1875,6 @@ void irc_generate_new_nick(bot_state_t *state);
 void irc_note_refusal(bot_state_t *state, const char *text, bool ban_numeric);
 void irc_note_registered(bot_state_t *state);
 void irc_server_block_clear(bot_state_t *state, int idx);
-void irc_server_block_remove(bot_state_t *state, int idx);
 void irc_server_block_desc(const bot_state_t *state, int idx, char *buf,
                            size_t len);
 void parser_handle_line(bot_state_t *state, char *line);
@@ -1781,6 +1903,13 @@ void bot_comms_send_command(bot_state_t *state, const char *target_nick,
     __attribute__((format(printf, 3, 4)));
 void bot_comms_send_to_host(bot_state_t *state, const char *hostmask,
                             const char *target_nick, const char *format, ...)
+    __attribute__((format(printf, 4, 5)));
+/* The same, always over IRC (PRIVMSG), never relayed by the hub. */
+void bot_comms_send_command_irc(bot_state_t *state, const char *target_nick,
+                                const char *format, ...)
+    __attribute__((format(printf, 3, 4)));
+void bot_comms_send_to_host_irc(bot_state_t *state, const char *hostmask,
+                                const char *target_nick, const char *format, ...)
     __attribute__((format(printf, 4, 5)));
 _Noreturn void handle_fatal_error(const char *message);
 void updater_check_for_updates(bot_state_t *state, const char *nick);
@@ -1957,6 +2086,7 @@ void irc_dial_tick(bot_state_t *state);
 bool irc_dialing(const bot_state_t *state);
 void irc_dial_abort(bot_state_t *state);
 void hub_client_grant_held_ops(bot_state_t *state, chan_t *c);
+bool hub_client_bot_on_hub(const bot_state_t *state, const char *uuid);
 bool hub_client_request_op(bot_state_t *state, const char *target_uuid,
                            const char *channel);
 /* Ask the mesh to let us into `chan`: CMD_CHAN_REQUEST when a hub is up,
@@ -1986,7 +2116,13 @@ void chan_access_accept_key(bot_state_t *state, const char *channel,
 /* Frame a channel-access request / reply to the hub.  False when no hub link
  * is usable, which is the caller's cue to fall back to ~B2. */
 bool hub_client_send_chan_request(bot_state_t *state, const char *kind,
-                                  const char *channel);
+                                  const char *channel, const char *rid);
+bool hub_client_new_rid(char *out, size_t cap);
+bool chan_own_result(bot_state_t *state, const char *rid, const char *status,
+                     const char *detail);
+void chan_own_tick(bot_state_t *state);
+void chan_own_failback(bot_state_t *state, chan_t *c, int slot, const char *why);
+bool chan_own_op_request(bot_state_t *state, chan_t *c);
 bool hub_client_send_chan_reply(bot_state_t *state, const char *request_id,
                                 const char *kind, const char *channel,
                                 const char *status, const char *data);
@@ -2008,6 +2144,53 @@ bool bot_comms_handle_privmsg(bot_state_t *state, const char *nick,
 void bot_set_startup_pass(bot_state_t *s, const char *pass);
 void bot_get_startup_pass(const bot_state_t *s, char out[MAX_PASS]);
 void config_write_with_state_pass(bot_state_t *s);
+
+/* ---- Server pool (pool.c, 2.5.4) ---- */
+/* Store one N| or S| line's data ("<value>|<ts>"); false if malformed. */
+bool pool_ingest_line(bot_state_t *state, char tag, const char *data);
+/* The hub's config carried N|/S| lines: drop the cached pool first. */
+void pool_clear(bot_state_t *state);
+/* The pool as .cnf lines (N|, then S|); -1 if it did not fit. */
+int pool_format_lines(const bot_state_t *state, char *buf, size_t cap);
+/* Rebuild server_list[] from the pool or the local list, keeping holds and
+ * the live slot; logs once when a hub-managed bot has nothing to dial. */
+bool pool_local_fallback(const bot_state_t *state);
+void servers_rebuild(bot_state_t *state);
+/* After a hub config: the one-time migration of local s| into the pool. */
+void pool_after_hub_config(bot_state_t *state);
+/* The last hub was removed: the usable pool becomes the local s| list. */
+void pool_go_hubless(bot_state_t *state);
+/* Local list edits (standalone) and pool pushes (hub-managed).  On failure
+ * `err` holds the reason for the admin. */
+bool servers_add(bot_state_t *state, const char *hostport, char *err, size_t errcap);
+bool servers_del(bot_state_t *state, const char *what, char *err, size_t errcap);
+/* The pool entry a dial slot came from, or NULL. */
+const pool_entry_t *pool_entry_of_slot(const bot_state_t *state, int slot);
+/* Pool entries the dial list leaves out (deleted excluded), for `servers`. */
+int pool_unlisted(const bot_state_t *state, const pool_entry_t **out, int max);
+/* Usable pool entries: live, state ok, in POOL_DEFAULT_NET. */
+int pool_eligible_count(const bot_state_t *state);
+/* The NETWORK= check (plan §5.4): armed at 001, decided at 376/422 or after
+ * NETCHECK_WAIT; channel joins wait for it to pass. */
+void netcheck_arm(bot_state_t *state);
+/* The pool changed (hub config): wrong-network holds go, list rebuilt. */
+void pool_changed(bot_state_t *state);
+void netcheck_end_of_motd(bot_state_t *state);
+void netcheck_tick(bot_state_t *state);
+bool netcheck_passed(const bot_state_t *state);
+/* hub_client.c: one CMD_SERVER_REPORT, if this hub link takes them. */
+bool hub_client_send_server_report(bot_state_t *state, const char *payload);
+bool hub_client_send_irc_link(bot_state_t *state, const char *payload);
+/* The IRC link changed (connecting with the entry, up, down, idle); sent to
+ * the hub when it takes it.  pool_link_resend: after a fresh hub link. */
+void pool_link_note(bot_state_t *state, const char *link, const char *entry);
+void pool_link_resend(bot_state_t *state);
+/* CMD_POOL_VIEW: the hub's per-entry load. */
+void pool_view_apply(bot_state_t *state, const char *payload, int len);
+/* Hub-managed pick: the eligible slot with the lowest load per weight (its
+ * HRW order breaks ties), skipping slots at their max unless all are; -1 if
+ * every slot is held.  *soonest = the earliest hold to end. */
+int pool_pick_slot(bot_state_t *state, time_t now, time_t *soonest);
 void config_write_local_with_state_pass(bot_state_t *s);
 
 /* Timestamp for changing an EXISTING replicated record: now, but always past
@@ -2128,6 +2311,6 @@ bool hub_client_send_user_chan_request(bot_state_t *state, const char *kind, con
 void hub_client_user_chan_tick(bot_state_t *state);
 /* bot_comms.c: the hubless path -- ask every trusted bot over ~B2 */
 void bot_comms_user_chan_fallback(bot_state_t *state, const char *kind, const char *chan,
-                                  const char *nick, const char *mask);
+                                  const char *nick, const char *mask, const char *uuid);
 
 #endif
