@@ -107,7 +107,7 @@ uflag_record_t *access_uflag_find(bot_state_t *state, const char *uuid) {
 uchan_record_t *access_uchan_find(bot_state_t *state, const char *uuid, const char *chan) {
   for (int i = 0; i < state->uchan_record_count; i++) {
     uchan_record_t *r = &state->uchan_records[i];
-    if (strcmp(r->uuid, uuid) == 0 && strcasecmp(r->chan, chan) == 0) return r;
+    if (strcmp(r->uuid, uuid) == 0 && irc_casecmp(r->chan, chan) == 0) return r;
   }
   return NULL;
 }
@@ -173,7 +173,7 @@ bool access_user_chan_ok(const bot_state_t *state, const char *uuid, const char 
   for (int i = 0; i < state->uchan_record_count; i++) {
     const uchan_record_t *r = &state->uchan_records[i];
     if (!r->is_active || strcmp(r->uuid, uuid) != 0) continue;
-    if (strcmp(r->chan, "*") == 0 || (chan && strcasecmp(r->chan, chan) == 0)) return true;
+    if (strcmp(r->chan, "*") == 0 || (chan && irc_casecmp(r->chan, chan) == 0)) return true;
   }
   return false;
 }
@@ -284,7 +284,7 @@ void access_prune(bot_state_t *state) {
       keep = strcmp(state->user_records[u].uuid, r->uuid) == 0;
     for (int j = 0; j < o && keep; j++)
       keep = !(strcmp(state->uchan_records[j].uuid, r->uuid) == 0 &&
-               strcasecmp(state->uchan_records[j].chan, r->chan) == 0);
+               irc_casecmp(state->uchan_records[j].chan, r->chan) == 0);
     if (keep) state->uchan_records[o++] = *r;
   }
   state->uchan_record_count = o;
@@ -399,7 +399,7 @@ int access_chan_cascade(bot_state_t *state, const char *chan, time_t ts) {
   int n = 0;
   for (int i = 0; i < state->uchan_record_count; i++) {
     uchan_record_t *r = &state->uchan_records[i];
-    if (!r->is_active || strcmp(r->chan, "*") == 0 || strcasecmp(r->chan, chan) != 0) continue;
+    if (!r->is_active || strcmp(r->chan, "*") == 0 || irc_casecmp(r->chan, chan) != 0) continue;
     if (access_uchan_put(state, r->uuid, r->chan, false, ts)) n++;
   }
   return n;

@@ -132,7 +132,13 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
       char *sp;
       char *bot_command = strtok_r(cmd, " ", &sp);
       char *bot_arg1 = strtok_r(NULL, " ", &sp);
-      if (bot_command && bot_arg1 && strcasecmp(bot_command, "OPME") == 0) {
+      if (bot_command && bot_arg1 && strcasecmp(bot_command, "NETPROBE") == 0) {
+        /* the link proof: over IRC only (a hub relay proves nothing) */
+        if (sender_nick) netproof_probe(state, sender_nick, bot_arg1);
+      } else if (bot_command && bot_arg1 && strcasecmp(bot_command, "NETPROBE-OK") == 0) {
+        char *srv = strtok_r(NULL, " ", &sp);
+        if (sender_nick) netproof_ok(state, bot_arg1, srv, sender_nick);
+      } else if (bot_command && bot_arg1 && strcasecmp(bot_command, "OPME") == 0) {
         /* Only where we can: in the channel and opped (as OPUSER).  The
          * sender is a trusted bot, so +bitch does not apply to it. */
         chan_t *mc = sender_nick ? channel_find(state, bot_arg1) : NULL;
@@ -162,7 +168,7 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
             if (imask && iuser) {
               /* a person the sender validated: its mask, checked live */
               invite_check_start(state, "", bot_arg1, bot_arg2, imask, iuser);
-            } else if (strcasecmp(bot_arg2, snick) == 0) {
+            } else if (irc_casecmp(bot_arg2, snick) == 0) {
               /* the sender itself: its published mask, checked live */
               invite_check_start(state, "", bot_arg1, bot_arg2, sender->mask, "");
             } else {
@@ -188,7 +194,7 @@ static void b2_open_and_dispatch(bot_state_t *state, const trusted_bot_t *sender
            * still that user's (2026-11-23) */
           const char *hm = NULL;
           for (int i = 0; i < oc->roster_count; i++)
-            if (strcasecmp(oc->roster[i].nick, bot_arg2) == 0) hm = oc->roster[i].hostmask;
+            if (irc_casecmp(oc->roster[i].nick, bot_arg2) == 0) hm = oc->roster[i].hostmask;
           if (hm && auth_mask_equal(hm, omask) && auth_user_live_ok(state, ouser, hm, bot_arg1)) {
             log_message(L_INFO, state, "[BOT-COMMS] Opping %s in %s (bot req, %s checked)\n",
                         bot_arg2, bot_arg1, hm);

@@ -17,7 +17,7 @@ bool auth_wildcard_match(const char *pattern, const char *text) {
     if (*p == '*') {
       last_wildcard = p++;
       last_text_for_wildcard = t;
-    } else if (*p == '?' || strncasecmp(p, t, 1) == 0) {
+    } else if (*p == '?' || irc_tolower(*p) == irc_tolower(*t)) {
       p++;
       t++;
     } else if (last_wildcard) {
@@ -122,7 +122,7 @@ bool auth_mask_equal(const char *a, const char *b) {
   size_t an = (size_t)(ab - a), bn = (size_t)(bb - b);
   size_t ai = (size_t)(aa - ab - 1), bi = (size_t)(ba - bb - 1);
   if (an != bn || ai != bi || ai == 0 || !aa[1] || !ba[1]) return false;
-  return strncasecmp(a, b, an) == 0 && strncmp(ab + 1, bb + 1, ai) == 0 &&
+  return irc_ncasecmp(a, b, an) == 0 && strncmp(ab + 1, bb + 1, ai) == 0 &&
          strcasecmp(aa + 1, ba + 1) == 0;
 }
 
@@ -228,7 +228,7 @@ trusted_bot_t *auth_trusted_bot_by_nick(bot_state_t *state, const char *nick) {
   for (int i = 0; i < state->trusted_bot_count; i++) {
     char bnick[MAX_NICK];
     auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
-    if (strcasecmp(bnick, nick) == 0) return &state->trusted_bots[i];
+    if (irc_casecmp(bnick, nick) == 0) return &state->trusted_bots[i];
   }
   return NULL;
 }

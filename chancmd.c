@@ -526,7 +526,7 @@ void chancmd_bans(bot_state_t *state, const char *nick, char *args) {
     const cfg_ban_t *b = &state->cfg_bans[i];
     if (!b->active)
       continue;
-    if (chan && strcasecmp(b->chan, chan) != 0 && strcmp(b->chan, "*") != 0)
+    if (chan && irc_casecmp(b->chan, chan) != 0 && strcmp(b->chan, "*") != 0)
       continue;
     if (b->expires && b->expires <= now)
       continue;

@@ -1,3 +1,4 @@
+#include <arpa/inet.h>
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
@@ -12,6 +13,7 @@
 #include <sys/mman.h>
 #include <sys/prctl.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
 #include <sys/select.h>
 #include <sys/stat.h>
 #include <sys/utsname.h>
@@ -19,6 +21,7 @@
 #include <unistd.h>
 
 #include "bot.h"
+#include "cli_fmt.h"
 
 void ssl_init_openssl(void) {
   SSL_load_error_strings();
@@ -146,6 +149,8 @@ static void state_init(bot_state_t *state) {
 }
 
 static void state_destroy(bot_state_t *state) {
+  free(state->chan_state_sent);
+  state->chan_state_sent = NULL;
   for (int i = 0; i < state->server_count; i++)
     free(state->server_list[i]);
   for (int i = 0; i < state->local_server_count; i++)
@@ -174,17 +179,6 @@ static void flush_stdin_if_needed(const char *buffer, size_t len) {
   }
 }
 
-static void get_input(const char *prompt, char *buffer, size_t len) {
-  printf("%s: ", prompt);
-  fflush(stdout);
-  if (fgets(buffer, (int)len, stdin) == NULL) {
-    buffer[0] = '\0';
-    return;
-  }
-  flush_stdin_if_needed(buffer, len);
-  buffer[strcspn(buffer, "\r\n")] = 0;
-}
-
 static void get_password(const char *prompt, char *buffer, size_t len) {
   struct termios oldt, newt;
   printf("%s: ", prompt);
@@ -202,23 +196,6 @@ static void get_password(const char *prompt, char *buffer, size_t len) {
   tcsetattr(STDIN_FILENO, TCSANOW, &oldt);
   printf("\n");
 }
-
-static bool get_confirmed_password(const char *prompt, char *buffer,
-                                   size_t len) {
-  char confirm_buffer[MAX_PASS];
-  get_password(prompt, buffer, len);
-  get_password("Confirm password", confirm_buffer, sizeof(confirm_buffer));
-  if (strcmp(buffer, confirm_buffer) == 0 && strlen(buffer) > 0) {
-    printf("Passwords match. Accepted.\n");
-    return true;
-  } else {
-    printf(
-        "🚨 ERROR: Passwords do not match or are empty. Please try again.\n");
-    memset(buffer, 0, len);
-    return false;
-  }
-}
-
 
 void daemonize(void) {
   pid_t pid;
@@ -400,18 +377,20 @@ static void wizard_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) 
     char in[PATH_MAX];
     unsigned char raw[HUB_KEY_RAW_LEN];
     out[0] = '\0';
-    get_input("Public key (paste the 88 chars, or a path to the .public.b64)",
-              in, sizeof(in));
+    cli_ask("public key", in, sizeof(in));
+    if (feof(stdin)) {
+      cli_err("no public key given: setup stopped");
+      exit(1);
+    }
     if (in[0] == '\0') {
-      printf("ERROR: a public key is required. Make one with "
-             "'utils/keygen %s' and give its .public.b64.\n", who);
+      cli_err("a public key is required: make one with 'utils/keygen %s' and give its "
+              ".public.b64", who);
       continue;
     }
     /* Private and public key files have the same shape; refuse a keygen
      * private file by name before it gets published in the a| record. */
     if (strstr(in, ".private.")) {
-      printf("ERROR: that is a PRIVATE key file — it stays with the admin. "
-             "Use the matching .public.b64.\n");
+      cli_err("that is a PRIVATE key file: it stays with the admin; give the .public.b64");
       continue;
     }
     if (crypto_pubkey_b64_decode(in, raw)) {
@@ -427,19 +406,67 @@ static void wizard_read_pubkey(const char *who, char out[COMBINED_KEY_B64 + 1]) 
         line[strcspn(line, " \t\r\n")] = '\0';
       }
       if (!line[0] || !crypto_pubkey_b64_decode(line, raw)) {
-        printf("ERROR: not an 88-char public key%s. Use the .public.b64 "
-               "(never the .private.b64).\n", f ? " in that file" : "");
+        cli_err("not an 88-char public key%s (the .public.b64, never the .private.b64)",
+                f ? " in that file" : "");
         continue;
       }
       memcpy(out, line, COMBINED_KEY_B64);
       out[COMBINED_KEY_B64] = '\0';
     }
-    char fp[KEY_FP_LEN + 1], yn[16];
+    char fp[KEY_FP_LEN + 1];
     crypto_key_fingerprint(raw, fp);
-    printf("  Key fingerprint for %s: %s\n", who, fp);
-    get_input("Use this key? (Y/n)", yn, sizeof(yn));
-    if (yn[0] != 'n' && yn[0] != 'N') return;
+    cli_kv("fingerprint", "%s", fp);
+    if (cli_ask_yes("use this key?", true)) return;
   }
+}
+
+/* A hub's pinned key for a summary line: the fingerprint of an 88-char
+ * combined key, or a 44-char Ed25519 key shortened. */
+/* -setup: can the bot dial out from vhost?  It must be an IPv4 or IPv6
+ * literal (what irc_client.c binds) of this host: a throwaway socket is
+ * bound to it on port 0 and closed.  why gets the reason. */
+static bool wizard_test_vhost(const char *vhost, char *why, size_t cap) {
+  struct sockaddr_storage ss;
+  socklen_t sl;
+  memset(&ss, 0, sizeof(ss));
+  struct sockaddr_in *v4 = (struct sockaddr_in *)&ss;
+  struct sockaddr_in6 *v6 = (struct sockaddr_in6 *)&ss;
+  if (inet_pton(AF_INET, vhost, &v4->sin_addr) == 1) {
+    v4->sin_family = AF_INET;
+    sl = sizeof(*v4);
+  } else if (inet_pton(AF_INET6, vhost, &v6->sin6_addr) == 1) {
+    v6->sin6_family = AF_INET6;
+    sl = sizeof(*v6);
+  } else {
+    snprintf(why, cap, "not an IP address (a hostname is not accepted)");
+    return false;
+  }
+  int fd = socket(ss.ss_family, SOCK_STREAM, 0);
+  if (fd < 0) {
+    snprintf(why, cap, "%s", strerror(errno));
+    return false;
+  }
+  bool ok = bind(fd, (struct sockaddr *)&ss, sl) == 0;
+  int e = errno;
+  close(fd);
+  if (ok) return true;
+  if (e == EADDRNOTAVAIL) snprintf(why, cap, "not an address of this host");
+  else snprintf(why, cap, "%s", strerror(e));
+  return false;
+}
+
+static const char *wizard_hub_key_label(const char *in, char *out, size_t cap) {
+  unsigned char raw[HUB_KEY_RAW_LEN];
+  if (crypto_pubkey_b64_decode(in, raw)) {
+    char fp[KEY_FP_LEN + 1];
+    crypto_key_fingerprint(raw, fp);
+    snprintf(out, cap, "key %s", fp);
+    secure_wipe(raw, sizeof(raw));
+  } else {
+    char sh[64];
+    snprintf(out, cap, "key %s", cli_short(in, sh, sizeof(sh)));
+  }
+  return out;
 }
 
 static void run_config_wizard(void) {
@@ -447,25 +474,32 @@ static void run_config_wizard(void) {
   char config_pass[MAX_PASS];
   char server_buf[MAX_BUFFER];
   char chan_buf[MAX_CHAN];
-  char confirm_char[16];
   char admin_name[64];
   char admin_pub[COMBINED_KEY_B64 + 1];
+  char pub_b64_keep[COMBINED_KEY_B64 + 1];
+  char id_fp[KEY_FP_LEN + 1];
 #define WIZARD_MAX_MASKS 20
   char admin_masks[WIZARD_MAX_MASKS][MAX_MASK_LEN];
+  /* what the summary shows for each hub: its pasted key, kept as typed */
+  char hub_keys[MAX_HUBS][96];
   int  admin_mask_count = 0;
   bool hub_managed = false;
   memset(admin_name,  0, sizeof(admin_name));
   memset(admin_pub,   0, sizeof(admin_pub));
   memset(admin_masks, 0, sizeof(admin_masks));
 
-  printf("--- IRC Bot Initial Setup ---\n");
-  printf("No config file found. Let's create one.\n\n");
+  cli_header("ircbot", BOT_VERSION, "setup");
+  cli_note("No %s here yet: these steps write one, encrypted with a config password.",
+           CONFIG_FILE);
 
   do {
     state_init(&state);
     memset(config_pass, 0, MAX_PASS);
     memset(server_buf, 0, MAX_BUFFER);
     memset(chan_buf, 0, MAX_CHAN);
+    memset(hub_keys, 0, sizeof(hub_keys));
+    pub_b64_keep[0] = '\0';
+    id_fp[0] = '\0';
 
     /* Reset every mode-dependent field here rather than at its prompt: the
      * prompts now live in mutually exclusive branches, so a wizard restart that
@@ -476,30 +510,37 @@ static void run_config_wizard(void) {
     memset(admin_name,  0, sizeof(admin_name));
     memset(admin_pub,   0, sizeof(admin_pub));
     memset(admin_masks, 0, sizeof(admin_masks));
+    int step = 0;
 
-    printf("==========================================\n");
-    printf("         Starting Configuration Wizard      \n");
-    printf("==========================================\n");
+    cli_step(++step, "Config password");
+    for (;;) {
+      char confirm[MAX_PASS];
+      cli_ask_secret("password", config_pass, MAX_PASS);
+      cli_ask_secret("confirm", confirm, sizeof(confirm));
+      bool same = config_pass[0] && strcmp(config_pass, confirm) == 0;
+      OPENSSL_cleanse(confirm, sizeof(confirm));
+      if (same) {
+        cli_ok("the passwords match");
+        break;
+      }
+      cli_err("the passwords do not match, or are empty: again");
+      OPENSSL_cleanse(config_pass, MAX_PASS);
+    }
 
-    printf("\n--- Setup Config Master Password ---\n");
-    while (!get_confirmed_password("Enter new config password", config_pass,
-                                   MAX_PASS))
-      ;
-
-    /* Bot identity is generated locally up front so the operator can paste
-     * the UUID + pubkey into the hub console's 'bot add' before continuing.
-     * The private key never leaves this machine. */
-    printf("\n--- Bot Identity (Curve25519) ---\n");
+    /* Bot identity is generated locally up front: the summary shows the
+     * exact 'bot add' line for the hub console.  The private key never
+     * leaves this machine. */
+    cli_step(++step, "Identity (generated here, Curve25519)");
     {
       unsigned char priv64[HUB_KEY_RAW_LEN], pub64[HUB_KEY_RAW_LEN];
       if (!crypto_generate_combined_keypair(priv64, pub64)) {
-        fprintf(stderr, "🚨 ERROR: Failed to generate bot keypair.\n");
+        cli_err("could not generate the bot's keypair");
         return;
       }
       /* UUID v4 */
       unsigned char rnd[16];
       if (RAND_bytes(rnd, sizeof(rnd)) != 1) {
-        fprintf(stderr, "🚨 ERROR: RAND_bytes failed.\n");
+        cli_err("RAND_bytes failed");
         secure_wipe(priv64, HUB_KEY_RAW_LEN);
         return;
       }
@@ -515,7 +556,7 @@ static void run_config_wizard(void) {
       char *priv_b64 = base64_encode(priv64, HUB_KEY_RAW_LEN);
       char *pub_b64  = base64_encode(pub64,  HUB_KEY_RAW_LEN);
       if (!priv_b64 || !pub_b64) {
-        fprintf(stderr, "🚨 ERROR: base64 encode failed.\n");
+        cli_err("base64 encode failed");
         if (priv_b64) { secure_wipe(priv_b64, strlen(priv_b64)); free(priv_b64); }
         if (pub_b64)  free(pub_b64);
         secure_wipe(priv64, HUB_KEY_RAW_LEN);
@@ -528,41 +569,50 @@ static void run_config_wizard(void) {
       secure_wipe(priv_b64, strlen(priv_b64));
       free(priv_b64);
 
-      char fp[KEY_FP_LEN + 1];
-      crypto_key_fingerprint(pub64, fp);
-      printf("\n  Bot UUID:        %s\n", state.bot_uuid);
-      printf("  Bot public key:  %s\n", pub_b64);
-      printf("  Key fingerprint: %s\n", fp);
-      printf("\n  Save these — when registering this bot on the hub console\n");
-      printf("  ('bot add <nick> <uuid> <pubkey>') the hub needs the UUID and pubkey above.\n");
-      printf("  (Standalone bots: other bots trust this one with\n");
-      printf("  '+bot <nick!user@host> <UUID> <public key>'.)\n");
-      printf("\n  Press Enter to continue...");
-      fflush(stdout);
-      { int c; while ((c = getchar()) != '\n' && c != EOF); }
+      crypto_key_fingerprint(pub64, id_fp);
+      snprintf(pub_b64_keep, sizeof(pub_b64_keep), "%s", pub_b64);
+      cli_kv("uuid", "%s", state.bot_uuid);
+      cli_kv("public key", "%s", pub_b64);
+      cli_kv("fingerprint", "%s", id_fp);
+      cli_note("The summary at the end has the 'bot add' line for the hub console.");
       free(pub_b64);
     }
 
-    printf("\n--- Setup Bot Nickname ---\n");
+    cli_step(++step, "On IRC");
     while (true) {
-      get_input("Enter bot nick", state.target_nick, MAX_NICK);
+      cli_ask("nick", state.target_nick, MAX_NICK);
       if (is_rfc_nick(state.target_nick)) {
         snprintf(state.current_nick, MAX_NICK, "%s", state.target_nick);
         break;
       }
       if (strchr(state.target_nick, '|'))
-        printf("ERROR: Nick cannot contain '|' (reserved as protocol delimiter).\n");
+        cli_err("a nick cannot hold '|' (it delimits the records)");
       else if (!is_valid_bot_nick(state.target_nick))
-        printf("ERROR: Invalid nick length (1-%d characters).\n", MAX_NICK - 1);
+        cli_err("a nick is 1-%d characters", MAX_NICK - 1);
       else
-        printf("ERROR: Not a valid IRC nick: start with a letter or one of "
-               "[]\\`_^{}, then letters, digits, those or '-'.\n");
+        cli_err("not an IRC nick: start with a letter or one of []\\`_^{}, then letters, "
+                "digits, those or '-'");
     }
-
-    get_input("Enter bot username (ident)", state.user, sizeof(state.user));
-    get_input("Enter bot real name (gecos)", state.gecos, sizeof(state.gecos));
-    get_input("Enter VHOST IP (optional, press Enter for default [no vhost])",
-              state.vhost, sizeof(state.vhost));
+    cli_ask("ident", state.user, sizeof(state.user));
+    cli_ask("real name", state.gecos, sizeof(state.gecos));
+    /* Optional: most bots dial out from the host's default address. */
+    cli_note("A vhost is optional: a local IP address the bot dials IRC from "
+             "(for a host with several).");
+    state.vhost[0] = '\0';
+    if (cli_ask_yes("do you have a vhost?", false)) {
+      for (;;) {
+        char why[128];
+        cli_ask("vhost ip (empty = none)", state.vhost, sizeof(state.vhost));
+        if (!state.vhost[0] || feof(stdin)) break;
+        if (wizard_test_vhost(state.vhost, why, sizeof(why))) {
+          cli_ok("%s can be bound", state.vhost);
+          break;
+        }
+        cli_err("cannot use %s: %s", state.vhost, why);
+        state.vhost[0] = '\0';
+      }
+    }
+    if (!state.vhost[0]) cli_note("no vhost: the system's default address");
 
     /* Management mode decides the rest of the wizard.  A hub-managed bot owns
      * none of the records the hub is authoritative for, so prompting for them
@@ -570,22 +620,17 @@ static void run_config_wizard(void) {
      * (OPT_HUB_ONLY_MUTATIONS), state the hub rejects outright and the bot then
      * re-pushes forever with no way to notice.  Ask first, collect only what
      * this bot actually owns. */
-    printf("\n--- Management Mode ---\n");
-    printf("Hub-managed: admins, usermasks, channels and IRC servers live on the\n");
-    printf("  hub and are managed on the hub console. This bot only needs hub\n");
-    printf("  addresses and their pinned public keys.\n");
-    printf("Standalone:  this bot owns its own IRC servers, admin list and channels.\n\n");
-
-    char mode_choice[16];
-    get_input("Hub-managed? (Y/n)", mode_choice, sizeof(mode_choice));
-    hub_managed = (mode_choice[0] != 'n' && mode_choice[0] != 'N');
+    cli_step(++step, "Management");
+    cli_note("hub-managed: admins, usermasks, channels and IRC servers live on the hub "
+             "and are managed on its console; this bot needs only the hubs' addresses "
+             "and keys.");
+    cli_note("standalone: this bot keeps its own IRC server, admin and channel.");
+    hub_managed = cli_ask_yes("hub-managed?", true);
 
     if (hub_managed) {
-      printf("\n--- Hub Configuration ---\n");
-      printf("You'll need each hub's address and public key: './irchub -id' on\n");
-      printf("the hub's host prints both (as the '+hub' line), so does 'hub show'\n");
-      printf("in its console. Each hub has its own keypair, so the key is pinned\n");
-      printf("per hub.\n");
+      cli_step(++step, "Hubs");
+      cli_note("Each hub's address and public key: './irchub -id' on its host prints "
+               "both (the '+hub' line), and so does 'hub show' on its console.");
 
       while (state.hub_count < MAX_HUBS) {
         char hub_addr[256];
@@ -593,18 +638,17 @@ static void run_config_wizard(void) {
         bool addr_valid = false;
         bool hpub_valid = false;
 
-        /* Hub address */
-        printf("\n--- Hub #%d Address ---\n", state.hub_count + 1);
+        printf("\n");
         while (!addr_valid) {
-          get_input("Enter hub address (e.g., 127.0.0.1:6000)", hub_addr,
-                    sizeof(hub_addr));
+          char label[24];
+          snprintf(label, sizeof(label), "hub %d", state.hub_count + 1);
+          cli_ask(label, hub_addr, sizeof(hub_addr));
           char *colon = strrchr(hub_addr, ':');
           if (colon && colon != hub_addr && strlen(colon + 1) > 0) {
             int port = atoi(colon + 1);
             if (port > 0 && port < 65536) addr_valid = true;
           }
-          if (!addr_valid)
-            printf("🚨 ERROR: Invalid format. Use HOST:PORT or IP:PORT.\n");
+          if (!addr_valid) cli_err("give host:port (e.g. 127.0.0.1:6000)");
         }
 
         /* Reject duplicate addresses. */
@@ -612,15 +656,12 @@ static void run_config_wizard(void) {
         for (int i = 0; i < state.hub_count; i++)
           if (strcmp(state.hubs[i].addr, hub_addr) == 0) { dup = true; break; }
         if (dup) {
-          printf("🚨 ERROR: '%s' already added; skipping.\n", hub_addr);
+          cli_err("%s is already in the list: skipped", hub_addr);
         } else {
-          /* Hub public key (44-char raw Ed25519 or 88-char combined). */
+          /* Hub public key: the 88-char combined key every hub tool prints. */
           unsigned char hub_pub[32];
-          printf("\n--- Hub #%d Public Key ---\n", state.hub_count + 1);
-          printf("Paste the hub's public key from './irchub -id' or 'hub show' "
-                 "(44 or 88 chars).\n");
           while (!hpub_valid) {
-            get_input("Hub public key", hub_pub_input, sizeof(hub_pub_input));
+            cli_ask("public key", hub_pub_input, sizeof(hub_pub_input));
             size_t hp_len = strlen(hub_pub_input);
             while (hp_len > 0 && (hub_pub_input[hp_len-1] == ' ' ||
                                   hub_pub_input[hp_len-1] == '\r' ||
@@ -630,9 +671,8 @@ static void run_config_wizard(void) {
             }
             int dec_len = 0;
             unsigned char *dec = base64_decode(hub_pub_input, &dec_len);
-            if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
-              printf("🚨 ERROR: Expected base64 of a 32-byte Ed25519 key "
-                     "(44 chars) or 64-byte combined key (88 chars).\n");
+            if (!dec || dec_len != HUB_KEY_RAW_LEN) {
+              cli_err("expected the hub's 88-char public key (./irchub -id or hub show)");
               if (dec) free(dec);
               continue;
             }
@@ -650,125 +690,126 @@ static void run_config_wizard(void) {
           memcpy(he->ed_pub, hub_pub, 32);
           he->ed_pub_set = true;
           secure_wipe(hub_pub, sizeof(hub_pub));
+          size_t hk_len = strnlen(hub_pub_input, sizeof(hub_keys[0]) - 1); /* validated 88-char key */
+          memcpy(hub_keys[state.hub_count], hub_pub_input, hk_len);
+          hub_keys[state.hub_count][hk_len] = '\0';
           state.hub_count++;
-          printf("\n✓ Hub added: %s\n", hub_addr);
+          cli_ok("hub %d: %s", state.hub_count, hub_addr);
         }
 
         if (state.hub_count >= MAX_HUBS) {
-          printf("Reached hub limit (%d).\n", MAX_HUBS);
+          cli_note("That is the most hubs a bot keeps (%d).", MAX_HUBS);
           break;
         }
-        char more[16];
-        get_input("Add another hub? (y/N)", more, sizeof(more));
-        if (more[0] != 'y' && more[0] != 'Y') break;
+        if (!cli_ask_yes("another hub?", false)) break;
       }
       if (state.hub_count == 0) {
         /* Defensive: the loop above always adds on its first pass, so this is
          * unreachable today.  Fail closed rather than write a hub-managed
          * config with nothing to connect to. */
-        printf("\n🚨 ERROR: A hub-managed bot needs at least one hub. "
-               "Restarting setup.\n\n");
+        cli_err("a hub-managed bot needs at least one hub: starting over");
         continue;
       }
-      printf("\n✓ Hub configuration saved (%d hub%s).\n",
-             state.hub_count, state.hub_count == 1 ? "" : "s");
-      printf("\n  Admins, usermasks and channels for this bot are added on the\n");
-      printf("  hub console ('user add', 'user mask', 'channel add'), not here.\n");
-      printf("  This wizard assumes the hub network runs with opt 'h' (hub-only\n");
-      printf("  mutations), which is the default — it cannot verify that until\n");
-      printf("  the first sync. If your hub does not set opt 'h', you can also\n");
-      printf("  add them later from IRC with '+admin' and 'join'.\n");
     } else {
-      printf("\n--- Setup IRC Server ---\n");
+      cli_step(++step, "IRC server");
       while (true) {
-        get_input("Enter IRC server (e.g., irc.efnet.org or irc.efnet.org:6697)",
-                  server_buf, MAX_BUFFER);
+        cli_ask("server", server_buf, MAX_BUFFER);
         char wh[POOL_HOST_MAX + 1];
         int wp = 0;
         if (strchr(server_buf, '.') &&
             pool_hostport_parse(server_buf, wh, sizeof(wh), &wp))
           break;
-        printf("🚨 ERROR: Invalid server format (host or host:port).\n");
+        cli_err("give host or host:port (e.g. irc.efnet.org:6697)");
       }
 
-      printf("\n--- Setup First Admin ---\n");
+      cli_step(++step, "First admin");
       while (true) {
-        get_input("Enter admin friendly name (no spaces, e.g. admin)", admin_name, sizeof(admin_name));
+        cli_ask("name", admin_name, sizeof(admin_name));
         if (strlen(admin_name) > 0 && !strchr(admin_name,' ') && !strchr(admin_name,'|'))
           break;
-        printf("ERROR: Name cannot contain spaces or '|'.\n");
+        cli_err("a name with no spaces or '|' (e.g. admin)");
       }
-      printf("\nThe admin signs in with a Curve25519 key, not a password.\n");
-      printf("On the admin's own machine run 'utils/keygen %s' (or see\n", admin_name);
-      printf("'help +admin' for an openssl recipe) and give its .public.b64 here.\n");
-      printf("The .private.b64 stays with the admin (chmod 600) for their IRC script.\n");
+      cli_note("The admin signs in with a Curve25519 key, not a password: on the admin's "
+               "own machine run 'utils/keygen %s' (or see 'help +admin' for an openssl "
+               "recipe) and give its .public.b64 here.  The .private.b64 stays with the "
+               "admin (chmod 600) for their IRC script.", admin_name);
       wizard_read_pubkey(admin_name, admin_pub);
-      printf("\n--- Setup Admin Usermasks ---\n");
-      printf("Enter usermasks for this admin (e.g. nick!*@*.example.com).\n");
-      printf("Press Enter with no mask when done (at least one required).\n\n");
+      cli_note("Usermasks the admin is known by (e.g. nick!*@*.example.com); an empty "
+               "line ends the list, at least one.");
       while (admin_mask_count < WIZARD_MAX_MASKS) {
         char tmp_mask[MAX_MASK_LEN] = {0};
-        printf("Usermask %d%s: ", admin_mask_count + 1,
-               admin_mask_count == 0 ? " (required)" : " (or Enter to finish)");
-        fflush(stdout);
-        char *res = fgets(tmp_mask, sizeof(tmp_mask), stdin);
-        if (!res) break;
-        tmp_mask[strcspn(tmp_mask, "\n")] = '\0';
+        char label[24];
+        snprintf(label, sizeof(label), "usermask %d", admin_mask_count + 1);
+        cli_ask(label, tmp_mask, sizeof(tmp_mask));
+        if (feof(stdin)) break;
         if (tmp_mask[0] == '\0') {
-          if (admin_mask_count == 0) { printf("ERROR: At least one usermask required.\n"); continue; }
+          if (admin_mask_count == 0) { cli_err("at least one usermask"); continue; }
           break;
         }
         if (!strchr(tmp_mask, '!') || !strchr(tmp_mask, '@')) {
-          printf("ERROR: Mask must contain '!' and '@'. Try again.\n");
+          cli_err("a usermask holds '!' and '@' (nick!user@host)");
           continue;
         }
         snprintf(admin_masks[admin_mask_count], MAX_MASK_LEN, "%s", tmp_mask);
         admin_mask_count++;
       }
 
-      printf("\n--- Setup Initial Channel ---\n");
+      cli_step(++step, "First channel");
       while (true) {
-        get_input("Enter channel to join (e.g., #bots) [Optional, Enter to skip]",
-                  chan_buf, MAX_CHAN);
-        if (strlen(chan_buf) == 0)
+        cli_ask("channel", chan_buf, MAX_CHAN);
+        if (strlen(chan_buf) == 0) {
+          cli_note("none: add channels later with 'join' from IRC");
           break;
+        }
         if (chan_buf[0] == '#' && strlen(chan_buf) > 1)
           break;
-        printf("🚨 ERROR: Channel must start with '#'.\n");
+        cli_err("a channel starts with '#' (or leave it empty)");
       }
     }
 
-    printf("\n==========================================\n");
-    printf("     Configuration Summary (Review)         \n");
-    printf("==========================================\n");
-    printf("Bot Nick: %s\n", state.target_nick);
+    /* The summary: every answer, and what to paste on the other side. */
+    cli_summary("Summary");
     if (hub_managed)
-      printf("IRC servers: from the hub pool\n");
+      cli_skv("mode", "hub-managed %s %d hub%s", cli_g(CLI_G_DOT), state.hub_count,
+              state.hub_count == 1 ? "" : "s");
     else
-      printf("IRC Server: %s\n", server_buf);
+      cli_skv("mode", "standalone");
+    cli_skv("nick", "%s", state.target_nick);
+    cli_skv("ident", "%s", state.user[0] ? state.user : "(the nick)");
+    cli_skv("real name", "%s", state.gecos[0] ? state.gecos : "(none)");
+    cli_skv("vhost", "%s", state.vhost[0] ? state.vhost : "(none)");
     if (hub_managed) {
-      printf("Mode: HUB-MANAGED (%d hub%s)\n", state.hub_count,
-             state.hub_count == 1 ? "" : "s");
-      printf("Admins/channels: managed on the hub\n");
-    } else {
-      printf("Mode: STANDALONE\n");
-      printf("Admin: %s (%d usermask%s)\n", admin_name, admin_mask_count,
-             admin_mask_count == 1 ? "" : "s");
-    {
-      unsigned char raw[HUB_KEY_RAW_LEN];
-      char fp[KEY_FP_LEN + 1];
-      if (crypto_pubkey_b64_decode(admin_pub, raw)) {
-        crypto_key_fingerprint(raw, fp);
-        printf("Admin key: %s\n", fp);
+      for (int i = 0; i < state.hub_count; i++) {
+        char kl[96];
+        cli_skv(i == 0 ? "hubs" : "", "%s  %s", state.hubs[i].addr,
+                wizard_hub_key_label(hub_keys[i], kl, sizeof(kl)));
       }
+      cli_skv("irc servers", "from the hub's pool");
+    } else {
+      cli_skv("irc server", "%s", server_buf);
+      unsigned char raw[HUB_KEY_RAW_LEN];
+      char fp[KEY_FP_LEN + 1] = "";
+      if (crypto_pubkey_b64_decode(admin_pub, raw)) crypto_key_fingerprint(raw, fp);
+      cli_skv("admin", "%s %s key %s", admin_name, cli_g(CLI_G_DOT), fp[0] ? fp : "?");
+      for (int i = 0; i < admin_mask_count; i++)
+        cli_skv(i == 0 ? "usermasks" : "", "%s", admin_masks[i]);
+      cli_skv("channel", "%s", chan_buf[0] ? chan_buf : "(none)");
     }
-      printf("Channel: %s\n", chan_buf[0] ? chan_buf : "(none)");
+    cli_skv("uuid", "%s", state.bot_uuid);
+    cli_skv("key", "%s", id_fp);
+    if (hub_managed) {
+      cli_skv("on the hub", "paste this on ONE hub's console:");
+      printf("\n   bot add %s %s %s\n\n", state.target_nick, state.bot_uuid, pub_b64_keep);
+      cli_note("Once is enough: every linked hub learns the bot through the mesh.");
+    } else {
+      cli_skv("other bots", "trust this one with:");
+      printf("\n   +bot %s!%s@<host> %s %s\n\n", state.target_nick,
+             state.user[0] ? state.user : state.target_nick, state.bot_uuid, pub_b64_keep);
     }
+    cli_rule();
 
-    get_input("Does this look correct? (Y/n)", confirm_char,
-              sizeof(confirm_char));
-    if (confirm_char[0] == 'n' || confirm_char[0] == 'N') {
-      printf("\nRestarting configuration wizard...\n\n");
+    if (!cli_ask_yes("write " CONFIG_FILE "?", true)) {
+      cli_note("Starting over.");
       for (int i = 0; i < state.hub_count; i++)
         OPENSSL_cleanse(state.hubs[i].ed_pub, sizeof(state.hubs[i].ed_pub));
       state.hub_count = 0;
@@ -812,6 +853,7 @@ static void run_config_wizard(void) {
   /* Wipe unconditionally — the buffers exist in both modes even though only the
    * standalone branch fills them. */
   secure_wipe(admin_masks, sizeof(admin_masks));
+  secure_wipe(hub_keys, sizeof(hub_keys));
 #undef WIZARD_MAX_MASKS
   /* Standalone: its one local server.  Hub-managed: none -- the hub's pool
    * arrives with the first sync (server pool plan §5.5a). */
@@ -829,17 +871,17 @@ static void run_config_wizard(void) {
     }
   }
 
-  printf("\n--- Finalizing Configuration ---\n");
   config_write(&state, config_pass);
-  printf("\nConfiguration saved to %s.\n", CONFIG_FILE);
-  printf("You can now start the bot:\n");
-  printf("  Run './ircbot -p' to create a machine-bound password file, then './ircbot'\n");
-  printf("  Or run './ircbot' directly and enter the password when prompted.\n");
-  if (hub_managed) {
-    printf("\nThis bot joins IRC once its first hub sync brings the server pool.\n");
-    printf("If the hub has no servers yet, add one on the hub console first\n");
-    printf("('server add <host[:port]>').\n");
-  }
+  OPENSSL_cleanse(config_pass, MAX_PASS);
+  printf("\n");
+  cli_ok("wrote %s", CONFIG_FILE);
+  cli_kv("next", "./ircbot -p, then ./ircbot");
+  cli_note("-p writes a machine-bound password file, so the bot starts without typing "
+           "the password; ./ircbot alone asks for it.");
+  if (hub_managed)
+    cli_note("The bot joins IRC once its first hub sync brings the server pool: if the "
+             "hub has no servers yet, add one on its console ('server add <host[:port]>').");
+  printf("\n");
 
   /* Release the wizard's local state: frees the local_servers[] entry (the
    * strdup at the server_buf line) and the channel list, and cleanses key
@@ -916,12 +958,16 @@ static int run_identity(char *password) {
     char fp[KEY_FP_LEN + 1];
     crypto_key_fingerprint(st->self_pub, fp);
     if (pub_b64) {
-      printf("Bot nick:        %s\n", st->target_nick);
-      printf("Bot UUID:        %s\n", st->bot_uuid);
-      printf("Bot public key:  %s\n", pub_b64);
-      printf("Key fingerprint: %s\n", fp);
-      printf("Hub console:     bot add %s %s %s\n", st->target_nick,
-             st->bot_uuid, pub_b64);
+      cli_header("ircbot", BOT_VERSION, "identity");
+      printf("\n");
+      cli_skv("nick", "%s", st->target_nick);
+      cli_skv("uuid", "%s", st->bot_uuid);
+      cli_skv("public key", "%s", pub_b64);
+      cli_skv("fingerprint", "%s", fp);
+      cli_skv("on the hub", "paste this on ONE hub's console:");
+      printf("\n   bot add %s %s %s\n\n", st->target_nick, st->bot_uuid, pub_b64);
+      cli_note("Once is enough: every linked hub learns the bot through the mesh.");
+      cli_rule();
       free(pub_b64);
       rc = 0;
     }
@@ -976,25 +1022,30 @@ int main(int argc, char *argv[]) {
 
   if (do_passfile) {
     char pass1[MAX_PASS], pass2[MAX_PASS];
+    cli_header("ircbot", BOT_VERSION, "password file");
+    cli_note("%s holds the config password, bound to this machine, so the bot starts "
+             "without typing it.", PASS_FILE);
+    printf("\n");
     do {
-      get_password("Config Password", pass1, sizeof(pass1));
+      cli_ask_secret("password", pass1, sizeof(pass1));
       if (!pass1[0]) {
-        fprintf(stderr, "Password cannot be empty.\n");
+        cli_err("the password cannot be empty");
         return 1;
       }
-      get_password("Confirm Config Password", pass2, sizeof(pass2));
-      if (strcmp(pass1, pass2) != 0)
-        printf("Passwords do not match. Try again.\n");
+      cli_ask_secret("confirm", pass2, sizeof(pass2));
+      if (strcmp(pass1, pass2) != 0) cli_err("the passwords do not match: again");
     } while (strcmp(pass1, pass2) != 0);
 
     bool ok = passfile_create(PASS_FILE, pass1);
     memset(pass1, 0, sizeof(pass1));
     memset(pass2, 0, sizeof(pass2));
     if (ok) {
-      printf("Saved: %s (0600, machine-bound)\n", PASS_FILE);
+      cli_ok("wrote %s (0600, bound to this machine)", PASS_FILE);
+      cli_kv("next", "./ircbot");
+      printf("\n");
       return 0;
     }
-    fprintf(stderr, "Failed to create %s.\n", PASS_FILE);
+    cli_err("could not write %s", PASS_FILE);
     return 1;
   }
 

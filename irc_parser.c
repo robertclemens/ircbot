@@ -61,10 +61,10 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
 
     if (mode == 'o' && has_arg && current_arg) {
       // Check if it affects US
-      if (strcasecmp(current_arg, state->current_nick) == 0) {
+      if (irc_casecmp(current_arg, state->current_nick) == 0) {
         c->i_am_opped = adding;
         for (int k = 0; k < c->roster_count; k++) {
-          if (strcasecmp(c->roster[k].nick, state->current_nick) == 0) {
+          if (irc_casecmp(c->roster[k].nick, state->current_nick) == 0) {
             c->roster[k].is_op = adding;
             break;
           }
@@ -96,7 +96,7 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
       // Check if it affects SOMEONE ELSE in our roster
       else {
         for (int k = 0; k < c->roster_count; k++) {
-          if (strcasecmp(c->roster[k].nick, current_arg) == 0) {
+          if (irc_casecmp(c->roster[k].nick, current_arg) == 0) {
             c->roster[k].is_op = adding;
             log_message(L_DEBUG, state,
                         "[DEBUG] Roster update: %s is_op=%d in %s\n",
@@ -157,19 +157,22 @@ static bool channel_handle_mode_change(bot_state_t *state, const char *channel,
  *
  * Idempotent: updates actual_hostname(+ts) and calls hub_client_sync_hostmask
  * only when the value actually changes, so repeated WHOs never re-push. */
-static void update_own_hostmask(bot_state_t *state, const char *mask) {
+static bool update_own_hostmask(bot_state_t *state, const char *mask) {
   if (!mask || mask[0] == '\0')
-    return;
+    return false;
   if (strcmp(state->actual_hostname, mask) == 0)
-    return; // unchanged — nothing to push
+    return false; // unchanged — nothing to push
 
   snprintf(state->actual_hostname, sizeof(state->actual_hostname), "%s", mask);
   state->actual_hostname_ts = time(NULL);
   log_message(L_INFO, state, "[INFO] My hostmask is now: %s\n",
               state->actual_hostname);
 
-  if (state->hub_connected && state->hub_authenticated)
+  if (state->hub_connected && state->hub_authenticated) {
     hub_client_sync_hostmask(state);
+    return true;
+  }
+  return false;
 }
 
 /* Ask the server for our own DISPLAYED hostmask.  `WHO <nick>` is answered by
@@ -252,6 +255,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
   if (strcmp(command, "001") == 0) {
     state->status |= S_AUTHED;
     irc_note_registered(state); /* server accepted us: drop any ban hold */
+    join_gate_irc_up(state);    /* no JOIN until our mask is known (channel.c) */
     /* 001's first parameter is the nick the server actually registered us
      * under, which is not always the one we asked for (length truncation,
      * collision handling, a services rename).  Self-recognition in the 352
@@ -276,7 +280,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
          * registration switches current_nick to the fallback without a push,
          * and a hub link that came up before that has only the target. */
         bool renamed = strcmp(state->current_nick, srv_nick) != 0;
-        if (renamed || strcasecmp(srv_nick, state->target_nick) != 0) {
+        if (renamed || irc_casecmp(srv_nick, state->target_nick) != 0) {
           if (renamed)
             log_message(L_INFO, state,
                         "[INFO] Server registered me as %s (was %s)\n",
@@ -316,8 +320,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
        * NICK_RETRY_TIME (the server keeps our current nick) until the target
        * changes or the bot reconnects. */
       if (refused && strcmp(command, "432") == 0 &&
-          strcasecmp(refused, state->target_nick) == 0 &&
-          strcasecmp(state->nick_refused, refused) != 0) {
+          irc_casecmp(refused, state->target_nick) == 0 &&
+          irc_casecmp(state->nick_refused, refused) != 0) {
         snprintf(state->nick_refused, sizeof(state->nick_refused), "%s",
                  state->target_nick);
         log_message(L_INFO, state,
@@ -341,6 +345,17 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * (K-Lined)", "(Throttled: ...)", "(Ping timeout)".  Classified at
      * disconnect alongside any 465/463. */
     irc_note_refusal(state, irc_trailing(params), false);
+  } else if (strcmp(command, "303") == 0) {
+    /* RPL_ISON "<me> :nick nick ..." -- the link proof's question */
+    strtok_r(params, " ", &saveptr_irc);
+    char *rest = strtok_r(NULL, "", &saveptr_irc);
+    netproof_ison(state, rest);
+  } else if (strcmp(command, "312") == 0) {
+    /* RPL_WHOISSERVER "<me> <nick> <server> :info" -- a link proof answer */
+    strtok_r(params, " ", &saveptr_irc);
+    char *wnick = strtok_r(NULL, " ", &saveptr_irc);
+    char *wsrv = strtok_r(NULL, " ", &saveptr_irc);
+    netproof_whois_server(state, wnick, wsrv);
   } else if (strcmp(command, "474") == 0) {
     /* ERR_BANNEDFROMCHAN: ask the mesh to lift the ban that matches us.  The
      * hub supplies our hostmask, and the servicing bot removes only the ban
@@ -351,6 +366,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_OUT;
+        snprintf(c->out_why, sizeof(c->out_why), "banned");
         if (c->is_managed) {
           log_message(L_INFO, state,
                       "[474] Banned from %s, requesting unban\n", chan_name);
@@ -366,6 +382,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (chan_name) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
+        snprintf(c->out_why, sizeof(c->out_why), "key");
         c->status = C_OUT;
         if (c->is_managed) {
           log_message(L_INFO, state,
@@ -420,6 +437,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (chan_name)
       chan_unban_finish(state, chan_name);
+  } else if (strcmp(command, "471") == 0) {
+    /* ERR_CHANNELISFULL: +l reached; the join retry keeps trying, the
+     * reason is only shown (bot show). */
+    strtok_r(params, " ", &saveptr_irc);
+    char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
+    chan_t *c = chan_name ? channel_find(state, chan_name) : NULL;
+    if (c) snprintf(c->out_why, sizeof(c->out_why), "full");
   } else if (strcmp(command, "405") == 0) {
     /* ERR_TOOMANYCHANNELS: server channel limit reached; stop retrying this channel */
     strtok_r(params, " ", &saveptr_irc);
@@ -428,6 +452,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->join_disabled = true;
+        snprintf(c->out_why, sizeof(c->out_why), "disabled");
         log_message(L_INFO, state,
                     "[405] Channel limit reached, disabling join retry: %s\n",
                     chan_name);
@@ -439,6 +464,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     char *chan_name = strtok_r(NULL, " ", &saveptr_irc);
     if (chan_name) {
       chan_t *c = channel_find(state, chan_name);
+      if (c) snprintf(c->out_why, sizeof(c->out_why), "invite");
       if (c && c->is_managed) {
         log_message(L_INFO, state,
                     "[473] Channel %s is invite-only, requesting invite\n",
@@ -451,6 +477,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
   else if (strcmp(command, "MODE") == 0 && params) {
     char params_copy[MAX_BUFFER];
     snprintf(params_copy, sizeof(params_copy), "%s", params);
+    irc_untrail(params_copy); /* "MODE #c +o :nick" / "MODE #c :+nt" */
 
     char *target = strtok_r(params_copy, " ", &saveptr_irc);
     char *modes = strtok_r(NULL, " ", &saveptr_irc);
@@ -509,10 +536,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * gating this on channel_find would discard the one authoritative,
      * channel-independent source of our displayed mask.  This is the same
      * nick!ident@host every peer stores in trusted_bots[]. */
-    if (strcasecmp(nick, state->current_nick) == 0) {
+    if (irc_casecmp(nick, state->current_nick) == 0) {
       char self_mask[MAX_MASK_LEN];
       snprintf(self_mask, sizeof(self_mask), "%s!%s@%s", nick, ident, host);
-      update_own_hostmask(state, self_mask);
+      bool pushed = update_own_hostmask(state, self_mask);
+      join_gate_own_mask(state, self_mask, pushed);
     }
 
     chan_t *c = channel_find(state, chan_name);
@@ -523,8 +551,17 @@ void parser_handle_line(bot_state_t *state, char *line) {
      * Without this, the bot's own 352 entry can be silently dropped in
      * large channels (>MAX_ROSTER_SIZE users), leaving i_am_opped = false
      * and triggering spurious OP-REQs on the next 315. */
-    if (strcasecmp(nick, state->current_nick) == 0)
+    if (irc_casecmp(nick, state->current_nick) == 0) {
+      bool was = c->i_am_opped;
       c->i_am_opped = is_op;
+      /* an op whose MODE line we missed: act on it as on the MODE */
+      if (is_op && !was) {
+        c->op_request_pending = false;
+        c->op_request_retry_count = 0;
+        log_message(L_INFO, state, "[INFO] I am now OP in %s (seen in WHO)\n", c->name);
+        hub_client_grant_held_ops(state, c);
+      }
+    }
 
     {
       /* add, or replace the entry a JOIN already made (chanenf.c keeps the
@@ -621,12 +658,6 @@ void parser_handle_line(bot_state_t *state, char *line) {
       int random_index = rand() % helper_count;
       roster_entry_t *chosen_helper = helpers[random_index];
 
-      log_message(L_INFO, state,
-                  "[INFO] Found %d trusted ops. Randomly selected: %s. "
-                  "Sending OPME request (attempt %d).\n",
-                  helper_count, chosen_helper->nick,
-                  c->op_request_retry_count + 1);
-
       c->last_op_request_time = now;
       c->op_request_pending = true;
 
@@ -636,8 +667,10 @@ void parser_handle_line(bot_state_t *state, char *line) {
          * hub: the named-helper request, with the same wait for a result. */
         bool sent_via_hub = chan_own_op_request(state, c);
         if (sent_via_hub) {
-          log_message(L_DEBUG, state, "[OP-REQ] Asked the hub's election for ops in %s\n",
-                      c->name);
+          log_message(L_INFO, state,
+                      "[OP-REQ] Need ops in %s (%d trusted ops here): asked the hub's "
+                      "election (attempt %d)\n",
+                      c->name, helper_count, c->op_request_retry_count + 1);
         } else {
           log_message(L_DEBUG, state,
                       "[OP-REQ] Looking up UUID for helper: nick=%s hostmask=%s\n",
@@ -652,6 +685,9 @@ void parser_handle_line(bot_state_t *state, char *line) {
             log_message(L_DEBUG, state,
                         "[OP-REQ] hub_client_request_op returned: %d\n", sent_via_hub);
             if (sent_via_hub) {
+              log_message(L_INFO, state,
+                          "[OP-REQ] Need ops in %s: asked %s through the hub (attempt %d)\n",
+                          c->name, chosen_helper->nick, c->op_request_retry_count + 1);
               c->own_rid[OWN_REQ_OP][0] = '\0'; /* an older hub: no answer comes */
               c->own_sent[OWN_REQ_OP] = now;
             }
@@ -730,7 +766,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
 
         if (strncasecmp(ctcp_command, "DCC ", 4) == 0) {
           /* Only ever the reply to this bot's own passive offer (dcc.c). */
-          if (user && host && strcasecmp(dest, state->current_nick) == 0)
+          if (user && host && irc_casecmp(dest, state->current_nick) == 0)
             dcc_handle_ctcp(state, src_nuh, ctcp_command);
         } else if (strcasecmp(ctcp_command, "VERSION") == 0) {
           irc_printf(state, "NOTICE %s :\001VERSION %s\001\r\n", nick,
@@ -754,7 +790,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (nick && user && host && dest && message) {
       if (dest[0] == '#' || dest[0] == '&') {
         chanflood_on_text(state, dest, nick, user, host, message);
-      } else if (strcasecmp(dest, state->current_nick) == 0 &&
+      } else if (irc_casecmp(dest, state->current_nick) == 0 &&
                  message[0] != '\001') {
         char src_nuh[MAX_MASK_LEN];
         /* services (NickServ, ChanServ, ...) answer every command with a
@@ -786,13 +822,13 @@ void parser_handle_line(bot_state_t *state, char *line) {
     }
 
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
-    if (join_mask_ok && nick && strcasecmp(nick, state->current_nick) == 0 &&
+    if (join_mask_ok && nick && irc_casecmp(nick, state->current_nick) == 0 &&
         strchr(join_mask, '!') && strchr(join_mask, '@'))
       update_own_hostmask(state, join_mask);
 
     /* Our own JOIN: current_nick is what the server knows us as (001, NICK).
      * Whoever holds target_nick while we run on a fallback is someone else. */
-    if (nick && strcasecmp(nick, state->current_nick) == 0) {
+    if (nick && irc_casecmp(nick, state->current_nick) == 0) {
       /* the channel is the first word (extended-join adds account and
        * realname after it) */
       char *chan_name = (*params == ':') ? params + 1 : params;
@@ -808,6 +844,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
         c->status = C_OUT;
       } else if (c) {
         c->status = C_IN;
+        c->out_why[0] = '\0';
         c->roster_count = 0;
         c->i_am_opped = false;
         channel_live_reset(c);
@@ -830,7 +867,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
     }
   } else if (strcmp(command, "PART") == 0 && prefix) {
     char *nick = strtok_r(prefix, "!", &saveptr_irc);
-    if (nick && strcasecmp(nick, state->current_nick) != 0) {
+    if (nick && irc_casecmp(nick, state->current_nick) != 0) {
       char pchan[MAX_CHAN];
       const char *pc = (*params == ':') ? params + 1 : params;
       size_t pl = strcspn(pc, " ");
@@ -841,7 +878,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       }
     }
     /* our own PART only (see JOIN) */
-    if (nick && strcasecmp(nick, state->current_nick) == 0) {
+    if (nick && irc_casecmp(nick, state->current_nick) == 0) {
       // Extract channel name (may have : prefix or trailing reason)
       char *chan_name = (*params == ':') ? params + 1 : params;
       char *space = strchr(chan_name, ' ');
@@ -864,10 +901,11 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (chan_name && kicked_nick)
       chanenf_on_kick(state, chan_name, prefix, kicked_nick);
     if (chan_name && kicked_nick &&
-        strcasecmp(kicked_nick, state->current_nick) == 0) {
+        irc_casecmp(kicked_nick, state->current_nick) == 0) {
       chan_t *c = channel_find(state, chan_name);
       if (c) {
         c->status = C_OUT;
+        snprintf(c->out_why, sizeof(c->out_why), "kicked");
         c->i_am_opped = false;
         channel_live_reset(c);
       }
@@ -882,8 +920,8 @@ void parser_handle_line(bot_state_t *state, char *line) {
     if (old_nick && new_nick)
       chanenf_on_nick(state, old_nick, new_nick);
     bool me = old_nick && new_nick &&
-              (strcasecmp(old_nick, state->current_nick) == 0 ||
-               (state->overlong_nick[0] && strcasecmp(old_nick, state->overlong_nick) == 0));
+              (irc_casecmp(old_nick, state->current_nick) == 0 ||
+               (state->overlong_nick[0] && irc_casecmp(old_nick, state->overlong_nick) == 0));
     if (me && strlen(new_nick) >= sizeof(state->current_nick)) {
       irc_nick_overlong(state, new_nick); /* 10b: never clipped */
     } else if (me) {
@@ -907,7 +945,7 @@ void parser_handle_line(bot_state_t *state, char *line) {
       request_own_hostmask(state);
 
       state->nick_change_pending = false;
-      if (strcasecmp(state->current_nick, state->target_nick) == 0) {
+      if (irc_casecmp(state->current_nick, state->target_nick) == 0) {
         state->nick_generation_attempt = 0;
       }
     }

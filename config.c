@@ -295,8 +295,9 @@ bool config_load(bot_state_t *state, const char *password,
         }
         break;
 
-      case 'N': /* N|/S|: the hub's server pool, cached (pool.c) */
+      case 'N': /* N|/S|/R|: the hub's server pool and our order, cached (pool.c) */
       case 'S':
+      case 'R':
         if (!pool_ingest_line(state, type, data))
           log_message(L_INFO, state, "[CFG] Ignoring invalid %c| line\n", type);
         break;

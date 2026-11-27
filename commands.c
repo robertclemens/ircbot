@@ -684,7 +684,7 @@ static void a2_dispatch(bot_state_t *state, const char *nick,
 void commands_handle_private_message(bot_state_t *state, const char *nick,
                                      const char *user, const char *host,
                                      const char *dest, char *message) {
-  if (strcasecmp(dest, state->current_nick) != 0)
+  if (irc_casecmp(dest, state->current_nick) != 0)
     return;
 
   char user_host[256];
@@ -979,7 +979,7 @@ static void list_match(bot_state_t *state, const char *nick, const char *arg1) {
       long long bot_ts = (long long)tb->ts;
       char bot_nick[MAX_NICK];
       auth_trusted_bot_nick(tb, bot_nick);
-      if (strcasecmp(bot_nick, arg1) != 0) continue;
+      if (irc_casecmp(bot_nick, arg1) != 0) continue;
       /* Found a matching bot */
       char ts_buf[48];
       if (bot_ts == 0) {
@@ -1981,7 +1981,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           return;
         }
       }
-      if (strcasecmp(state->target_nick, arg2) == 0) {
+      if (irc_casecmp(state->target_nick, arg2) == 0) {
         irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use by this bot.\r\n",
                    nick, arg2);
         return;
@@ -1989,7 +1989,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       for (int i = 0; i < state->trusted_bot_count; i++) {
         char bnick[MAX_NICK];
         auth_trusted_bot_nick(&state->trusted_bots[i], bnick);
-        if (strcasecmp(bnick, arg2) == 0) {
+        if (irc_casecmp(bnick, arg2) == 0) {
           irc_printf(state, "PRIVMSG %s :Error: Name '%s' already in use by a bot.\r\n",
                      nick, arg2);
           return;
@@ -1999,7 +1999,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
        * admin/oper names are account names and keep the rule above. */
       bool cn_found = false;
       /* Case 1: this bot's own target nick */
-      if (strcasecmp(state->target_nick, arg1) == 0) {
+      if (irc_casecmp(state->target_nick, arg1) == 0) {
         if (!is_rfc_nick(arg2)) {
           say_bad_rfc_nick(state, nick, arg2);
           return;
@@ -2034,7 +2034,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           trusted_bot_t *tb = &state->trusted_bots[i];
           char bnick[MAX_NICK];
           auth_trusted_bot_nick(tb, bnick);
-          if (strcasecmp(bnick, arg1) != 0) continue;
+          if (irc_casecmp(bnick, arg1) != 0) continue;
           if (!is_rfc_nick(arg2)) {
             say_bad_rfc_nick(state, nick, arg2);
             return;
@@ -2217,7 +2217,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         bool bad = false;
         for (char *t = strtok_r(work, ",", &save); t && !bad; t = strtok_r(NULL, ",", &save)) {
           bool dup = false;
-          for (int k = 0; k < nchans; k++) dup |= strcasecmp(chans[k], t) == 0;
+          for (int k = 0; k < nchans; k++) dup |= irc_casecmp(chans[k], t) == 0;
           if (dup) continue;
           if (!access_chan_name_ok(t) || nchans >= 16) bad = true;
           else snprintf(chans[nchans++], MAX_CHAN, "%s", t);
@@ -2768,10 +2768,11 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
         updater_check_for_updates(state, nick);
     } else if (strcasecmp(command, "+hub") == 0) {
       /* +hub <host:port> <pubkey-b64>
-       * The pubkey is the hub's pinned long-term Ed25519 public key — either
-       * 44-char base64 (raw 32-byte Ed25519) or 88-char base64 (combined
-       * 64-byte Curve25519 pubkey, first 32 bytes used; same as the hub's
-       * hub_public.b64). Per-hub keypairs mean the pinned key is REQUIRED:
+       * The pubkey is the hub's 88-char combined Curve25519 public key (what
+       * ./irchub -id and hub show print); the first 32 bytes, its Ed25519
+       * half, are pinned.  The 44-char Ed25519 half alone is still taken:
+       * it is what the bot's own h| lines hold, so a decrypted .ircbot.cnf
+       * can be restored from. Per-hub keypairs mean the pinned key is REQUIRED:
        * the bot refuses to connect to a hub it can't authenticate. This
        * folds in the old 'sethubpub' behaviour per hub. */
       if (!arg1 || !arg2) {
@@ -2803,9 +2804,9 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
       unsigned char *dec = base64_decode(arg2, &dec_len);
       if (!dec || (dec_len != 32 && dec_len != HUB_KEY_RAW_LEN)) {
         irc_printf(state,
-                   "PRIVMSG %s :Error: pubkey must be base64 of a 32-byte "
-                   "Ed25519 key (44 chars) or 64-byte combined Curve25519 "
-                   "key (88 chars).\r\n", nick);
+                   "PRIVMSG %s :Error: pubkey must be the hub's 88-char public "
+                   "key (./irchub -id or hub show on that hub), or the 44-char "
+                   "key of an h| line in this bot's config.\r\n", nick);
         if (dec) free(dec);
         return;
       }
@@ -3242,7 +3243,7 @@ static void dispatch_user_command(bot_state_t *state, const char *nick,
           irc_printf(
               state,
               "PRIVMSG %s :Syntax: +hub <host:port> <pubkey-b64> - Add a hub "
-              "and pin its Ed25519 pubkey (44 or 88 char base64: the public "
+              "and pin its public key (the 88-char public "
               "key line of hub show in that hub's console, or of ./irchub -id "
               "on its host).\r\n",
               nick);

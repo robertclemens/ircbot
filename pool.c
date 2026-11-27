@@ -8,6 +8,7 @@
 #include "bot.h"
 
 #include <openssl/evp.h>
+#include <openssl/rand.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -44,9 +45,19 @@ static bool split_ts(const char *data, char *value, size_t cap, time_t *ts) {
 }
 
 bool pool_ingest_line(bot_state_t *state, char tag, const char *data) {
-  char value[POOL_S_LINE_MAX > POOL_N_LINE_MAX ? POOL_S_LINE_MAX : POOL_N_LINE_MAX];
+  static char value[POOL_R_LINE_MAX]; /* the longest of N|/S|/R| */
   time_t ts;
   if (!split_ts(data, value, sizeof(value), &ts)) return false;
+  if (tag == 'R') {
+    /* The hubs' server order for this bot: computed, so no stamp to compare;
+     * the newest one wins (pool_clear leaves it: an order outlives a pool
+     * refresh that does not carry one). */
+    static pool_order_t o;
+    if (!pool_order_parse(value, &o)) return false;
+    state->pool_order = o;
+    state->pool_order_known = true;
+    return true;
+  }
   if (tag == 'N') {
     pool_net_t n;
     if (!pool_net_parse(value, &n)) return false;
@@ -87,6 +98,14 @@ int pool_format_lines(const bot_state_t *state, char *buf, size_t cap) {
     if (w < 0 || (size_t)w >= cap - off) return -1;
     off += (size_t)w;
   }
+  if (state->pool_order_known) {
+    static char ov[POOL_R_LINE_MAX];
+    pool_order_t o = state->pool_order;
+    if (pool_order_format(&o, ov, sizeof(ov)) < 0) return -1;
+    int w = snprintf(buf + off, cap - off, "R|%s|0\n", ov);
+    if (w < 0 || (size_t)w >= cap - off) return -1;
+    off += (size_t)w;
+  }
   return (int)off;
 }
 
@@ -108,8 +127,8 @@ static void entry_dial(const pool_srv_t *s, char *out, size_t cap) {
   snprintf(out, cap, "%s:%d", s->host, s->port);
 }
 
-/* Rendezvous score of (this bot, entry): every bot orders the pool its own
- * way, so bots that see no load view yet still spread out. */
+/* Rendezvous score of (this bot, entry): with no R| order from the hubs,
+ * every bot orders the pool its own way, so bots still spread out. */
 static uint64_t hrw(const char *bot_uuid, const char *entry_uuid) {
   char in[160];
   int n = snprintf(in, sizeof(in), "%s|%s", bot_uuid, entry_uuid);
@@ -132,25 +151,47 @@ static int ranked_cmp(const void *a, const void *b) {
   return strcmp(x->e->s.uuid, y->e->s.uuid);
 }
 
-/* Eligible entries in this bot's HRW order. */
+/* Eligible entries in this bot's dial order: the hubs' R| order first (a
+ * higher score for an earlier place), then any entry the order does not name
+ * yet (a server added since) in HRW order behind it. */
 static int pool_ranked(const bot_state_t *state, ranked_t *out, int max) {
   int n = 0;
   for (int i = 0; i < state->pool_count && n < max; i++) {
     const pool_entry_t *e = &state->pool[i];
     if (!entry_eligible(e)) continue;
     out[n].e = e;
-    out[n].score = hrw(state->bot_uuid, e->s.uuid);
+    int at = -1;
+    for (int k = 0; state->pool_order_known && k < state->pool_order.n && at < 0; k++)
+      if (strcmp(state->pool_order.ids[k], e->s.uuid) == 0) at = k;
+    out[n].score = at >= 0 ? UINT64_MAX - (uint64_t)at : hrw(state->bot_uuid, e->s.uuid) >> 1;
     n++;
   }
   qsort(out, (size_t)n, sizeof(out[0]), ranked_cmp);
   return n;
 }
 
-/* Slot i's identity across rebuilds: its pool uuid, else its dial string. */
-static bool slot_same(const char *uuid_a, const char *dial_a, const char *uuid_b,
-                      const char *dial_b) {
-  if (uuid_a[0] || uuid_b[0]) return strcmp(uuid_a, uuid_b) == 0;
-  return dial_a && dial_b && strcasecmp(dial_a, dial_b) == 0;
+static void link_send(bot_state_t *state);
+
+static int dial_count(char *const *list, int n, const char *dial) {
+  int c = 0;
+  for (int i = 0; i < n; i++)
+    if (list[i] && strcasecmp(list[i], dial) == 0) c++;
+  return c;
+}
+
+/* Slot identity across rebuilds: two pool slots by uuid, two local slots by
+ * dial string.  A local slot and a pool slot (the hub's first pool landing
+ * while the bot is on, or dialing, a local s| server) are the same server
+ * only when their host:port is identical and names exactly one slot on each
+ * side; anything else is no match, never a guess. */
+static bool slot_same(const char *uuid_a, const char *dial_a, char *const *list_a, int n_a,
+                      const char *uuid_b, const char *dial_b, char *const *list_b,
+                      int n_b) {
+  if (!dial_a || !dial_b) return false;
+  if (uuid_a[0] && uuid_b[0]) return strcmp(uuid_a, uuid_b) == 0;
+  if (strcasecmp(dial_a, dial_b) != 0) return false;
+  if (!uuid_a[0] && !uuid_b[0]) return true;
+  return dial_count(list_a, n_a, dial_a) == 1 && dial_count(list_b, n_b, dial_b) == 1;
 }
 
 /* A 2.5.3 bot's first start on 2.5.4 (and any hub-managed bot that has never
@@ -173,7 +214,12 @@ void servers_rebuild(bot_state_t *state) {
     memcpy(old_uuid[i], state->dial_uuid[i], sizeof(old_uuid[i]));
     old_block[i] = state->server_blocks[i];
   }
-  int live_old = (state->status & S_CONNECTED) ? state->irc_server_idx : -1;
+  /* The live link's slot: registered, or still dialing / registering (an R|
+   * order can land then, and the slot must survive it). */
+  int live_old = ((state->status & S_CONNECTED) || state->server_fd >= 0) ? state->irc_server_idx : -1;
+  /* A pending `jump <server>` names a slot: follow its server, not its index. */
+  int jump_old = state->jump_slot1 - 1;
+  if (jump_old >= old_n) jump_old = -1;
 
   int n = 0;
   bool local = pool_local_fallback(state);
@@ -212,14 +258,16 @@ void servers_rebuild(bot_state_t *state) {
   state->server_list[n] = NULL;
   state->server_count = n;
 
-  int live_new = -1;
+  int live_new = -1, jump_new = -1;
   for (int i = 0; i < n; i++) {
     memset(&state->server_blocks[i], 0, sizeof(server_block_t));
     for (int j = 0; j < old_n; j++) {
-      if (!slot_same(state->dial_uuid[i], state->server_list[i], old_uuid[j], old_dial[j]))
+      if (!slot_same(state->dial_uuid[i], state->server_list[i], state->server_list, n,
+                     old_uuid[j], old_dial[j], old_dial, old_n))
         continue;
       state->server_blocks[i] = old_block[j];
       if (j == live_old) live_new = i;
+      if (j == jump_old) jump_new = i;
       break;
     }
   }
@@ -230,7 +278,15 @@ void servers_rebuild(bot_state_t *state) {
    * just has no slot for a refusal to land on. */
   state->irc_server_idx = live_new;
   state->current_server_index = live_new >= 0 ? live_new + 1 : 0;
-  state->jump_slot1 = 0; /* slots moved: a pending jump by index is void */
+  state->jump_slot1 = jump_new + 1; /* 0 when its server is gone */
+  /* A local slot matched to its pool entry: the hub learns which entry the
+   * link is on (it was told "-" at the dial). */
+  if (live_new >= 0 && state->dial_uuid[live_new][0] &&
+      strcmp(state->irc_link_entry, state->dial_uuid[live_new]) != 0) {
+    snprintf(state->irc_link_entry, sizeof(state->irc_link_entry), "%s",
+             state->dial_uuid[live_new]);
+    link_send(state);
+  }
 
   bool idle = state->hub_count > 0 && n == 0;
   if (idle && !state->pool_idle) {
@@ -431,8 +487,7 @@ bool servers_add(bot_state_t *state, const char *hostport, char *err, size_t err
     snprintf(err, errcap, "the pool is full");
     return false;
   }
-  /* From the entry it revives (its view load), or all zero: never stack
-   * garbage in load_up/load_conn. */
+  /* From the entry it revives, or all zero: never stack garbage. */
   pool_entry_t next = e ? *e : (pool_entry_t){0};
   next.s = s;
   next.s.weight = e ? e->s.weight : 1;
@@ -526,6 +581,123 @@ static void netcheck_report(bot_state_t *state, const char *kind) {
   hub_client_send_server_report(state, payload);
 }
 
+static void netcheck_hold(bot_state_t *state);
+
+/* ---- the link proof ------------------------------------------------------
+ * The server says another NETWORK=, but it may be ours misconfigured.  Ask
+ * the server which trusted bots it can see (ISON); up to NETPROOF_PEERS of
+ * them get a sealed ~B2 NETPROBE <nonce> over IRC.  A peer on a verified
+ * server WHOISes us and answers NETPROBE-OK <nonce> <server it sees us on>:
+ * our own server name there proves the two servers are one network (a relay
+ * bridge can forward messages, but our client is in no WHOIS on a network it
+ * is not on).  Proven: used for this connection, reported "linked"; never
+ * persisted.  Not within NETPROOF_WAIT: the hold, as before. */
+static bool netproof_start(bot_state_t *state) {
+  if (state->hub_count == 0 || state->trusted_bot_count == 0) return false;
+  unsigned char rnd[NETPROOF_NONCE_HEX / 2];
+  if (RAND_bytes(rnd, sizeof(rnd)) != 1) return false;
+  for (size_t i = 0; i < sizeof(rnd); i++)
+    snprintf(state->netproof_nonce + 2 * i, 3, "%02x", rnd[i]);
+  char line[400] = "ISON";
+  size_t len = 4;
+  for (int i = 0; i < state->trusted_bot_count; i++) {
+    char nick[MAX_NICK];
+    auth_trusted_bot_nick(&state->trusted_bots[i], nick);
+    size_t nl = strlen(nick);
+    if (!nl || len + 1 + nl >= sizeof(line)) continue;
+    line[len++] = ' ';
+    memcpy(line + len, nick, nl + 1);
+    len += nl;
+  }
+  if (len == 4) return false;
+  state->net_check = 3;
+  state->netproof_deadline = time(NULL) + NETPROOF_WAIT;
+  log_message(L_INFO, state, "[POOL] %s says NETWORK=%s, expected %s: proving the link "
+              "through other bots\n", state->actual_server_name[0] ? state->actual_server_name : "server",
+              state->isup.network, state->pool_net.name);
+  irc_printf(state, "%s\r\n", line);
+  return true;
+}
+
+/* 303 RPL_ISON while proving: the trusted bots this server sees. */
+void netproof_ison(bot_state_t *state, char *nicks) {
+  if (state->net_check != 3 || !nicks) return;
+  char *sp = NULL;
+  int sent = 0;
+  for (char *n = strtok_r(nicks, " :", &sp); n && sent < NETPROOF_PEERS;
+       n = strtok_r(NULL, " :", &sp)) {
+    if (irc_casecmp(n, state->current_nick) == 0) continue;
+    bot_comms_send_command_irc(state, n, "NETPROBE %s", state->netproof_nonce);
+    sent++;
+  }
+  if (!sent)
+    log_message(L_INFO, state, "[POOL] No trusted bot is visible from %s to prove it\n",
+                state->actual_server_name);
+}
+
+/* Our own server's NETWORK= is the pool's (not merely proven linked: a
+ * proof never vouches for another). */
+static bool netcheck_ok_here(const bot_state_t *state) {
+  return state->isup.network[0] && state->pool_known &&
+         pool_net_matches(&state->pool_net, state->isup.network);
+}
+
+static bool nonce_ok(const char *s) {
+  if (!s || strlen(s) != NETPROOF_NONCE_HEX) return false;
+  for (const char *p = s; *p; p++)
+    if (!((*p >= '0' && *p <= '9') || (*p >= 'a' && *p <= 'f'))) return false;
+  return true;
+}
+
+/* A peer asks (over IRC, sealed): WHOIS it, if our own server is verified. */
+void netproof_probe(bot_state_t *state, const char *from_nick, const char *nonce) {
+  if (!from_nick || !nonce_ok(nonce) || state->net_check != 2 || !netcheck_ok_here(state))
+    return;
+  time_t now = time(NULL);
+  int slot = -1;
+  for (int i = 0; i < NETPROOF_PEND; i++) {
+    if (state->netprobe_pend[i].until && now > state->netprobe_pend[i].until)
+      memset(&state->netprobe_pend[i], 0, sizeof(state->netprobe_pend[i]));
+    if (!state->netprobe_pend[i].until && slot < 0) slot = i;
+  }
+  if (slot < 0) return; /* busy: the prober asks others too */
+  snprintf(state->netprobe_pend[slot].nonce, sizeof(state->netprobe_pend[slot].nonce), "%s",
+           nonce);
+  snprintf(state->netprobe_pend[slot].prober, sizeof(state->netprobe_pend[slot].prober), "%s",
+           from_nick);
+  state->netprobe_pend[slot].until = now + NETPROOF_WAIT;
+  irc_printf(state, "WHOIS %s\r\n", from_nick);
+}
+
+/* 312 RPL_WHOISSERVER: answer a pending probe with the server we see. */
+void netproof_whois_server(bot_state_t *state, const char *nick, const char *server) {
+  if (!nick || !server) return;
+  for (int i = 0; i < NETPROOF_PEND; i++) {
+    if (!state->netprobe_pend[i].until ||
+        irc_casecmp(state->netprobe_pend[i].prober, nick) != 0)
+      continue;
+    bot_comms_send_command_irc(state, nick, "NETPROBE-OK %s %s", state->netprobe_pend[i].nonce,
+                               server);
+    memset(&state->netprobe_pend[i], 0, sizeof(state->netprobe_pend[i]));
+  }
+}
+
+/* A peer's answer: our own server, seen from a verified one, is the proof. */
+void netproof_ok(bot_state_t *state, const char *nonce, const char *server, const char *by) {
+  if (state->net_check != 3 || !nonce_ok(nonce) || strcmp(nonce, state->netproof_nonce) != 0)
+    return;
+  if (!server || strcasecmp(server, state->actual_server_name) != 0) {
+    log_message(L_INFO, state, "[POOL] %s sees me on %s, not %s: no proof\n", by,
+                server ? server : "?", state->actual_server_name);
+    return;
+  }
+  state->net_check = 2;
+  state->netproof_nonce[0] = '\0';
+  log_message(L_INFO, state, "[POOL] %s says NETWORK=%s; linked to %s (proven by %s): using it\n",
+              state->actual_server_name, state->isup.network, state->pool_net.name, by);
+  netcheck_report(state, "linked");
+}
+
 static void netcheck_decide(bot_state_t *state) {
   const char *net = state->isup.network;
   const bool learned = state->pool_known && state->pool_net.name[0];
@@ -537,6 +709,7 @@ static void netcheck_decide(bot_state_t *state) {
       snprintf(state->pool_net.net_id, sizeof(state->pool_net.net_id), "%s", POOL_DEFAULT_NET);
       snprintf(state->pool_net.label, sizeof(state->pool_net.label), "%s", POOL_DEFAULT_NET);
       snprintf(state->pool_net.name, sizeof(state->pool_net.name), "%s", net);
+      state->pool_net.pace_gap = POOL_PACE_GAP_DEFAULT;
       state->pool_net_ts = time(NULL);
       state->pool_known = true;
       log_message(L_INFO, state, "[POOL] Network learned: %s\n", net);
@@ -548,7 +721,15 @@ static void netcheck_decide(bot_state_t *state) {
     if (net[0]) netcheck_report(state, "ok");
     return;
   }
-  /* The wrong network, or none named once one is known: off at once. */
+  /* The wrong network, or none named once one is known: prove the link
+   * first when trusted bots can vouch for it, else off at once. */
+  if (net[0] && netproof_start(state)) return;
+  netcheck_hold(state);
+}
+
+/* Off this server for WRONGNET_HOLD: its NETWORK= is not ours, unproven. */
+static void netcheck_hold(bot_state_t *state) {
+  const char *net = state->isup.network;
   int idx = state->irc_server_idx;
   log_message(L_INFO, state, "[POOL] %s says NETWORK=%s, expected %s: wrong network, "
               "disconnecting\n", state->actual_server_name[0] ? state->actual_server_name : "server",
@@ -570,6 +751,12 @@ void netcheck_end_of_motd(bot_state_t *state) {
 
 void netcheck_tick(bot_state_t *state) {
   if (state->net_check == 1 && time(NULL) >= state->net_check_deadline) netcheck_decide(state);
+  if (state->net_check == 3 && time(NULL) >= state->netproof_deadline) {
+    log_message(L_INFO, state, "[POOL] No trusted bot proved %s linked within %d s\n",
+                state->actual_server_name, NETPROOF_WAIT);
+    state->netproof_nonce[0] = '\0';
+    netcheck_hold(state);
+  }
 }
 
 /* ---- the IRC link state to the hub (CMD_BOT_IRC_LINK) ------------------ */
@@ -577,8 +764,11 @@ void netcheck_tick(bot_state_t *state) {
 static void link_send(bot_state_t *state) {
   if (!state->irc_link[0]) return;
   char payload[sizeof(((bot_state_t *)0)->irc_link_sent)];
-  snprintf(payload, sizeof(payload), "%s|%s|%s|", POOL_DEFAULT_NET,
-           state->irc_link_entry[0] ? state->irc_link_entry : "-", state->irc_link);
+  /* 4th field: the server's 005 NETWORK= (bot show), "-" until it is in;
+   * a hub reading three fields stops before it. */
+  snprintf(payload, sizeof(payload), "%s|%s|%s|%s", POOL_DEFAULT_NET,
+           state->irc_link_entry[0] ? state->irc_link_entry : "-", state->irc_link,
+           state->isup.network[0] ? state->isup.network : "-");
   if (strcmp(payload, state->irc_link_sent) == 0) return;
   if (hub_client_send_irc_link(state, payload))
     snprintf(state->irc_link_sent, sizeof(state->irc_link_sent), "%s", payload);
@@ -592,53 +782,76 @@ void pool_link_note(bot_state_t *state, const char *link, const char *entry) {
 
 void pool_link_resend(bot_state_t *state) { link_send(state); }
 
-/* ---- load-aware pick (plan §5.3) --------------------------------------- */
+/* ---- the pick: the order, held slots out, the pace gap ------------------ */
 
-void pool_view_apply(bot_state_t *state, const char *payload, int len) {
-  for (int i = 0; i < state->pool_count; i++) state->pool[i].load_up = state->pool[i].load_conn = 0;
-  const char *p = payload, *end = payload + len;
-  while (p < end) {
-    const char *nl = memchr(p, '\n', (size_t)(end - p));
-    size_t ll = nl ? (size_t)(nl - p) : (size_t)(end - p);
-    char line[POOL_UUID_LEN + 48];
-    if (ll < sizeof(line) && ll > 2 && p[0] == 'E' && p[1] == '|') {
-      memcpy(line, p, ll);
-      line[ll] = '\0';
-      char uuid[POOL_UUID_LEN + 1];
-      int up = 0, conn = 0;
-      char tail;
-      if (sscanf(line + 2, "%36[0-9a-f-]|%d|%d%c", uuid, &up, &conn, &tail) == 3 && up >= 0 &&
-          conn >= 0 && up <= 100000 && conn <= 100000) {
-        pool_entry_t *e = pool_find(state, uuid);
-        if (e) { e->load_up = up; e->load_conn = conn; }
-      }
-    }
-    if (!nl) break;
-    p = nl + 1;
-  }
-  state->pool_view_at = time(NULL);
-}
-
+/* The first slot to dial: slots are in dial order (servers_rebuild).  A slot
+ * held by a ban or throttle is out; one dialed less than the R| pace gap ago
+ * is out too (soonest says when it is back); one whose last attempt failed
+ * lately goes after every other one.  -1 = nothing to dial now. */
 int pool_pick_slot(bot_state_t *state, time_t now, time_t *soonest) {
-  int best = -1, best_over = -1;
-  long long best_cost = 0, best_over_cost = 0;
+  int gap = state->pool_order_known ? state->pool_order.gap : 0;
+  int lagging = -1;
   *soonest = 0;
   for (int i = 0; i < state->server_count; i++) {
     const server_block_t *b = &state->server_blocks[i];
     if (b->kind == SB_BANNED_PERM) continue;
-    if (b->kind != SB_NONE && b->until > now) {
-      if (*soonest == 0 || b->until < *soonest) *soonest = b->until;
+    time_t back = 0;
+    if (b->kind != SB_NONE && b->until > now) back = b->until;
+    if (gap > 0 && b->last_dial && now - b->last_dial < gap && b->last_dial + gap > back)
+      back = b->last_dial + gap;
+    if (back) {
+      if (*soonest == 0 || back < *soonest) *soonest = back;
       continue;
     }
-    const pool_entry_t *e = pool_entry_of_slot(state, i);
-    int load = e ? e->load_up + e->load_conn : 0;
-    int w = e && e->s.weight > 0 ? e->s.weight : 1;
-    long long cost = (long long)load * 1000 / w; /* slots are in HRW order: first wins a tie */
-    /* a slot whose last attempt failed lately goes behind every other one */
-    if (b->last_fail && now - b->last_fail < POOL_FAIL_AVOID) cost += 1000000000LL;
-    bool over = e && e->s.max > 0 && load >= e->s.max;
-    if (!over && (best < 0 || cost < best_cost)) { best = i; best_cost = cost; }
-    if (over && (best_over < 0 || cost < best_over_cost)) { best_over = i; best_over_cost = cost; }
+    if (b->last_fail && now - b->last_fail < POOL_FAIL_AVOID) {
+      if (lagging < 0) lagging = i;
+      continue;
+    }
+    return i;
   }
-  return best >= 0 ? best : best_over;
+  return lagging;
+}
+
+/* ---- server rebalance force (CMD_BOT_MOVE) ------------------------------ */
+
+/* bot move <bot> server <s>: go to that pool entry now (one bot, so no
+ * burst); the R| order may move it back at its next rebalance. */
+bool pool_move_to_entry(bot_state_t *state, const char *entry) {
+  if (state->hub_count == 0 || !entry || !entry[0]) return false;
+  int to = -1;
+  for (int i = 0; i < state->server_count && to < 0; i++)
+    if (strcmp(state->dial_uuid[i], entry) == 0 &&
+        state->server_blocks[i].kind != SB_BANNED_PERM)
+      to = i;
+  int cur = state->irc_server_idx;
+  if (to < 0 || ((state->status & S_CONNECTED) && cur == to)) return false;
+  log_message(L_INFO, state, "[POOL] Moving to %s (bot move from the hub console)\n",
+              state->server_list[to]);
+  state->current_server_index = to;
+  state->jump_slot1 = to + 1;
+  if (state->status & S_CONNECTED) {
+    irc_printf(state, "QUIT :Moving servers\r\n");
+    irc_disconnect(state);
+  }
+  return true;
+}
+
+bool pool_move_to_first(bot_state_t *state) {
+  if (state->hub_count == 0 || !state->pool_order_known || !(state->status & S_CONNECTED))
+    return false;
+  int cur = state->irc_server_idx;
+  const char *on = cur >= 0 && cur < state->server_count ? state->dial_uuid[cur] : "";
+  /* the first entry of the order this bot can dial */
+  int to = -1;
+  for (int k = 0; k < state->pool_order.n && to < 0; k++)
+    for (int i = 0; i < state->server_count && to < 0; i++)
+      if (strcmp(state->dial_uuid[i], state->pool_order.ids[k]) == 0) to = i;
+  if (to < 0 || strcmp(on, state->dial_uuid[to]) == 0) return false;
+  log_message(L_INFO, state, "[POOL] Rebalance: moving to %s, the first server of my order\n",
+              state->server_list[to]);
+  state->current_server_index = to;
+  state->jump_slot1 = to + 1;
+  irc_printf(state, "QUIT :Rebalancing servers\r\n");
+  irc_disconnect(state);
+  return true;
 }

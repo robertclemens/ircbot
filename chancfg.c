@@ -371,7 +371,7 @@ static cfg_ban_t *ban_find(bot_state_t *state, const char *chan,
                            const char *mask) {
   for (int i = 0; i < state->cfg_ban_count; i++) {
     cfg_ban_t *b = &state->cfg_bans[i];
-    if (strcasecmp(b->chan, chan) == 0 && strcasecmp(b->mask, mask) == 0)
+    if (irc_casecmp(b->chan, chan) == 0 && irc_casecmp(b->mask, mask) == 0)
       return b;
   }
   return NULL;
@@ -382,7 +382,7 @@ static bool ban_active_room(const bot_state_t *state, const char *chan) {
   int n = 0;
   for (int i = 0; i < state->cfg_ban_count; i++) {
     const cfg_ban_t *b = &state->cfg_bans[i];
-    if (b->active && strcasecmp(b->chan, chan) == 0)
+    if (b->active && irc_casecmp(b->chan, chan) == 0)
       n++;
   }
   if (strcmp(chan, "*") == 0)
@@ -546,7 +546,7 @@ int chancfg_bans_for(const bot_state_t *state, const char *chan,
     const cfg_ban_t *b = &state->cfg_bans[i];
     if (!b->active || (b->expires > 0 && b->expires <= now))
       continue;
-    if (strcmp(b->chan, "*") == 0 || strcasecmp(b->chan, chan) == 0)
+    if (strcmp(b->chan, "*") == 0 || irc_casecmp(b->chan, chan) == 0)
       out[n++] = b;
   }
   return n;
@@ -666,8 +666,8 @@ const cfg_ban_t *chancfg_ban_get(const bot_state_t *state, const char *chan,
                                  const char *mask) {
   for (int i = 0; i < state->cfg_ban_count; i++) {
     const cfg_ban_t *b = &state->cfg_bans[i];
-    if (b->active && strcasecmp(b->chan, chan) == 0 &&
-        strcasecmp(b->mask, mask) == 0)
+    if (b->active && irc_casecmp(b->chan, chan) == 0 &&
+        irc_casecmp(b->mask, mask) == 0)
       return b;
   }
   return NULL;

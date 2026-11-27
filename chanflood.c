@@ -67,9 +67,81 @@ static bool src_nick(const char *nuh, char *out, size_t out_size) {
 
 static const roster_entry_t *roster_by_nick(const chan_t *c, const char *nick) {
   for (int i = 0; i < c->roster_count; i++)
-    if (strcasecmp(c->roster[i].nick, nick) == 0)
+    if (irc_casecmp(c->roster[i].nick, nick) == 0)
       return &c->roster[i];
   return NULL;
+}
+
+/* A bot was just added to (or updated in) the trusted list: its joins seen
+ * before the hub told us who it is were counted as a stranger's.  Forget the
+ * join windows of its host in every channel, so a newly linked bot's own
+ * autojoin never trips join flood against the next stranger from that host
+ * (every bot of one host joining at once), and lift any automatic ban this
+ * bot already placed on it (a join flood's own grace, JOIN_FLOOD_GRACE_MS,
+ * normally drops the kick+ban before it is sent). */
+/* "nick!user" of nick!user@host into out; false without '!' and '@'. */
+static bool src_nu(const char *nuh, char *out, size_t out_size) {
+  const char *bang = strchr(nuh, '!'), *at = bang ? strchr(bang, '@') : NULL;
+  size_t n = at ? (size_t)(at - nuh) : 0;
+  if (!at || n == 0 || n >= out_size)
+    return false;
+  memcpy(out, nuh, n);
+  out[n] = '\0';
+  return true;
+}
+
+/* A trusted bot's mask became known: take its own joins off its host's join
+ * window, and only those.  Every other user on that host keeps their count
+ * (flood windows are per host, so clones cannot hop nicks).  A bot whose
+ * joins were not recorded (the table was full) is subtracted nothing: its own
+ * early join stays counted, which the 5 s grace and the exact-mask ban lift
+ * still cover. */
+void chanflood_trusted(bot_state_t *state, const char *mask) {
+  char host[FLOOD_HOST_MAX], nu[MAX_MASK_LEN];
+  if (!src_host(mask, host, sizeof(host)) || !src_nu(mask, nu, sizeof(nu)))
+    return;
+  for (chan_t *c = state->chanlist; c; c = c->next) {
+    if (!c->flood)
+      continue;
+    for (int i = 0; i < MAX_FLOOD_TRACK; i++) {
+      flood_src_t *f = &c->flood[i];
+      if (!f->host[0] || strcmp(f->host, host) != 0)
+        continue;
+      for (int k = 0; k < FLOOD_JOIN_CONTRIB; k++) {
+        flood_contrib_t *j = &f->jc[k];
+        if (!j->nu[0] || irc_casecmp(j->nu, nu) != 0)
+          continue;
+        flood_window_t *w = &f->w[FL_JOIN];
+        w->count -= j->count;
+        if (w->count <= 0)
+          *w = (flood_window_t){0, 0};
+        memset(j, 0, sizeof(*j));
+      }
+    }
+  }
+  chanenf_trusted_lift(state, mask);
+}
+
+/* Note nuh's join in its host slot's open window (FLOOD_JOIN_CONTRIB: a new
+ * contributor past the table is not recorded). */
+static void join_contrib(flood_src_t *slot, const char *nuh) {
+  char nu[MAX_MASK_LEN];
+  if (!src_nu(nuh, nu, sizeof(nu)))
+    return;
+  flood_contrib_t *free_j = NULL;
+  for (int k = 0; k < FLOOD_JOIN_CONTRIB; k++) {
+    flood_contrib_t *j = &slot->jc[k];
+    if (j->nu[0] && irc_casecmp(j->nu, nu) == 0) {
+      j->count++;
+      return;
+    }
+    if (!j->nu[0] && !free_j)
+      free_j = j;
+  }
+  if (free_j) {
+    snprintf(free_j->nu, sizeof(free_j->nu), "%s", nu);
+    free_j->count = 1;
+  }
 }
 
 bool chanflood_count_at(bot_state_t *state, chan_t *c, const char *nuh,
@@ -121,8 +193,19 @@ bool chanflood_count_at(bot_state_t *state, chan_t *c, const char *nuh,
   slot->last_ms = now_ms;
   if (victim_auth)
     slot->victim_auth |= (uint8_t)(1u << kind);
-  if (!flood_window_hit(&slot->w[kind], n, s, now_ms))
+  if (kind == FL_JOIN) {
+    /* the window restarts on this event: its contributors go with it */
+    const flood_window_t *w = &slot->w[FL_JOIN];
+    if (w->count <= 0 || now_ms - w->start_ms >= (long long)s * 1000)
+      memset(slot->jc, 0, sizeof(slot->jc));
+  }
+  if (!flood_window_hit(&slot->w[kind], n, s, now_ms)) {
+    if (kind == FL_JOIN)
+      join_contrib(slot, nuh);
     return false;
+  }
+  if (kind == FL_JOIN)
+    memset(slot->jc, 0, sizeof(slot->jc)); /* tripped: the window is closed */
   if (auth_victim_out)
     *auth_victim_out = (slot->victim_auth & (1u << kind)) != 0;
   slot->victim_auth &= (uint8_t)~(1u << kind);
@@ -151,7 +234,11 @@ static void trip(bot_state_t *state, chan_t *c, const char *nuh,
   else
     ban_step = off >= 2;
   int job = ban_step ? JOB_BAN : (op_flood ? JOB_OP : JOB_KICK);
-  const char *act = ban_step ? "kick+ban" : (op_flood ? "deop" : "kick");
+  char join_act[48];
+  snprintf(join_act, sizeof(join_act), "kick+ban unless trusted within %d s",
+           JOIN_FLOOD_GRACE_MS / 1000);
+  const char *act = kind == FL_JOIN ? join_act
+                    : ban_step ? "kick+ban" : (op_flood ? "deop" : "kick");
   char reason[BAN_REASON_MAX + 1];
   snprintf(reason, sizeof(reason), "%s flood", KIND_NAME[kind]);
 
@@ -162,7 +249,8 @@ static void trip(bot_state_t *state, chan_t *c, const char *nuh,
               rank < 0 ? " (not opped or not in the deal: logged only)" : "");
   bool queued;
   if (ban_step)
-    queued = chanenf_request_ban(state, c->name, nuh, reason, true);
+    queued = chanenf_request_ban(state, c->name, nuh, reason, true,
+                                 kind == FL_JOIN ? JOIN_FLOOD_GRACE_MS : 0);
   else if (op_flood)
     queued = chanenf_request_deop(state, c->name, nick, reason);
   else

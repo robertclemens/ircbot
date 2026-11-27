@@ -302,7 +302,7 @@ static char *take_protection(bot_state_t *state, size_t *out_len) {
     mode_item_t it;
     char *nxt = q->q[lane][(q->head[lane] + n) % MAX_SENDQ];
     if (!mode_item_parse(nxt, &it) ||
-        strcasecmp(it.chan, first.chan) != 0)
+        irc_casecmp(it.chan, first.chan) != 0)
       break;
     size_t add = 2 + strlen(it.arg) + 1;
     if (est + add > 400)

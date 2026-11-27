@@ -90,12 +90,12 @@ static bool nuh_nick(const char *nuh, char *out, size_t out_size) {
 }
 
 static bool is_me(const bot_state_t *state, const char *nick) {
-  return nick && strcasecmp(nick, state->current_nick) == 0;
+  return nick && irc_casecmp(nick, state->current_nick) == 0;
 }
 
 static int rindex_of(const chan_t *c, const char *nick) {
   for (int i = 0; i < c->roster_count; i++)
-    if (strcasecmp(c->roster[i].nick, nick) == 0)
+    if (irc_casecmp(c->roster[i].nick, nick) == 0)
       return i;
   return -1;
 }
@@ -107,7 +107,7 @@ static roster_entry_t *rfind(chan_t *c, const char *nick) {
 
 static void rremove(chan_t *c, const char *nick) {
   for (int i = 0; i < c->roster_count; i++) {
-    if (strcasecmp(c->roster[i].nick, nick) == 0) {
+    if (irc_casecmp(c->roster[i].nick, nick) == 0) {
       memmove(&c->roster[i], &c->roster[i + 1],
               (size_t)(c->roster_count - i - 1) * sizeof(c->roster[0]));
       c->roster_count--;
@@ -195,7 +195,7 @@ bool chanenf_chan_nuh_authorised(bot_state_t *state, const chan_t *c,
     return true;
   int ri = c ? rindex_of(c, nick) : -1;
   const roster_entry_t *e = ri < 0 ? NULL : &c->roster[ri];
-  if (e && strcasecmp(e->hostmask, nuh) == 0)
+  if (e && irc_casecmp(e->hostmask, nuh) == 0)
     return entry_authorised(state, c->name, e);
   return auth_is_authorised(state, nuh, c ? c->name : NULL);
 }
@@ -222,7 +222,7 @@ bool chanenf_roster_set(chan_t *c, const char *nick, const char *hostmask,
 
 static bool live_has_ban(const chan_t *c, const char *mask) {
   for (int i = 0; i < c->ban_count; i++)
-    if (strcasecmp(c->bans[i].mask, mask) == 0)
+    if (irc_casecmp(c->bans[i].mask, mask) == 0)
       return true;
   return false;
 }
@@ -511,7 +511,7 @@ static ban_track_t *track_get(bot_state_t *state, const char *chan,
         free_slot = t;
       continue;
     }
-    if (strcasecmp(t->chan, chan) == 0 && strcasecmp(t->mask, mask) == 0)
+    if (irc_casecmp(t->chan, chan) == 0 && irc_casecmp(t->mask, mask) == 0)
       return t;
     if (!oldest || t->last_match < oldest->last_match)
       oldest = t;
@@ -755,6 +755,107 @@ static int act_job(job_act_t a) {
   }
 }
 
+/* Remember an automatic ban (oldest entry goes when full). */
+static void auto_ban_note(bot_state_t *state, const chan_t *c, const char *nuh,
+                          const char *mask) {
+  auto_ban_t *slot = NULL;
+  for (int i = 0; i < AUTO_BAN_TRACK; i++) {
+    auto_ban_t *a = &state->auto_bans[i];
+    if (a->chan[0] && irc_casecmp(a->chan, c->name) == 0 && strcmp(a->mask, mask) == 0) {
+      slot = a; /* the same ban again: refresh */
+      break;
+    }
+    if (!slot || !a->chan[0] || (slot->chan[0] && a->set_ms < slot->set_ms))
+      slot = a;
+  }
+  snprintf(slot->chan, sizeof(slot->chan), "%s", c->name);
+  snprintf(slot->nuh, sizeof(slot->nuh), "%s", nuh);
+  snprintf(slot->mask, sizeof(slot->mask), "%s", mask);
+  slot->set_ms = now_ms();
+  long bt = chancfg_get(state, c, CS_BANTIME);
+  slot->expires = bt > 0 ? time(NULL) + (time_t)bt * 60 : 0;
+}
+
+/* -b of an automatic ban this bot placed, by a bot (by_bot: the unban a
+ * trusted bot's 474 asked for): lifted because it caught that trusted bot,
+ * the offender is banned again with the next safe narrower mask -- the bot's
+ * mask is known now, so chanenf_auto_ban_mask narrows past it -- keeping the
+ * original expiry.  Lifted by a person, or its B| record deleted (an admin's
+ * `ban del`), or for any other reason: forgotten, as before. */
+static void reban_narrowed(bot_state_t *state, chan_t *c, const char *lifted, bool by_bot) {
+  for (int i = 0; i < AUTO_BAN_TRACK; i++) {
+    auto_ban_t *a = &state->auto_bans[i];
+    if (!a->chan[0] || irc_casecmp(a->chan, c->name) != 0 || strcmp(a->mask, lifted) != 0)
+      continue;
+    bool deleted = false;
+    for (int k = 0; k < state->cfg_ban_count && !deleted; k++) {
+      const cfg_ban_t *b = &state->cfg_bans[k];
+      deleted = !b->active && strcmp(b->mask, lifted) == 0 &&
+                (strcmp(b->chan, "*") == 0 || irc_casecmp(b->chan, c->name) == 0);
+    }
+    if (!by_bot || deleted) {
+      memset(a, 0, sizeof(*a));
+      return;
+    }
+    const char *caught = NULL;
+    for (int t = 0; t < state->trusted_bot_count && !caught; t++)
+      if (auth_wildcard_match(lifted, state->trusted_bots[t].mask))
+        caught = state->trusted_bots[t].mask;
+    if (!caught || (a->expires && time(NULL) >= a->expires) || !c->i_am_opped) {
+      memset(a, 0, sizeof(*a));
+      return;
+    }
+    char mask[BAN_MASK_MAX + 1];
+    if (!chanenf_auto_ban_mask(state, c, a->nuh, mask, sizeof(mask)) ||
+        strcmp(mask, lifted) == 0) {
+      log_message(L_INFO, state,
+                  "[BAN] %s in %s caught trusted bot %s; no narrower mask is safe for %s\n",
+                  lifted, c->name, caught, a->nuh);
+      memset(a, 0, sizeof(*a));
+      return;
+    }
+    log_message(L_INFO, state,
+                "[BAN] %s in %s caught trusted bot %s: banning %s with %s instead\n", lifted,
+                c->name, caught, a->nuh, mask);
+    chancfg_bot_ban(state, c->name, lifted, 0, NULL, NULL, true);
+    if (a->expires)
+      chancfg_bot_ban(state, c->name, mask, a->expires, "", "auto ban (narrowed)", false);
+    char who[80];
+    if (ban_set(state, c, mask, "auto ban (narrowed)", who, sizeof(who)) == BS_SENT)
+      snprintf(a->mask, sizeof(a->mask), "%s", mask);
+    else
+      memset(a, 0, sizeof(*a));
+    return;
+  }
+}
+
+void chanenf_trusted_lift(bot_state_t *state, const char *mask) {
+  if (!mask || !mask[0])
+    return;
+  long long t = now_ms();
+  for (int i = 0; i < AUTO_BAN_TRACK; i++) {
+    auto_ban_t *a = &state->auto_bans[i];
+    if (!a->chan[0])
+      continue;
+    if (t - a->set_ms > AUTO_BAN_KEEP_MS) {
+      memset(a, 0, sizeof(*a));
+      continue;
+    }
+    if (!auth_wildcard_match(mask, a->nuh))
+      continue;
+    auto_ban_t copy = *a;
+    memset(a, 0, sizeof(*a));
+    log_message(L_INFO, state,
+                "[BAN] Lifting my ban %s in %s: %s is a trusted bot\n", copy.mask,
+                copy.chan, copy.nuh);
+    /* no-op unless this bot wrote a timed B| record for it */
+    chancfg_bot_ban(state, copy.chan, copy.mask, 0, NULL, NULL, true);
+    chan_t *c = channel_find(state, copy.chan);
+    if (c && c->status == C_IN)
+      act_unban(state, c, copy.mask, "trusted bot");
+  }
+}
+
 static void exec_ban_nuh(bot_state_t *state, chan_t *c, const char *nuh,
                          const char *reason) {
   char nick[MAX_MEMBER_NICK];
@@ -764,6 +865,12 @@ static void exec_ban_nuh(bot_state_t *state, chan_t *c, const char *nuh,
   if ((e && entry_authorised(state, c->name, e)) ||
       chanenf_chan_nuh_authorised(state, c, nuh))
     return;
+  /* a live ban already covers it (the holder's, when this is a backup): no
+   * second one, even if the mask computed now differs (a trust that arrived
+   * meanwhile narrows the type; the placer's reban_narrowed handles that) */
+  for (int i = 0; i < c->ban_count; i++)
+    if (auth_wildcard_match(c->bans[i].mask, nuh))
+      return;
   char mask[BAN_MASK_MAX + 1];
   if (!chanenf_auto_ban_mask(state, c, nuh, mask, sizeof(mask))) {
     log_message(L_INFO, state,
@@ -778,7 +885,12 @@ static void exec_ban_nuh(bot_state_t *state, chan_t *c, const char *nuh,
     chancfg_bot_ban(state, c->name, mask, time(NULL) + (time_t)bt * 60, "",
                     reason, false);
   }
-  act_ban(state, c, mask, reason && reason[0] ? reason : "auto ban");
+  char who[80];
+  /* noted only when this bot sent it: a backup that finds it live is not
+   * its placer and leaves the lifting to the one that is */
+  if (ban_set(state, c, mask, reason && reason[0] ? reason : "auto ban", who,
+              sizeof(who)) == BS_SENT)
+    auto_ban_note(state, c, nuh, mask);
 }
 
 static void exec_mode(bot_state_t *state, chan_t *c) {
@@ -842,14 +954,15 @@ static void job_exec(bot_state_t *state, chan_t *c, job_act_t act,
 }
 
 /* Hand a piece of work to the election: run it now when this bot holds the
- * job, otherwise queue it for backup-index x JOB_STEP_MS.  false = this bot
+ * job, otherwise queue it for backup-index x JOB_STEP_MS (+ hold_ms; a held
+ * job waits even for the holder).  false = this bot
  * takes no part (not opped / not in the deal) or the queue is full. */
-static bool job_submit(bot_state_t *state, chan_t *c, job_act_t act,
-                       const char *target, const char *reason) {
+static bool job_submit_held(bot_state_t *state, chan_t *c, job_act_t act,
+                            const char *target, const char *reason, int hold_ms) {
   int rank = chanenf_deal_rank(state, c, act_job(act));
   if (rank < 0)
     return false;
-  if (rank == 0) {
+  if (rank == 0 && hold_ms <= 0) {
     job_exec(state, c, act, target, reason);
     return true;
   }
@@ -861,8 +974,8 @@ static bool job_submit(bot_state_t *state, chan_t *c, job_act_t act,
         slot = j;
       continue;
     }
-    if (j->act == act && strcasecmp(j->chan, c->name) == 0 &&
-        strcasecmp(j->target, target) == 0)
+    if (j->act == act && irc_casecmp(j->chan, c->name) == 0 &&
+        irc_casecmp(j->target, target) == 0)
       return true; /* already waiting */
   }
   if (!slot) {
@@ -877,14 +990,20 @@ static bool job_submit(bot_state_t *state, chan_t *c, job_act_t act,
   snprintf(slot->target, sizeof(slot->target), "%s", target);
   snprintf(slot->reason, sizeof(slot->reason), "%s", reason ? reason : "");
   slot->created_ms = now_ms();
+  slot->hold_ms = hold_ms > 0 ? hold_ms : 0;
   return true;
+}
+
+static bool job_submit(bot_state_t *state, chan_t *c, job_act_t act,
+                       const char *target, const char *reason) {
+  return job_submit_held(state, c, act, target, reason, 0);
 }
 
 /* Forget this channel's queued (backup) work of one kind. */
 static void jobs_drop(bot_state_t *state, const chan_t *c, job_act_t act) {
   for (int i = 0; i < MAX_PENDING_JOBS; i++) {
     pending_job_t *j = &state->jobs[i];
-    if (j->used && j->act == act && strcasecmp(j->chan, c->name) == 0)
+    if (j->used && j->act == act && irc_casecmp(j->chan, c->name) == 0)
       j->used = false;
   }
 }
@@ -908,7 +1027,7 @@ static void jobs_tick(bot_state_t *state) {
     }
     /* the limit job comes from each bot's own sweep, up to a sweep apart:
      * its backups give the holder one whole sweep first */
-    long long wait = (long long)rank * JOB_STEP_MS;
+    long long wait = (long long)rank * JOB_STEP_MS + j->hold_ms;
     if (j->act == JA_LIMIT)
       wait += (long long)ENF_SWEEP_SECS * 1000;
     if (t - j->created_ms < wait)
@@ -942,15 +1061,15 @@ bool chanenf_request_deop(bot_state_t *state, const char *chan, const char *nick
 }
 
 bool chanenf_request_ban(bot_state_t *state, const char *chan, const char *nuh,
-                         const char *reason, bool kick_too) {
+                         const char *reason, bool kick_too, int hold_ms) {
   chan_t *c = chan ? channel_find(state, chan) : NULL;
   char nick[MAX_MEMBER_NICK];
   if (!c || c->status != C_IN || !nuh || strlen(nuh) >= MAX_MASK_LEN ||
       !nuh_nick(nuh, nick, sizeof(nick)) || !valid_nick(state, nick))
     return false;
-  bool ok = job_submit(state, c, JA_BAN_NUH, nuh, reason);
+  bool ok = job_submit_held(state, c, JA_BAN_NUH, nuh, reason, hold_ms);
   if (kick_too)
-    job_submit(state, c, JA_KICK, nick, reason);
+    job_submit_held(state, c, JA_KICK, nick, reason, hold_ms);
   return ok;
 }
 
@@ -996,8 +1115,8 @@ bool chanenf_admin_ban(bot_state_t *state, const char *chan, const char *mask,
   bool sticky = false;
   for (int i = 0; i < state->cfg_ban_count; i++) {
     const cfg_ban_t *b = &state->cfg_bans[i];
-    if (b->active && strcasecmp(b->mask, mask) == 0 &&
-        (strcmp(b->chan, "*") == 0 || strcasecmp(b->chan, c->name) == 0)) {
+    if (b->active && irc_casecmp(b->mask, mask) == 0 &&
+        (strcmp(b->chan, "*") == 0 || irc_casecmp(b->chan, c->name) == 0)) {
       if (b->reason[0]) snprintf(reason, sizeof(reason), "%s", b->reason);
       sticky = strchr(b->flags, 's') != NULL;
       break;
@@ -1041,7 +1160,7 @@ static void revenge(bot_state_t *state, chan_t *c, const char *prefix) {
   if (chanenf_offence(state, c->name, prefix) <= 1)
     job_submit(state, c, JA_DEOP, nick, "revenge");
   else
-    chanenf_request_ban(state, c->name, prefix, "revenge", true);
+    chanenf_request_ban(state, c->name, prefix, "revenge", true, 0);
 }
 
 /* --- roster events --------------------------------------------------------- */
@@ -1115,7 +1234,7 @@ void chanenf_on_nick(bot_state_t *state, const char *old_nick,
                     (int)sizeof(mask)) {
       /* a stale entry under the new name -- but a case-only change (Bob ->
        * bob) names the same entry, which is renamed in place */
-      if (strcasecmp(old_nick, new_nick) != 0)
+      if (irc_casecmp(old_nick, new_nick) != 0)
         rremove(c, new_nick);
       e = rfind(c, old_nick);
       if (e) {
@@ -1221,6 +1340,9 @@ static void on_mode(bot_state_t *state, const char *chan, const char *prefix,
         job_submit(state, c, JA_DEHALF, e->nick, "bitch");
     } else if (ch == 'b') {
       bans_changed = true;
+      if (!adding && a && safe_token(a, BAN_MASK_MAX))
+        reban_narrowed(state, c, a,
+                       src_me || (user_src && auth_trusted_bot_by_host(state, prefix) != NULL));
       if (adding && a && rev && !revenged && src_unauth && !src_me &&
           safe_token(a, BAN_MASK_MAX) && ban_hits_authorised(state, c, a)) {
         revenged = true;
@@ -1394,7 +1516,7 @@ static void ban_sweep(bot_state_t *state, chan_t *c, time_t now) {
     const cfg_ban_t *b = &state->cfg_bans[i];
     if (b->active && !(b->expires > 0 && b->expires <= now))
       continue;
-    if (strcmp(b->chan, "*") != 0 && strcasecmp(b->chan, c->name) != 0)
+    if (strcmp(b->chan, "*") != 0 && irc_casecmp(b->chan, c->name) != 0)
       continue;
     if (live_has_ban(c, b->mask)) {
       char why[16];

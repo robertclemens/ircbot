@@ -376,7 +376,7 @@ void dcc_handle_ctcp(bot_state_t *state, const char *user_host,
   dcc_session_t *s = NULL;
   for (int i = 0; i < DCC_MAX_SESSIONS && !s; i++)
     if (state->dcc[i].phase == DCC_OFFERED &&
-        strcasecmp(state->dcc[i].user_host, user_host) == 0)
+        irc_casecmp(state->dcc[i].user_host, user_host) == 0)
       s = &state->dcc[i];
   if (!shape_ok || !s) {
     /* Never a connection the bot did not offer: no listening, no chats or

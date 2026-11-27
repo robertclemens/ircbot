@@ -285,7 +285,7 @@ static int irc_pick_server(bot_state_t *state, time_t now) {
 
   time_t soonest = 0;
   if (state->hub_count > 0 && !pool_local_fallback(state)) {
-    /* Hub-managed: by load on the pool's entries (plan §5.3). */
+    /* Hub-managed: the first slot in dial order that is free (pool.c). */
     int pick = pool_pick_slot(state, now, &soonest);
     if (pick >= 0) {
       state->irc_blocked_logged = false;
@@ -370,6 +370,7 @@ void irc_disconnect(bot_state_t *state) {
   isupport_reset(state);
   state->net_check = 0; /* the next link is checked afresh */
   pool_link_note(state, "down", NULL);
+  join_gate_irc_down(state);
   channel_list_reset_status(state);
 }
 
@@ -649,21 +650,40 @@ void irc_connect(bot_state_t *state) {
       state->irc_server_idx < state->server_count && state->last_irc_attempt &&
       state->server_blocks[state->irc_server_idx].last_fail < state->last_irc_attempt)
     state->server_blocks[state->irc_server_idx].last_fail = attempt_now;
-  /* Hub-managed: a random 0..5 s before each dial, so bots that dropped
-   * together do not all land on the server that was least loaded a moment
-   * ago (plan §5.3). */
-  /* Just started: the cached pool is there before the hub link, but the load
-   * on it is not.  Wait a little for the first view, so a restart does not
-   * pick blind -- but only while a hub link is coming up or up: a bot whose
-   * hub dial failed dials IRC at once (a mass restart with the hubs down must
-   * not take every bot off IRC together, test_80 restart storm). */
+  /* Hub-managed: hub first, then IRC.  After start the bot waits up to
+   * HUB_SYNC_WAIT for its hub's config (channels, bans, trusted bots, the
+   * pool and its R| server order, all current before the first JOIN) --
+   * only while a hub link is coming up or up, or the round's next hub is
+   * about to be dialed: a bot whose hubs all fail must not stay off IRC
+   * (test_80 restart storm). */
   if (state->hub_count > 0 && !once && jumped < 0 && state->server_count > 0 &&
-      !state->pool_view_at && attempt_now - state->bot_start_time < POOL_VIEW_WAIT &&
-      (state->hub_connecting || state->hub_connected))
+      !state->hub_cfg_synced &&
+      attempt_now - state->bot_start_time < HUB_SYNC_WAIT &&
+      (state->hub_connecting || state->hub_connected || state->hub_retry_delay == 0))
     return;
+  /* Before each dial: with an order, the bot's turn -- slot k of m bots of
+   * this host that share a first server dials only at a second t with
+   * t % (m * gap) == k * gap (one host, one clock: two of them never dial
+   * closer than the gap); alone in its group (most bots) at once.  With no
+   * order: while a hub link is up or coming up (an older hub sends none;
+   * a new one's is on its way) the old 0..5 s jitter; with no hub link at
+   * all a random 0..29 s, so bots of one host that start together do not
+   * burst one server.  A new order clears a wait drawn before it. */
   if (state->hub_count > 0 && !once && jumped < 0 && state->server_count > 0) {
     if (!state->pool_dial_at) {
-      state->pool_dial_at = attempt_now + (time_t)(rand() % POOL_DIAL_JITTER);
+      int wait = 0;
+      if (state->pool_order_known) {
+        const pool_order_t *o = &state->pool_order;
+        if (o->slots > 1 && o->gap > 0) {
+          long long period = (long long)o->slots * o->gap;
+          long long at = (long long)attempt_now % period;
+          wait = (int)(((long long)o->slot * o->gap - at + period) % period);
+        }
+      } else {
+        wait = state->hub_connected || state->hub_connecting ? rand() % POOL_DIAL_JITTER
+                                                             : rand() % POOL_NO_ORDER_JITTER;
+      }
+      state->pool_dial_at = attempt_now + (time_t)wait;
       if (state->pool_dial_at > attempt_now) return;
     } else if (attempt_now < state->pool_dial_at) {
       return;
@@ -692,6 +712,7 @@ void irc_connect(bot_state_t *state) {
   /* Counted as on this entry before the dial, so other bots picking now see
    * it (plan §5.3). */
   pool_link_note(state, "connecting", pick >= 0 ? state->dial_uuid[pick] : "");
+  if (pick >= 0) state->server_blocks[pick].last_dial = attempt_now; /* the pace gap */
   state->last_irc_attempt = attempt_now;
   state->irc_refusal[0] = '\0';
   state->irc_refusal_ban = false;
@@ -1010,6 +1031,13 @@ void irc_check_status(bot_state_t *state) {
       state->last_hub_connect_attempt = last_attempt;
       // Note: the main loop's hub_client_connect() will handle the retry logic
     }
+  } else if (state->hub_count > 0 && state->hub_connected && !state->hub_authenticated &&
+             hub_client_awaiting_challenge() &&
+             now - state->last_hub_connect_attempt > HUB_DIAL_TIMEOUT &&
+             !hub_client_data_waiting(state)) {
+    log_message(L_INFO, state, "[HUB] No challenge from the hub in %d s — dropping the link\n",
+                HUB_DIAL_TIMEOUT);
+    hub_client_disconnect(state);
   } else if (state->hub_count > 0 && state->hub_fd != -1 && !state->hub_authenticated &&
              now - state->last_hub_connect_attempt > HUB_AUTH_TIMEOUT &&
              !hub_client_data_waiting(state)) {
@@ -1069,8 +1097,8 @@ void irc_check_status(bot_state_t *state) {
     channel_manager_check_joins(state);
     
     if (!state->nick_change_pending) {
-      if (strcasecmp(state->current_nick, state->target_nick) != 0 &&
-          strcasecmp(state->nick_refused, state->target_nick) != 0) {
+      if (irc_casecmp(state->current_nick, state->target_nick) != 0 &&
+          irc_casecmp(state->nick_refused, state->target_nick) != 0) {
         if (now - state->nick_release_time > NICK_TAKE_TIME) {
           if (now - state->last_nick_attempt > NICK_RETRY_TIME) {
             log_message(L_INFO, state,

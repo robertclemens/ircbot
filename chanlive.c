@@ -14,9 +14,46 @@
 
 /* --- 005 (RPL_ISUPPORT) -------------------------------------------------- */
 
+static casemap_t g_casemap = CASEMAP_RFC1459;
+
+casemap_t irc_casemap(void) { return g_casemap; }
+
+int irc_tolower(int c) {
+  c = (unsigned char)c;
+  if (c >= 'A' && c <= 'Z') return c + ('a' - 'A');
+  if (g_casemap == CASEMAP_ASCII) return c;
+  switch (c) {
+  case '[': return '{';
+  case ']': return '}';
+  case '\\': return '|';
+  case '~': return g_casemap == CASEMAP_RFC1459 ? '^' : c;
+  default: return c;
+  }
+}
+
+int irc_ncasecmp(const char *a, const char *b, size_t n) {
+  for (size_t i = 0; i < n; i++) {
+    int ca = irc_tolower(a[i]), cb = irc_tolower(b[i]);
+    if (ca != cb) return ca - cb;
+    if (ca == 0) return 0;
+  }
+  return 0;
+}
+
+int irc_casecmp(const char *a, const char *b) { return irc_ncasecmp(a, b, (size_t)-1); }
+
+void irc_untrail(char *params) {
+  if (!params) return;
+  char *p = params[0] == ':' ? params : strstr(params, " :");
+  if (!p) return;
+  if (*p == ' ') p++;
+  memmove(p, p + 1, strlen(p + 1) + 1);
+}
+
 void isupport_reset(bot_state_t *state) {
   isupport_t *is = &state->isup;
   memset(is, 0, sizeof(*is));
+  g_casemap = CASEMAP_RFC1459;
   is->modes = ISUPPORT_MODES_DEFAULT;
   is->nicklen = NICKLEN_DEFAULT;
   snprintf(is->prefix_modes, sizeof(is->prefix_modes), "ov");
@@ -73,6 +110,12 @@ static void isupport_token(bot_state_t *state, const char *tok) {
      * none sent */
     is->network[0] = '\0';
     if (!neg && pool_net_name_ok(val)) snprintf(is->network, sizeof(is->network), "%s", val);
+    return;
+  }
+  if (nl == 11 && strncmp(tok, "CASEMAPPING", 11) == 0) {
+    if (neg || strcmp(val, "rfc1459") == 0) g_casemap = CASEMAP_RFC1459;
+    else if (strcmp(val, "strict-rfc1459") == 0) g_casemap = CASEMAP_STRICT;
+    else g_casemap = CASEMAP_ASCII; /* ascii, rfc8265, rfc7613, unknown */
     return;
   }
   if (nl == 5 && strncmp(tok, "MODES", 5) == 0) {
@@ -250,7 +293,7 @@ void chanlive_ban_add(bot_state_t *state, chan_t *c, const char *mask,
   if (ml == 0 || ml >= MAX_MASK_LEN)
     return; /* never store a clipped mask */
   for (int i = 0; i < c->ban_count; i++)
-    if (strcasecmp(c->bans[i].mask, mask) == 0)
+    if (irc_casecmp(c->bans[i].mask, mask) == 0)
       return;
   if (c->ban_count >= isupport_ban_cap(state)) {
     if (!c->ban_overflow_logged) {
@@ -284,7 +327,7 @@ void chanlive_ban_add(bot_state_t *state, chan_t *c, const char *mask,
 
 void chanlive_ban_del(chan_t *c, const char *mask) {
   for (int i = 0; i < c->ban_count; i++) {
-    if (strcasecmp(c->bans[i].mask, mask) == 0) {
+    if (irc_casecmp(c->bans[i].mask, mask) == 0) {
       free(c->bans[i].mask);
       c->bans[i] = c->bans[--c->ban_count];
       return;
@@ -301,7 +344,7 @@ void chanlive_ban_list_end(chan_t *c) {
 
 static roster_entry_t *roster_by_nick(chan_t *c, const char *nick) {
   for (int i = 0; i < c->roster_count; i++)
-    if (strcasecmp(c->roster[i].nick, nick) == 0)
+    if (irc_casecmp(c->roster[i].nick, nick) == 0)
       return &c->roster[i];
   return NULL;
 }
@@ -404,6 +447,8 @@ void chanlive_numeric(bot_state_t *state, const char *command, char *params) {
   if (strlen(params) >= sizeof(buf))
     return; /* no real 324/329/367 is this long */
   memcpy(buf, params, strlen(params) + 1);
+  if (strcmp(command, "324") == 0 || strcmp(command, "329") == 0 || strcmp(command, "367") == 0)
+    irc_untrail(buf); /* "324 me #c :+nt" */
   char *rest = NULL;
   chan_t *c = numeric_chan(state, buf, &rest);
   if (!c || !rest)
@@ -503,7 +548,7 @@ bool chan_member_authorised(const bot_state_t *state, const chan_t *c,
   if (found)
     *found = false;
   for (int i = 0; i < c->roster_count; i++) {
-    if (strcasecmp(c->roster[i].nick, nick) == 0) {
+    if (irc_casecmp(c->roster[i].nick, nick) == 0) {
       if (found)
         *found = true;
       return auth_is_authorised(state, c->roster[i].hostmask, c->name);

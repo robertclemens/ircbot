@@ -91,7 +91,7 @@ LDFLAGS += -lssl -lcrypto
 endif
 
 # Source files
-SRCS = main.c cfg_delta.c pool_rec.c pool.c elf_needs.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c sendq.c chanlive.c chancfg.c glob_overlap.c chanenf.c chanflood.c botflood.c chancmd.c access.c
+SRCS = main.c cli_fmt.c cfg_delta.c pool_rec.c pool.c elf_needs.c bot.c config.c channel.c hub_client.c irc_client.c irc_parser.c commands.c utils.c logging.c auth.c bot_comms.c crypto.c dcc.c sendq.c chanlive.c chancfg.c glob_overlap.c chanenf.c chanflood.c botflood.c chancmd.c access.c
 
 # Object files
 OBJS = $(SRCS:.c=.o)
@@ -119,7 +119,7 @@ $(TARGET): $(OBJS)
 	$(CC) $(CFLAGS) -o $(TARGET) $(OBJS) $(LDFLAGS) $(GC_LDFLAGS)
 	@chmod 700 $(TARGET)
 
-%.o: %.c bot.h cfg_delta.h elf_needs.h pool_rec.h
+%.o: %.c bot.h cfg_delta.h elf_needs.h pool_rec.h cli_fmt.h
 	$(CC) $(CFLAGS) $(WARNFLAGS) -c $< -o $@
 
 clean:

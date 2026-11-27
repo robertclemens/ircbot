@@ -47,6 +47,11 @@ void hub_client_init(bot_state_t *state) {
   state->hub_connecting = false;
   state->hub_authenticated = false;
   state->last_hub_connect_attempt = 0;
+  state->hub_retry_delay = 0;
+  state->hub_tried = 0;
+  state->hub_dial_idx = -1;
+  state->hub_rounds_failed = 0;
+  state->hub_cfg_synced = false;
   state->last_hub_ping_time = 0;
   state->last_hub_activity = 0;
   state->hub_connect_time = 0;
@@ -60,7 +65,6 @@ void hub_client_init(bot_state_t *state) {
  * state->hub_fd, not yet hub_connected, and the main loop watches it for
  * writability (hub_client_dial_ready).  An address that does not answer in
  * HUB_DIAL_TIMEOUT is given up for the next, as the blocking dial did. */
-#define HUB_DIAL_TIMEOUT 10
 static struct addrinfo *g_dial_res, *g_dial_ai;
 static time_t g_dial_started;
 static int g_dial_flags;
@@ -72,6 +76,51 @@ static void hub_dial_free(void) {
 }
 
 static void hub_dial_up(bot_state_t *state, int sockfd);
+
+/* Hubs that can be dialed (a pinned key): bit i = hubs[i]. */
+static unsigned hub_dialable(const bot_state_t *state) {
+  unsigned m = 0;
+  for (int i = 0; i < state->hub_count && i < MAX_HUBS; i++)
+    if (state->hubs[i].addr[0] && state->hubs[i].ed_pub_set) m |= 1u << i;
+  return m;
+}
+
+/* A dial or handshake that never became a link: the next untried hub of
+ * the round at once; a round with none left waits (doubling) and restarts. */
+static void hub_attempt_failed(bot_state_t *state) {
+  unsigned left = hub_dialable(state) & ~state->hub_tried;
+  if (left) {
+    state->hub_retry_delay = 0;
+    return;
+  }
+  state->hub_tried = 0;
+  if (state->hub_rounds_failed < 8) state->hub_rounds_failed++;
+  int d = HUB_RECONNECT_DELAY;
+  for (int i = 1; i < state->hub_rounds_failed && d < HUB_ROUND_BACKOFF_MAX; i++) d *= 2;
+  if (d > HUB_ROUND_BACKOFF_MAX) d = HUB_ROUND_BACKOFF_MAX;
+  state->hub_retry_delay = d + rand() % HUB_ROUND_JITTER;
+  log_message(L_INFO, state, "[HUB] No hub answered (%d known); next round in %d s\n",
+              state->hub_count, state->hub_retry_delay);
+}
+
+/* A random untried dialable hub; a finished round starts a new one. */
+static int hub_pick(bot_state_t *state) {
+  unsigned ok = hub_dialable(state);
+  if (!ok) return -1;
+  /* bot move: the hub an admin named goes first, once */
+  int want = state->hub_move_to - 1;
+  state->hub_move_to = 0;
+  if (want >= 0 && want < MAX_HUBS && (ok & (1u << want))) return want;
+  unsigned left = ok & ~state->hub_tried;
+  if (!left) {
+    state->hub_tried = 0;
+    left = ok;
+  }
+  int n = 0, idx[MAX_HUBS];
+  for (int i = 0; i < MAX_HUBS; i++)
+    if (left & (1u << i)) idx[n++] = i;
+  return idx[rand() % n];
+}
 
 /* Start a connect to g_dial_ai or the next address that takes one. */
 static void hub_dial_next(bot_state_t *state) {
@@ -97,6 +146,7 @@ static void hub_dial_next(bot_state_t *state) {
   log_message(L_INFO, state, "[HUB] Failed to connect to %s\n", g_dial_hub);
   hub_dial_free();
   state->hub_connecting = false;
+  hub_attempt_failed(state);
 }
 
 /* The address in flight failed or timed out: on to the next. */
@@ -357,6 +407,8 @@ static bool x25519_derive_session_key(bot_state_t *state,
 }
 
 void hub_client_disconnect(bot_state_t *state) {
+  bool was_up = state->hub_authenticated;
+  bool was_dialing = state->hub_fd != -1 || state->hub_connecting;
   if (state->hub_fd != -1) {
     shutdown(state->hub_fd, SHUT_RDWR);
     close(state->hub_fd);
@@ -366,8 +418,9 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_authenticated = false;
   state->hub_connecting = false;
   state->pool_hub_seen = false; /* the next hub proves it keeps a pool afresh */
+  join_gate_hub_down(state);     /* hm| is this link's word only */
+  chan_state_hub_down(state);    /* the next hub link gets the list afresh */
   state->irc_link_sent[0] = '\0'; /* ...and gets the IRC link state again */
-  state->pool_view_at = 0;
   state->hub_connect_time = 0;
   auth_state = HUB_AUTH_NONE;
   hub_rx_reset();
@@ -379,6 +432,18 @@ void hub_client_disconnect(bot_state_t *state) {
   state->hub_link_tx_ctr = state->hub_link_rx_ctr = 0;
   state->current_hub[0] = '\0'; // Clear current hub tracking
   state->last_hub_connect_attempt = time(NULL);
+  state->hub_cfg_synced = false;
+  if (was_up) {
+    /* A link that worked and dropped (the hub restarting, most often): a
+     * different hub next, after a short spread so bots do not all redial in
+     * the same second; a lone hub is tried again. */
+    state->hub_tried = state->hub_dial_idx >= 0 ? 1u << state->hub_dial_idx : 0;
+    state->hub_rounds_failed = 0;
+    state->hub_retry_delay = rand() % HUB_DROP_JITTER;
+  } else if (was_dialing) {
+    hub_attempt_failed(state); /* refused, timed out or dropped in the handshake */
+  }
+  state->hub_dial_idx = -1;
   last_pong_sent = 0;
   /* The tree came from the hub we just lost; keep the rows so 'bots' can
    * still answer, but clear the presence we believe the hub holds so the next
@@ -386,6 +451,8 @@ void hub_client_disconnect(bot_state_t *state) {
   state->presence_server[0] = '\0';
   state->last_presence_sent = 0;
 }
+
+bool hub_client_awaiting_challenge(void) { return auth_state == HUB_AUTH_SENT_UUID; }
 
 /* Bytes from the hub not read yet.  The handshake timeout leaves such a link
  * alone: a blocking IRC connect can hold the loop past HUB_AUTH_TIMEOUT while
@@ -493,9 +560,10 @@ void hub_client_send_presence(bot_state_t *state, bool force) {
    * entry: after a redirect they differ, and the tree should show the truth. */
   char server[TREE_SERVER_MAX + 1] = "";
   if (state->status & S_CONNECTED) {
-    const char *cfg = (state->current_server_index >= 0 &&
-                       state->current_server_index < state->server_count)
-                          ? state->server_list[state->current_server_index]
+    /* irc_server_idx is the live link; current_server_index is the
+     * rotation's next slot (one past it once dialed) */
+    const char *cfg = (state->irc_server_idx >= 0 && state->irc_server_idx < state->server_count)
+                          ? state->server_list[state->irc_server_idx]
                           : NULL;
     /* Explicit precision: a server name longer than the presence field is
      * truncated on purpose, not an oversight. */
@@ -660,7 +728,7 @@ static bool upgrade_ops_back(const bot_state_t *state, const char *ops,
   char *save = NULL;
   for (char *ch = strtok_r(work, " ", &save); ch; ch = strtok_r(NULL, " ", &save)) {
     const chan_t *c = state->chanlist;
-    while (c && strcasecmp(c->name, ch) != 0) c = c->next;
+    while (c && irc_casecmp(c->name, ch) != 0) c = c->next;
     if (!c) continue;
     if (c->status == C_IN && c->i_am_opped) continue;
     size_t ml = strlen(missing);
@@ -1158,6 +1226,11 @@ bool hub_client_send_irc_link(bot_state_t *state, const char *payload) {
   return hub_send_frame(state, CMD_BOT_IRC_LINK, payload, (int)strlen(payload));
 }
 
+bool hub_client_send_chan_state(bot_state_t *state, const char *payload) {
+  if (!state->hub_authenticated || !state->pool_hub_seen) return false;
+  return hub_send_frame(state, CMD_BOT_CHAN_STATE, payload, (int)strlen(payload));
+}
+
 bool hub_client_send_server_report(bot_state_t *state, const char *payload) {
   if (!state->hub_authenticated || !state->pool_hub_seen) return false;
   return hub_send_frame(state, CMD_SERVER_REPORT, payload, (int)strlen(payload));
@@ -1524,7 +1597,7 @@ void hub_client_grant_held_ops(bot_state_t *state, chan_t *c) {
     if (now - c->op_grant_held[i].at > OP_GRANT_HOLD_SECS)
       continue;
     for (int k = 0; k < c->roster_count; k++) {
-      if (strcasecmp(c->roster[k].nick, c->op_grant_held[i].nick) == 0) {
+      if (irc_casecmp(c->roster[k].nick, c->op_grant_held[i].nick) == 0) {
         if (!c->roster[k].is_op &&
             !op_grant_bitch_refuses(state, c, c->op_grant_held[i].nick)) {
           log_message(L_INFO, state,
@@ -1985,7 +2058,7 @@ static bool user_rec_same(const user_record_t *a, const user_record_t *b) {
 static const mask_record_t *saved_mask_find(const mask_record_t *saved, int n,
                                             const char *uuid, const char *mask) {
   for (int i = 0; i < n; i++)
-    if (strcmp(saved[i].uuid, uuid) == 0 && strcasecmp(saved[i].mask, mask) == 0)
+    if (strcmp(saved[i].uuid, uuid) == 0 && irc_casecmp(saved[i].mask, mask) == 0)
       return &saved[i];
   return NULL;
 }
@@ -2037,7 +2110,7 @@ static int access_table_changes(const bot_state_t *state,
     const uchan_record_t *c = &state->uchan_records[i];
     const uchan_record_t *w = NULL;
     for (int j = 0; j < nc && !w; j++)
-      if (strcmp(sc[j].uuid, c->uuid) == 0 && strcasecmp(sc[j].chan, c->chan) == 0)
+      if (strcmp(sc[j].uuid, c->uuid) == 0 && irc_casecmp(sc[j].chan, c->chan) == 0)
         w = &sc[j];
     if (w) matched++;
     if (!w || w->is_active != c->is_active || w->timestamp != c->timestamp)
@@ -2064,7 +2137,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
   bool has_access_lines = false, has_pool_lines = false;
   for (const char *p = payload; p && *p; ) {
     if ((p[0] == 'a' || p[0] == 'o') && p[1] == '|') has_user_lines = true;
-    else if ((p[0] == 'N' || p[0] == 'S') && p[1] == '|') has_pool_lines = true;
+    else if ((p[0] == 'N' || p[0] == 'S' || p[0] == 'R') && p[1] == '|') has_pool_lines = true;
     else if (p[0] == 'm' && p[1] == '|') has_mask_lines = true;
     else if (p[0] == 'u' && (p[1] == 'f' || p[1] == 'c') && p[2] == '|') has_access_lines = true;
     else if (p[0] == 'T' && p[1] == '|') has_trust_set = true;
@@ -2131,6 +2204,14 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
      * drop it (bots never applied a hub purge). */
     if (strncmp(line, "PURGE|", 6) == 0) {
       hub_client_apply_purge(state, line + 6);
+      line = strtok_r(NULL, "\n", &saveptr);
+      continue;
+    }
+
+    /* hm|<ts>|<mask>: our own mask as the hub holds it (the join gate) */
+    if (strncmp(line, "hm|", 3) == 0) {
+      if (!join_gate_hub_mask(state, line + 3))
+        log_message(L_DEBUG, state, "[HUB-SYNC] Malformed hm| record ignored\n");
       line = strtok_r(NULL, "\n", &saveptr);
       continue;
     }
@@ -2230,7 +2311,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
               c->status = C_OUT;
             }
             // If channel changed from unmanaged to managed, JOIN the channel
-            if (!was_managed && is_add && c->status != C_IN) {
+            if (!was_managed && is_add && c->status != C_IN && join_gate_ready(state)) {
               log_message(L_INFO, state, "[HUB] Joining channel %s (synced add)\n", chan);
               if (c->key[0] != '\0') {
                 irc_printf(state, "JOIN %s %s\r\n", chan, c->key);
@@ -2268,7 +2349,7 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
           mask_record_t *found_m = NULL;
           for (int mi=0; mi<state->mask_record_count; mi++) {
             if (strcmp(state->mask_records[mi].uuid,uuid)==0 &&
-                strcasecmp(state->mask_records[mi].mask,mask_s)==0) {
+                irc_casecmp(state->mask_records[mi].mask,mask_s)==0) {
               found_m = &state->mask_records[mi]; break;
             }
           }
@@ -2452,24 +2533,37 @@ static void hub_client_process_config_data(bot_state_t *state, const char *paylo
           updates++;
           log_message(L_INFO, state, "[HUB] Updated trusted bot: %s%s\n",
                       in.mask, key_is_new ? " (new key)" : "");
+          chanflood_trusted(state, in.mask);
         }
       } else if (state->trusted_bot_count < MAX_TRUSTED_BOTS) {
         state->trusted_bots[state->trusted_bot_count++] = in;
         updates++;
         log_message(L_INFO, state, "[HUB] Added trusted bot: %s%s\n", in.mask,
                     in.has_pub ? "" : " (no key yet)");
+        chanflood_trusted(state, in.mask);
       }
     } break;
 
     case 'T': // T|<count>: end of the hub's complete trusted-bot list (swept below)
       break;
 
-    case 'N': /* N|/S|: the server pool (pool.c) */
+    case 'N': /* N|/S|/R|: the server pool and this bot's order (pool.c) */
     case 'S':
+    case 'R': {
       if (type == 'N') state->pool_hub_seen = true;
+      unsigned int had = state->pool_order_known ? state->pool_order.gen : 0;
+      bool knew = state->pool_order_known;
       if (!pool_ingest_line(state, type, data))
         log_message(L_DEBUG, state, "[HUB-SYNC] Malformed %c| record ignored\n", type);
-      break;
+      else if (type == 'R' && (!knew || had != state->pool_order.gen)) {
+        state->pool_dial_at = 0; /* its turn, not a wait drawn before it */
+        log_message(L_INFO, state,
+                    "[POOL] Server order from the hub: %d server%s, first %s, slot %d of %d (gen %08x)\n",
+                    state->pool_order.n, state->pool_order.n == 1 ? "" : "s",
+                    state->pool_order.ids[0], state->pool_order.slot + 1, state->pool_order.slots,
+                    state->pool_order.gen);
+      }
+    } break;
 
     default:
       log_message(L_DEBUG, state, "[HUB-SYNC] Unrecognized line type '%c': %s\n", type, line);
@@ -2701,7 +2795,7 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
     if (auth_trusted_bot_by_uuid(state, req)) {
       const char *hm = NULL;
       for (int i = 0; bc && i < bc->roster_count; i++)
-        if (strcasecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
+        if (irc_casecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
       char who[64] = "";
       if (!hm || !auth_is_trusted_bot(state, hm, who, sizeof(who)) || strcmp(who, req) != 0) {
         log_message(L_INFO, state, "[CHANREQ] Not opping %s in %s: not the requesting bot here\n",
@@ -2717,7 +2811,7 @@ static void chan_elect_do(bot_state_t *state, const char *payload) {
     if (!auth_trusted_bot_by_uuid(state, req) && strcmp(req, "ADMIN") != 0) {
       const char *hm = NULL;
       for (int i = 0; bc && i < bc->roster_count; i++)
-        if (strcasecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
+        if (irc_casecmp(bc->roster[i].nick, nick) == 0) hm = bc->roster[i].hostmask;
       if (!mask[0] || !hm || !auth_mask_equal(hm, mask) || !auth_user_live_ok(state, req, hm, chan)) {
         log_message(L_INFO, state, "[CHANREQ] Not opping %s in %s: not the requester here\n",
                     nick, chan);
@@ -2890,9 +2984,45 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
     log_message(L_INFO, state, "[HUB] Hub requested config sync\n");
     break;
 
-  case CMD_POOL_VIEW:
-    if (payload && payload_len > 0) pool_view_apply(state, payload, payload_len);
-    break;
+  case CMD_BOT_MOVE: { /* our own uuid: the first server of our order; uuid|entry: that one */
+    size_t ul = strlen(state->bot_uuid);
+    if (payload && payload_len == (int)ul && memcmp(payload, state->bot_uuid, ul) == 0) {
+      pool_move_to_first(state);
+    } else if (payload && payload_len == (int)(ul + 1 + POOL_UUID_LEN) &&
+               memcmp(payload, state->bot_uuid, ul) == 0 && payload[ul] == '|') {
+      char entry[POOL_UUID_LEN + 1];
+      memcpy(entry, payload + ul + 1, POOL_UUID_LEN);
+      entry[POOL_UUID_LEN] = '\0';
+      if (!pool_move_to_entry(state, entry))
+        log_message(L_INFO, state, "[POOL] Asked to move to server %s: not one I can dial now\n",
+                    entry);
+    }
+  } break;
+
+  case CMD_BOT_HUB_MOVE: { /* payload: the target hub's Ed25519 key, base64 */
+    int dl = 0;
+    char key[64];
+    if (!payload || payload_len <= 0 || payload_len >= (int)sizeof(key)) break;
+    memcpy(key, payload, (size_t)payload_len);
+    key[payload_len] = '\0';
+    unsigned char *raw = base64_decode(key, &dl);
+    int to = -1;
+    for (int i = 0; raw && dl == 32 && i < state->hub_count; i++)
+      if (state->hubs[i].ed_pub_set && CRYPTO_memcmp(state->hubs[i].ed_pub, raw, 32) == 0) to = i;
+    if (raw) free(raw);
+    if (to < 0) {
+      /* never a hub this bot did not pin itself */
+      log_message(L_INFO, state, "[HUB] Asked to move to a hub not in my list; staying\n");
+      break;
+    }
+    if (to == state->hub_dial_idx) break; /* already there */
+    log_message(L_INFO, state, "[HUB] Moving to hub %s (bot move from the hub console)\n",
+                state->hubs[to].addr);
+    state->hub_move_to = to + 1;
+    hub_client_disconnect(state);
+    state->last_hub_connect_attempt = 0;
+    state->hub_retry_delay = 0;
+  } break;
 
   case CMD_CONFIG_DATA:
     log_message(L_INFO, state, "[HUB] Received config from hub (%d bytes)\n",
@@ -2910,6 +3040,11 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
         }
       }
       hub_client_process_config_data(state, payload);
+      if (!state->hub_cfg_synced) {
+        state->hub_cfg_synced = true; /* the startup gate (HUB_SYNC_WAIT) opens */
+        if (!(state->status & S_CONNECTED))
+          log_message(L_INFO, state, "[HUB] Config synced from %s\n", state->current_hub);
+      }
     }
     break;
 
@@ -2966,7 +3101,7 @@ static void hub_handle_response(bot_state_t *state, int cmd, char *payload,
           int k = 0;
           for (int i = 0; i < c->op_grant_held_count; i++)
             if (now - c->op_grant_held[i].at <= OP_GRANT_HOLD_SECS &&
-                strcasecmp(c->op_grant_held[i].nick, nick) != 0)
+                irc_casecmp(c->op_grant_held[i].nick, nick) != 0)
               c->op_grant_held[k++] = c->op_grant_held[i];
           c->op_grant_held_count = k;
           if (k < OP_GRANT_HOLD_MAX) {
@@ -3165,7 +3300,7 @@ void hub_client_connect(bot_state_t *state) {
     return;
   }
   time_t now = time(NULL);
-  if (now - state->last_hub_connect_attempt < HUB_RECONNECT_DELAY)
+  if (now - state->last_hub_connect_attempt < state->hub_retry_delay)
     return;
   static volatile int lock = 0;
   if (__sync_lock_test_and_set(&lock, 1))
@@ -3174,7 +3309,11 @@ void hub_client_connect(bot_state_t *state) {
   state->hub_connecting = true;
   char hub_tmp[256];
   char hub_original[256]; // Save original hub string for later
-  int hub_idx = rand() % state->hub_count;
+  int hub_idx = hub_pick(state);
+  if (hub_idx < 0) hub_idx = rand() % state->hub_count; /* none keyed: says so below */
+  state->hub_tried |= 1u << hub_idx;
+  state->hub_dial_idx = hub_idx;
+  state->hub_retry_delay = HUB_RECONNECT_DELAY; /* until the outcome says otherwise */
   snprintf(hub_tmp, sizeof(hub_tmp), "%s", state->hubs[hub_idx].addr);
   snprintf(hub_original, sizeof(hub_original), "%s", hub_tmp);
 
@@ -3200,6 +3339,7 @@ void hub_client_connect(bot_state_t *state) {
     log_message(L_INFO, state, "[HUB] Invalid hub address (missing port): %s\n",
                 hub_tmp);
     state->hub_connecting = false;
+    hub_attempt_failed(state);
     __sync_lock_release(&lock);
     return;
   }
@@ -3219,6 +3359,7 @@ void hub_client_connect(bot_state_t *state) {
     log_message(L_INFO, state, "[HUB] Cannot resolve hub address '%s': %s\n",
                 host, gai_strerror(gai_err));
     state->hub_connecting = false;
+    hub_attempt_failed(state);
     __sync_lock_release(&lock);
     return;
   }
@@ -3259,6 +3400,8 @@ static void hub_dial_up(bot_state_t *state, int sockfd) {
 static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
                              int packet_len);
 
+static void hub_rx_frames(bot_state_t *state);
+
 void hub_client_process(bot_state_t *state) {
   if (state->hub_count == 0 || state->hub_fd == -1 || !state->hub_connected)
     return;
@@ -3278,6 +3421,15 @@ void hub_client_process(bot_state_t *state) {
     hub_client_disconnect(state);
     return;
   }
+  /* Everything one read brings is handled under one send-queue hold, so the
+   * MODE lines it causes (a batched election's CMD_CHAN_DOs) leave packed,
+   * several changes per line, instead of one each through the burst. */
+  sendq_hold(state);
+  hub_rx_frames(state);
+  sendq_release(state);
+}
+
+static void hub_rx_frames(bot_state_t *state) {
   unsigned gen = g_hub_rx_gen;
   size_t off = 0;
   while (g_hub_rx_len - off >= 4) {
@@ -3438,6 +3590,8 @@ static void hub_handle_frame(bot_state_t *state, unsigned char *packet_body,
           auth_state = HUB_AUTH_COMPLETE;
           state->last_hub_activity = time(NULL);
           state->hub_connect_time = time(NULL);
+          state->hub_rounds_failed = 0;
+          state->hub_tried = 0;
           /* Phase 4: a new hub link — bump the persisted link-order counter
            * before the first presence carries it. */
           hub_client_link_ord_bump(state);

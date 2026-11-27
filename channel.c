@@ -52,7 +52,7 @@ chan_t *channel_add(bot_state_t *state, const char *name) {
 bool channel_remove(bot_state_t *state, const char *name) {
   chan_t *current = state->chanlist, *prev = NULL;
   while (current) {
-    if (strcasecmp(current->name, name) == 0) {
+    if (irc_casecmp(current->name, name) == 0) {
       if (prev)
         prev->next = current->next;
       else
@@ -70,7 +70,7 @@ bool channel_remove(bot_state_t *state, const char *name) {
 
 chan_t *channel_find(const bot_state_t *state, const char *name) {
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
-    if (strcasecmp(c->name, name) == 0)
+    if (irc_casecmp(c->name, name) == 0)
       return c;
   }
   return NULL;
@@ -93,6 +93,7 @@ void channel_list_reset_status(bot_state_t *state) {
     c->status = C_OUT;
     c->last_join_attempt = 0;
     c->join_disabled = false;
+    c->out_why[0] = '\0';
     c->i_am_opped = false;
     channel_live_reset(c);
     c->op_request_pending = false;
@@ -108,7 +109,171 @@ void channel_list_reset_status(bot_state_t *state) {
     state->unban_jobs[i].active = false;
 }
 
+/* ---- the join gate (bot.h JOIN_GATE_*) ----------------------------------
+ * A hub-linked bot that joins before the other bots hold its displayed mask
+ * is, to them, a stranger: a ban or a join-flood trip lands on it.  So no
+ * JOIN until the mask is known mesh-wide, as far as this bot can tell. */
+
+void join_gate_irc_up(bot_state_t *state) {
+  state->join_gate_since = time(NULL);
+  state->join_gate_mask_at = 0;
+  state->join_gate_confirm_at = 0;
+  state->join_gate_open = false;
+}
+
+void join_gate_irc_down(bot_state_t *state) {
+  state->join_gate_since = 0;
+  state->join_gate_mask_at = 0;
+  state->join_gate_confirm_at = 0;
+  state->join_gate_open = false;
+}
+
+static void join_gate_match(bot_state_t *state, time_t now, bool unchanged) {
+  if (!state->join_gate_since || !state->join_gate_mask_at || state->join_gate_confirm_at ||
+      !state->hub_mask_known || strcmp(state->hub_mask, state->actual_hostname) != 0)
+    return;
+  /* A mask the hub held before this session needs no settle: the mesh has it. */
+  state->join_gate_confirm_at = unchanged ? now - JOIN_GATE_SETTLE : now;
+}
+
+/* Our 352 for this session (mask = actual_hostname now).  pushed: the change
+ * already went to the hub.  A mask the hub holds differently but this bot
+ * still had from before goes now, or the confirmation never comes. */
+void join_gate_own_mask(bot_state_t *state, const char *mask, bool pushed) {
+  if (!state->join_gate_since || state->join_gate_mask_at || !mask || !mask[0]) return;
+  time_t now = time(NULL);
+  state->join_gate_mask_at = now;
+  if (state->hub_mask_known && strcmp(state->hub_mask, mask) != 0 && !pushed &&
+      state->hub_authenticated) {
+    if (state->actual_hostname_ts < now) state->actual_hostname_ts = now;
+    hub_client_sync_hostmask(state);
+  }
+  /* the hub held this exact mask before this session (a fresh process always
+   * "changes" from no mask, so pushed says nothing here): the mesh has it */
+  join_gate_match(state, now, state->hub_mask_known && strcmp(state->hub_mask, mask) == 0);
+}
+
+/* hm|<ts>|<mask>: our mask as the hub holds it ("-" = none).  Sent by 2.5.4+
+ * hubs in every config; any other shape is ignored. */
+bool join_gate_hub_mask(bot_state_t *state, const char *ts_mask) {
+  const char *bar = ts_mask ? strchr(ts_mask, '|') : NULL;
+  if (!bar || bar == ts_mask || bar - ts_mask > 20) return false;
+  for (const char *p = ts_mask; p < bar; p++)
+    if (*p < '0' || *p > '9') return false;
+  const char *mask = bar + 1;
+  size_t ml = strlen(mask);
+  if (ml == 0 || ml >= sizeof(state->hub_mask)) return false;
+  bool none = strcmp(mask, "-") == 0;
+  if (!none && (!strchr(mask, '!') || !strchr(mask, '@'))) return false;
+  state->hub_mask_known = true;
+  snprintf(state->hub_mask, sizeof(state->hub_mask), "%s", none ? "" : mask);
+  join_gate_match(state, time(NULL), false);
+  return true;
+}
+
+void join_gate_hub_down(bot_state_t *state) {
+  state->hub_mask_known = false;
+  state->hub_mask[0] = '\0';
+}
+
+bool join_gate_ready(bot_state_t *state) {
+  if (state->join_gate_open || !state->join_gate_since) return true;
+  time_t now = time(NULL);
+  const char *why = NULL;
+  if (state->hub_count == 0 || !state->hub_authenticated)
+    why = "no hub link";
+  else if (now - state->join_gate_since >= JOIN_GATE_MAX)
+    why = state->join_gate_mask_at ? "the hub never confirmed it, joining anyway"
+                                   : "no WHO answer for it, joining anyway";
+  else if (!state->hub_cfg_synced || !state->join_gate_mask_at)
+    return false;
+  else if (state->hub_mask_known) {
+    if (!state->join_gate_confirm_at || now - state->join_gate_confirm_at < JOIN_GATE_SETTLE)
+      return false;
+    why = "known to the hub";
+  } else {
+    if (now - state->join_gate_mask_at < JOIN_GATE_SETTLE) return false;
+    why = "hub sends no confirmation, settled";
+  }
+  state->join_gate_open = true;
+  log_message(L_INFO, state, "[JOIN] Hostmask %s: %s, %ld s after connect: joining channels\n",
+              state->actual_hostname[0] ? state->actual_hostname : "(unknown)", why,
+              (long)(now - state->join_gate_since));
+  return true;
+}
+
+/* ---- CMD_BOT_CHAN_STATE (bot.h CHAN_STATE_*) -----------------------------
+ * The list rebuilt every tick and sent only when it changed, at most once
+ * per CHAN_STATE_DEBOUNCE: every join, part, op, kick and refusal shows up
+ * without a hook at each.  A list that does not fit ends ",~N" (N more; no
+ * channel name starts with '~'). */
+
+static const char *chan_state_token(bot_state_t *state, const chan_t *c, char *out, size_t cap) {
+  if (c->status == C_IN) {
+    char mark[2] = "";
+    if (c->i_am_opped) {
+      mark[0] = '@';
+    } else {
+      for (int i = 0; i < c->roster_count; i++) {
+        if (irc_casecmp(c->roster[i].nick, state->current_nick) != 0) continue;
+        mark[0] = c->roster[i].is_halfop ? '%' : c->roster[i].is_voice ? '+' : '\0';
+        break;
+      }
+    }
+    snprintf(out, cap, "%s%s", mark, c->name);
+    return out;
+  }
+  const char *why = !(state->status & S_AUTHED) ? "noirc"
+                    : c->join_disabled           ? "disabled"
+                    : !join_gate_ready(state)    ? "gate"
+                    : c->out_why[0]              ? c->out_why
+                                                 : "joining";
+  snprintf(out, cap, "-%s:%s", c->name, why);
+  return out;
+}
+
+void chan_state_hub_down(bot_state_t *state) {
+  if (state->chan_state_sent) state->chan_state_sent[0] = '\0';
+  state->chan_state_sent_at = 0;
+}
+
+void chan_state_tick(bot_state_t *state) {
+  pool_link_resend(state); /* the 005 NETWORK= lands after the "up" note */
+  if (!state->hub_authenticated || !state->pool_hub_seen) return;
+  time_t now = time(NULL);
+  if (state->chan_state_sent_at && now - state->chan_state_sent_at < CHAN_STATE_DEBOUNCE) return;
+  if (!state->chan_state_sent) {
+    state->chan_state_sent = calloc(1, BOT_CHAN_STATE_MAX);
+    if (!state->chan_state_sent) return;
+  }
+  static char buf[BOT_CHAN_STATE_MAX];
+  size_t len = 0;
+  int left = 0;
+  buf[0] = '\0';
+  for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
+    if (!c->is_managed) continue;
+    char tok[MAX_CHAN + CHAN_STATE_WHY_MAX + 3];
+    chan_state_token(state, c, tok, sizeof(tok));
+    size_t tl = strlen(tok);
+    /* room for this token, its comma and a ",…+NNN" tail */
+    if (left || len + tl + 1 + 12 >= sizeof(buf)) {
+      left++;
+      continue;
+    }
+    if (len) buf[len++] = ',';
+    memcpy(buf + len, tok, tl + 1);
+    len += tl;
+  }
+  if (left) snprintf(buf + len, sizeof(buf) - len, "%s~%d", len ? "," : "", left);
+  if (state->chan_state_sent_at && strcmp(buf, state->chan_state_sent) == 0) return;
+  if (hub_client_send_chan_state(state, buf)) {
+    snprintf(state->chan_state_sent, BOT_CHAN_STATE_MAX, "%s", buf);
+    state->chan_state_sent_at = now;
+  }
+}
+
 void channel_manager_check_joins(bot_state_t *state) {
+  chan_state_tick(state);
   if (!(state->status & S_AUTHED))
     return;
   /* No channel before the NETWORK= check says this is the right network. */
@@ -118,6 +283,8 @@ void channel_manager_check_joins(bot_state_t *state) {
   time_t now = time(NULL);
   /* Close out ban-list walks whose 368 never arrived. */
   chan_unban_expire(state);
+  if (!join_gate_ready(state))
+    return;
 
   for (chan_t *c = state->chanlist; c != NULL; c = c->next) {
     // Skip tombstoned/deleted channels and channels blocked by 405
@@ -219,7 +386,7 @@ static bool chan_access_fallback(bot_state_t *state, chan_req_kind_t kind,
       continue;
     /* Our own record may be in the roster; asking ourselves achieves nothing. */
     if (state->current_nick[0] != '\0' &&
-        strcasecmp(tb_nick, state->current_nick) == 0)
+        irc_casecmp(tb_nick, state->current_nick) == 0)
       continue;
 
     void (*send)(bot_state_t *, const char *, const char *, ...) =
@@ -440,7 +607,7 @@ void invite_check_who(bot_state_t *state, const char *nick, const char *ident, c
   if (snprintf(live, sizeof(live), "%s!%s@%s", nick, ident, host) >= (int)sizeof(live)) return;
   for (int i = 0; i < INVITE_CHECKS; i++) {
     invite_check_t *k = &state->invite_checks[i];
-    if (!k->active || strcasecmp(k->nick, nick) != 0) continue;
+    if (!k->active || irc_casecmp(k->nick, nick) != 0) continue;
     k->seen = true;
     chan_t *c = channel_find(state, k->chan);
     if (!c || c->status != C_IN || !c->i_am_opped)
@@ -458,7 +625,7 @@ void invite_check_who(bot_state_t *state, const char *nick, const char *ident, c
 void invite_check_end(bot_state_t *state, const char *nick) {
   for (int i = 0; i < INVITE_CHECKS; i++) {
     invite_check_t *k = &state->invite_checks[i];
-    if (k->active && !k->seen && strcasecmp(k->nick, nick) == 0)
+    if (k->active && !k->seen && irc_casecmp(k->nick, nick) == 0)
       invite_check_close(state, k, false, "the nick is not on IRC");
   }
 }
@@ -477,7 +644,7 @@ void invite_check_tick(bot_state_t *state) {
 static unban_job_t *unban_job_find(bot_state_t *state, const char *channel) {
   for (int i = 0; i < MAX_UNBAN_JOBS; i++)
     if (state->unban_jobs[i].active &&
-        strcasecmp(state->unban_jobs[i].channel, channel) == 0)
+        irc_casecmp(state->unban_jobs[i].channel, channel) == 0)
       return &state->unban_jobs[i];
   return NULL;
 }
